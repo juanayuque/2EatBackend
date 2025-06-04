@@ -1,58 +1,75 @@
 // index.js or your Express route
-require('dotenv').config();
-const express = require("express");
-const axios = require("axios");
-const cors = require("cors");
 
+// Load environment variables from a .env file into process.env
+require('dotenv').config();
+
+// Import necessary modules
+const express = require("express"); // Web framework for Node.js
+const axios = require("axios");   // HTTP client for making API requests
+const cors = require("cors");     // Middleware to enable Cross-Origin Resource Sharing
+
+// Initialize the Express application
 const app = express();
+
+// Enable CORS for all routes, allowing frontend applications on different origins to access this API
 app.use(cors());
+
+// Define the port the server will listen on
 const PORT = 3000;
 
+// Retrieve the Google API key from environment variables
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
-console.log("API KEY (partial):", GOOGLE_API_KEY ? GOOGLE_API_KEY.substring(0, 5) + "..." : "Undefined"); // More secure log
 
+// Log a partial API key for debugging; avoids exposing the full key in logs
+console.log("API KEY (partial):", GOOGLE_API_KEY ? GOOGLE_API_KEY.substring(0, 5) + "..." : "Undefined");
+
+// Define an API endpoint to fetch nearby restaurant information
+// Expects 'lat' (latitude) and 'lng' (longitude) as query parameters
 app.get("/api/location-info", async (req, res) => {
   const { lat, lng } = req.query;
 
   try {
+    // Make a POST request to Google Places API (searchNearby endpoint)
     const placesResponse = await axios.post(
       "https://places.googleapis.com/v1/places:searchNearby",
       {
+        // Define the search area as a circle around the provided coordinates
         locationRestriction: {
           circle: {
             center: {
               latitude: parseFloat(lat),
               longitude: parseFloat(lng),
             },
-            radius: 1000, // in meters
+            radius: 1000, // Search radius of 1000 meters (1 km)
           },
         },
-        includedTypes: ["restaurant"], // Filter for only restaurants
-        maxResultCount: 20, // Max results per call for searchNearby
+        includedTypes: ["restaurant"], // Crucially, filter results to only include restaurants
+        maxResultCount: 20, // Request up to 20 results per API call
       },
       {
         headers: {
           "Content-Type": "application/json",
           "X-Goog-Api-Key": process.env.GOOGLE_API_KEY,
-          // Request all the detailed fields you need here
+          // Specify which fields to retrieve from the Places API response.
+          // This "field mask" optimizes performance by only fetching necessary data.
           "X-Goog-FieldMask": "places.displayName,places.location,places.rating,places.userRatingCount,places.reviews,places.photos,places.formattedAddress,places.websiteUri,places.regularOpeningHours,places.servesVegetarianFood,places.priceLevel,places.editorialSummary,places.primaryTypeDisplayName,places.plusCode,places.internationalPhoneNumber,places.takeout,places.dineIn,places.curbsidePickup,places.delivery,places.outdoorSeating,places.parkingOptions,places.allowsDogs",
         },
       }
     );
 
-    // Map the response to include all relevant place data
+    // Process the API response: map the raw Google Places data into a cleaner, custom format
     const restaurants = (placesResponse.data.places || []).map((place) => {
       return {
-        // Basic Info
+        // Essential contact & location details
         name: place.displayName?.text || 'N/A',
         latitude: place.location?.latitude,
         longitude: place.location?.longitude,
         formattedAddress: place.formattedAddress || 'N/A',
         internationalPhoneNumber: place.internationalPhoneNumber || 'N/A',
         websiteUri: place.websiteUri || 'N/A',
-        primaryTypeDisplayName: place.primaryTypeDisplayName?.text || 'N/A',
+        primaryTypeDisplayName: place.primaryTypeDisplayName?.text || 'N/A', // e.g., "Sushi Restaurant"
 
-        // Ratings & Reviews
+        // Customer feedback and popularity metrics
         rating: place.rating || null,
         userRatingCount: place.userRatingCount || 0,
         reviews: place.reviews ? place.reviews.map(review => ({
@@ -62,48 +79,51 @@ app.get("/api/location-info", async (req, res) => {
             publishTime: review.publishTime || ''
         })) : [],
 
-        // Operational Info
-        priceLevel: place.priceLevel || null, // e.g., PRICE_LEVEL_UNSPECIFIED, PRICE_LEVEL_MODERATE
-        regularOpeningHours: place.regularOpeningHours || null, // Contains details like 'weekdayDescriptions'
+        // Business operations and amenities
+        priceLevel: place.priceLevel || null, // Price indication (e.g., 1-4, low to high)
+        regularOpeningHours: place.regularOpeningHours || null, // Detailed opening hours
         takeout: place.takeout || false,
         dineIn: place.dineIn || false,
         curbsidePickup: place.curbsidePickup || false,
         delivery: place.delivery || false,
         outdoorSeating: place.outdoorSeating || false,
-        parkingOptions: place.parkingOptions || null, // e.g., 'freeParkingLot', 'paidGarage'
+        parkingOptions: place.parkingOptions || null, // Parking availability
         allowsDogs: place.allowsDogs || false,
 
-        // Dietary & Other
+        // Specific offerings or summaries
         servesVegetarianFood: place.servesVegetarianFood || false,
-        editorialSummary: place.editorialSummary?.text || null, // AI-generated summary
+        editorialSummary: place.editorialSummary?.text || null, // AI-generated text summary
 
-        // Photos (metadata only, actual images require separate API call)
+        // Photo metadata; actual images require a separate API call with the `name` field
         photos: place.photos ? place.photos.map(photo => ({
-            name: photo.name, // Photo resource name (e.g., 'places/ChIJw2_qL3JadkgROfI5eS0d3A/photos/CmRaAAA...
+            name: photo.name,
             widthPx: photo.widthPx,
             heightPx: photo.heightPx,
-            // To get the actual image URL, make a separate call to:
-            // `https://places.googleapis.com/v1/{photo.name}/media?key=YOUR_API_KEY&maxWidthPx={width}`
+            // To retrieve the actual image, construct a URL like:
+            // `https://places.googleapis.com/v1/${photo.name}/media?key=YOUR_API_KEY&maxWidthPx={width}`
         })) : [],
 
-        // Plus Code (for location reference)
+        // Plus Code for precise location referencing
         plusCode: place.plusCode || null,
 
-        // You can calculate this if needed based on frontend or backend
+        // Placeholder for distance; calculation would be done on frontend or with another API call
         distance: 0,
       };
     });
 
+    // Send the structured restaurant data
     res.json({
-      postcode: "N/A", // If you need a postcode, you'd integrate a reverse geocoding API call here
       nearbyRestaurants: restaurants,
     });
   } catch (error) {
+    // Log detailed error information for debugging
     console.error("Google Places API error:", error.response?.data || error.message);
+    // Send a 500 status code with a user-friendly error message
     res.status(500).json({ error: "Failed to fetch nearby restaurants" });
   }
 });
 
+// Start the Express server and listen for incoming requests on the specified port
 app.listen(PORT, () => {
   console.log(`Backend running on http://localhost:${PORT}`);
 });
