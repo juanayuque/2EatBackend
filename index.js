@@ -80,7 +80,7 @@ app.get("/api/location-info", async (req, res) => {
         userRatingCount: place.userRatingCount || 0,
         reviews: place.reviews ? place.reviews.map(review => ({
             author: review.authorAttribution?.displayName || 'Anonymous',
-            text: review.text || '',
+            text: review.text?.text || null, // 
             rating: review.rating || null,
             publishTime: review.publishTime || ''
         })) : [],
