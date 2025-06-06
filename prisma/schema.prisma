@@ -13,3 +13,69 @@ datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
+
+model Restaurant {
+  // We use `googlePlaceId` as the unique identifier for Google Places.
+  id                       String    @id @default(uuid())
+  googlePlaceId            String    @unique @map("google_place_id") // Google's unique Place ID, MUST be NOT NULL
+  name                     String
+  latitude                 Decimal     @db.Decimal(10, 7) // Store with specific precision for lat/lng
+  longitude                Decimal     @db.Decimal(10, 7)
+  formattedAddress         String?   @map("formatted_address") @db.Text // Use @db.Text for longer strings
+  internationalPhoneNumber String?   @map("international_phone_number") @db.VarChar(50)
+  websiteUri               String?   @map("website_uri") @db.Text
+  primaryTypeDisplayName   String?   @map("primary_type_display_name") @db.VarChar(100)
+  rating                   Decimal?    @db.Decimal(2, 1) // Store with specific precision for rating
+  userRatingCount          Int?      @map("user_rating_count")
+  priceLevel               Int?      @map("price_level")
+  servesVegetarianFood     Boolean?  @map("serves_vegetarian_food") @default(false)
+  editorialSummary         String?   @map("editorial_summary") @db.Text
+  plusCode                 String?   @map("plus_code") @db.VarChar(255) // Can be large, consider TEXT if needed
+  takeout                  Boolean?  @default(false)
+  dineIn                   Boolean?  @map("dine_in") @default(false)
+  curbsidePickup           Boolean?  @map("curbside_pickup") @default(false)
+  delivery                 Boolean?  @default(false)
+  outdoorSeating           Boolean?  @map("outdoor_seating") @default(false)
+  allowsDogs               Boolean?  @map("allows_dogs") @default(false)
+  parkingOptions           Json?     @map("parking_options") // Use Json for PostgreSQL's JSONB type
+  regularOpeningHours      Json?     @map("regular_opening_hours") // Use Json for PostgreSQL's JSONB type
+
+  // Relations to other models
+  reviews                  Review[]
+  photos                   Photo[]
+
+  // Timestamps
+  createdAt                DateTime  @default(now()) @map("created_at")
+  updatedAt                DateTime  @updatedAt @map("updated_at")
+
+  @@map("restaurants") // Maps this model to the 'restaurants' table in the database
+}
+
+model Review {
+  id           String    @id @default(uuid())
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  restaurantId String    @map("restaurant_id")
+  author       String    @db.VarChar(255)
+  text         String?   @db.Text
+  rating       Decimal     @db.Decimal(2, 1)
+  publishTime  DateTime? @map("publish_time")
+
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  @@map("reviews")
+}
+
+model Photo {
+  id           String    @id @default(uuid())
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  restaurantId String    @map("restaurant_id")
+  name         String    @db.VarChar(255) // Google's photo resource name
+  widthPx      Int?      @map("width_px")
+  heightPx     Int?      @map("height_px")
+
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  @@map("photos")
+}
