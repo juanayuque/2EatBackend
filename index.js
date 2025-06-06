@@ -86,7 +86,7 @@ app.get("/api/location-info", async (req, res) => {
         })) : [],
 
         // Business operations and amenities
-        priceLevel: place.priceLevel || null, // Price indication (e.g., 1-4, low to high)
+        priceLevel: place.priceLevel ? parseInt(place.priceLevel) : null, // Convert to Int
         regularOpeningHours: place.regularOpeningHours || null, // Detailed opening hours
         takeout: place.takeout || false,
         dineIn: place.dineIn || false,
