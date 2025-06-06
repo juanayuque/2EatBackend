@@ -110,7 +110,7 @@ app.get("/api/location-info", async (req, res) => {
         })) : [],
 
         // Plus Code for precise location referencing
-        plusCode: place.plusCode || null,
+        plusCode: place.plusCode?.globalCode || null, // Extract globalCode from the object
 
         // Placeholder for distance; calculation would be done on frontend or with another API call
         distance: 0,
