@@ -7,7 +7,7 @@ require('dotenv').config();
 const express = require("express"); // Web framework for Node.js
 const axios = require("axios");   // HTTP client for making API requests
 const cors = require("cors");     // Middleware to enable Cross-Origin Resource Sharing
-const { PrismaClient } = require('../generated/prisma'); // Import PrismaClient
+const { PrismaClient } = require('./generated/prisma'); // Import PrismaClient
 
 // Initialize the Express application
 const app = express();
