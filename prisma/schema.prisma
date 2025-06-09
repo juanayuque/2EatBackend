@@ -14,6 +14,38 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+//Predefined options
+enum Gender {
+  MALE
+  FEMALE
+  NON_BINARY
+  PREFER_NOT_TO_SAY
+}
+
+// Budget Ranges
+enum BudgetLevel {
+  VERY_CHEAP  // e.g., 0-5 pounds
+  CHEAP       // e.g., 0-10 pounds
+  MODERATE    // e.g., 0-20 pounds
+  EXPENSIVE   // e.g., 0-40 pounds
+  VERY_EXPENSIVE // e.g., any
+}
+
+model User {
+  id                   String        @id @unique @map("firebase_uid") // Firebase UID
+  // fields
+  age                  Int?          // Optional, if user provides it
+  gender               Gender?       // Optional, using the Gender enum
+  searchDistance       Int?          @map("search_distance") // Distance in km
+  budgetRange          BudgetLevel[] @map("budget_range") // 
+  dietaryNeeds         String[]     @map("dietary_needs") // Array of strings (e.g., "Vegetarian", "Gluten-Free")
+  preferredCuisines    String[]     @map("preferred_cuisines") // Array of strings 
+  createdAt            DateTime      @default(now()) @map("created_at")
+  updatedAt            DateTime      @updatedAt @map("updated_at")
+
+  @@map("users") 
+}
+
 model Restaurant {
   // We use `googlePlaceId` as the unique identifier for Google Places.
   id                       String    @id @default(uuid())
