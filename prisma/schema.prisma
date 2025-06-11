@@ -32,9 +32,9 @@ enum BudgetLevel {
 }
 
 model User {
-  id                   String        @id @unique @map("firebase_uid") // Firebase UID
-  // fields
-  email                String?
+  id                   String       @id @default(cuid())
+  firebaseUid          String       @unique
+  email                String?      @unique
   age                  Int?          // Optional, if user provides it
   gender               Gender?       // Optional, using the Gender enum
   searchDistance       Int?          @map("search_distance") // Distance in km
