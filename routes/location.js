@@ -3,10 +3,8 @@ require('dotenv').config();
 const express = require('express');
 const router = express.Router();
 const axios = require('axios');
-const prisma = require('../src/prisma'); 
-
-const { verifyFirebaseToken } = require('./users');
-
+const prisma = require('../src/prisma');
+const verifyFirebaseToken = require('../middleware/auth');
 
 router.get('/location-info', verifyFirebaseToken, async (req, res) => {
   const { lat, lng } = req.query;
