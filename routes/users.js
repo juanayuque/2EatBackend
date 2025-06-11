@@ -19,4 +19,5 @@ router.post('/sync-profile', async (req, res) => {
   }
 });
 
-export default router;
+module.exports = router;
+

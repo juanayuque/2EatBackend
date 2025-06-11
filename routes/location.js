@@ -203,4 +203,5 @@ router.get('/location-info', verifyFirebaseToken, async (req, res) => {
     }
   });
 
-export default router;
+module.exports = router;
+
