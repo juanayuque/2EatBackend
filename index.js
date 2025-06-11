@@ -8,6 +8,13 @@ const express = require("express"); // Web framework for Node.js
 const axios = require("axios");   // HTTP client for making API requests
 const cors = require("cors");     // Middleware to enable Cross-Origin Resource Sharing
 const { PrismaClient } = require('./generated/prisma'); // Import PrismaClient
+const admin = require("firebase-admin");
+const serviceAccount = require("./serviceAccountKey.json");
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+
 
 // Initialize the Express application
 const app = express();
@@ -27,9 +34,27 @@ console.log("API KEY (partial):", GOOGLE_API_KEY ? GOOGLE_API_KEY.substring(0, 5
 // --- Initialize Prisma Client ---
 const prisma = new PrismaClient();
 
-// Define an API endpoint to fetch nearby restaurant information
+async function authenticateToken(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const idToken = authHeader.split('Bearer ')[1];
+
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    req.user = decodedToken;
+    next();
+  } catch (error) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+
+// Define an API endpoint to fetch nearby restaurant information, only for Users 
 // Expects 'lat' (latitude) and 'lng' (longitude) as query parameters
-app.get("/api/location-info", async (req, res) => {
+app.get("/api/location-info", authenticateToken, async (req, res) => {
   const { lat, lng } = req.query;
 
   try {
