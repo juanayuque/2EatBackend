@@ -1,5 +1,7 @@
-import express from 'express';
-import admin from 'firebase-admin';
+require('dotenv').config();
+
+const express = requie('express');
+const admin = require('firebase-admin');
 const router = express.Router();
 
 // Middleware to verify Firebase Auth token

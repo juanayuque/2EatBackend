@@ -1,10 +1,10 @@
-import express from 'express';
-import fs from 'fs';
-import https from 'https';
-import cors from 'cors';
-import admin from 'firebase-admin';
-import locationRoutes from './routes/location.js';
-import userRoutes from './routes/users.js';
+const express = require('express');
+const fs = require('fs');
+const https = require('https');
+const cors = require('cors');
+const admin = require('firebase-admin');
+const locationRoutes = require('./routes/location.js');
+const userRoutes = require('./routes/users.js');
 
 const app = express();
 app.use(cors());
