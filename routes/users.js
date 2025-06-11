@@ -3,28 +3,8 @@ require('dotenv').config();
 const express = require('express');
 const admin = require('firebase-admin');
 const router = express.Router();
-const prisma = require('../src/prisma'); 
+const prisma = require('../src/prisma');
 
-
-async function verifyFirebaseToken(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith('Bearer ')) {
-    return res.status(401).send('Missing token');
-  }
-
-  const token = authHeader.split(' ')[1];
-
-  try {
-    const decodedToken = await admin.auth().verifyIdToken(token);
-    req.user = decodedToken; // Attach decoded token to request object
-    next(); // Proceed to the next middleware or route handler
-  } catch (err) {
-    console.error('Firebase token verification failed:', err);
-    res.status(401).send('Unauthorized');
-  }
-}
-
-// --- Dedicated route for syncing user profile ---
 router.post('/sync-profile', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith('Bearer ')) {
@@ -58,10 +38,5 @@ router.post('/sync-profile', async (req, res) => {
     res.status(401).json({ error: 'Authentication failed or user sync error' });
   }
 });
-// --- End dedicated user sync route ---
 
-// Export the router and the middleware for use in other files
-module.exports = {
-  userRouter: router,
-  verifyFirebaseToken: verifyFirebaseToken
-};
+module.exports = router;
