@@ -3,8 +3,8 @@ require('dotenv').config();
 const express = require('express');
 const admin = require('firebase-admin');
 const router = express.Router();
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient(); // Initialize PrismaClient 
+const prisma = require('../src/prisma'); 
+
 
 async function verifyFirebaseToken(req, res, next) {
   const authHeader = req.headers.authorization;

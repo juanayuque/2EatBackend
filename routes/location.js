@@ -3,11 +3,8 @@ require('dotenv').config();
 const express = require('express');
 const router = express.Router();
 const axios = require('axios');
-// Import the centralized PrismaClient instance
-const prisma = require('./src/prisma'); // Adjust path as needed, e.g., ../src/prisma
+const prisma = require('../src/prisma'); 
 
-// Import the verifyFirebaseToken middleware from the user module
-// Ensure the path is correct relative to this file.
 const { verifyFirebaseToken } = require('./users');
 
 
