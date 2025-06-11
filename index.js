@@ -214,6 +214,23 @@ app.get("/api/location-info", async (req, res) => {
 });
 
 // Start the Express server and listen for incoming requests on the specified port
-app.listen(PORT, () => {
-  console.log(`Backend running on http://localhost:${PORT}`);
+const https = require("https");
+const fs = require("fs");
+
+// Read Cloudflare origin certificate and key from file system
+const sslOptions = {
+  key: fs.readFileSync("/etc/ssl/private/cloudflare.key"),
+  cert: fs.readFileSync("/etc/ssl/certs/cloudflare.crt"),
+};
+
+// Start HTTPS server on port 443
+https.createServer(sslOptions, app).listen(443, () => {
+  console.log("Backend running on https://2eatapp.com");
 });
+
+require("http").createServer((req, res) => {
+  res.writeHead(301, {
+    Location: "https://" + req.headers.host + req.url,
+  });
+  res.end();
+}).listen(80);
