@@ -35,8 +35,11 @@ console.log("API KEY (partial):", GOOGLE_API_KEY ? GOOGLE_API_KEY.substring(0, 5
 const prisma = new PrismaClient();
 
 async function authenticateToken(req, res, next) {
+  console.log("🔒 Authenticating token...");
+
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    console.log("⛔ No token provided");
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
@@ -44,12 +47,16 @@ async function authenticateToken(req, res, next) {
 
   try {
     const decodedToken = await admin.auth().verifyIdToken(idToken);
+    console.log("✅ Token valid for user:", decodedToken.uid);
     req.user = decodedToken;
     next();
   } catch (error) {
+    console.log("❌ Token invalid");
     return res.status(401).json({ error: 'Invalid token' });
   }
 }
+
+
 
 
 // Define an API endpoint to fetch nearby restaurant information, only for Users 
@@ -236,6 +243,11 @@ app.get("/api/location-info", authenticateToken, async (req, res) => {
     // --- Disconnect 
     await prisma.$disconnect();
   }
+});
+
+//Debug
+app.get("/api/location-detail", (req, res) => {
+  return res.status(401).json({ error: "Testing if route is blocked" });
 });
 
 // Start the Express server and listen for incoming requests on the specified port
