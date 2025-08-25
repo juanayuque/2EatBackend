@@ -1,41 +1,110 @@
-require('dotenv').config();
-
-const express = require('express');
-const admin = require('firebase-admin');
+const express = require("express");
 const router = express.Router();
-const prisma = require('../src/prisma');
+const prisma = require("../src/prisma");
+const verifyFirebaseToken = require("../middleware/auth");
 
-router.post('/sync-profile', async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith('Bearer ')) {
-    return res.status(401).send('Missing token');
-  }
+// Allow preflight fast-path on this router (optional; app.options('*') already handles it)
+router.options("*", (_req, res) => res.sendStatus(204));
 
-  const token = authHeader.split(' ')[1];
-
+/**
+ * POST /api/users/sync-profile
+ * Synchronizes the authenticated user's profile into the database.
+ * Uses Firebase ID token decoded by verifyFirebaseToken.
+ */
+router.post("/sync-profile", verifyFirebaseToken, async (req, res) => {
   try {
-    const decodedToken = await admin.auth().verifyIdToken(token);
-    const firebaseUid = decodedToken.uid;
-    const email = decodedToken.email || null; // Email might not always be present
+    // Decoded Firebase claims from middleware
+    const {
+      uid: firebaseUid,
+      email = null,
+      name: tokenName = null,
+      picture: tokenPicture = null,
+      email_verified: emailVerified = null,
+    } = req.user || {};
 
-    // --- Prisma User Sync Logic ---
+    if (!firebaseUid) {
+      return res.status(401).json({ error: "Invalid token: uid missing" });
+    }
+
+    // Optional client-provided overrides
+    const { displayName: bodyName, photoUrl: bodyPhotoUrl } = req.body || {};
+
+    const displayName = bodyName ?? tokenName ?? null;
+    const photoUrl = bodyPhotoUrl ?? tokenPicture ?? null;
+
+    // Upsert user by firebaseUid to keep operation idempotent
     const user = await prisma.user.upsert({
-      where: { firebaseUid: firebaseUid },
+      where: { firebaseUid },
       update: {
-        email: email,
-        updatedAt: new Date(), // Update timestamp on existing user
+        email,
+        displayName,
+        photoUrl,
+        emailVerified,
+        updatedAt: new Date(),
       },
       create: {
-        firebaseUid: firebaseUid,
-        email: email,
+        firebaseUid,
+        email,
+        displayName,
+        photoUrl,
+        emailVerified,
+      },
+      // select could be used to limit response payload if the table grows
+    });
+
+    return res.status(200).json({
+      message: "User profile synced successfully",
+      user: {
+        id: user.id,
+        firebaseUid: user.firebaseUid,
+        email: user.email,
+        displayName: user.displayName,
+        photoUrl: user.photoUrl,
+        emailVerified: user.emailVerified,
       },
     });
-    console.log(`User synced to DB: ${user.firebaseUid}`);
-    res.status(200).json({ message: 'User profile synced successfully', user: { id: user.id, firebaseUid: user.firebaseUid, email: user.email } });
-
   } catch (err) {
-    console.error('Firebase token verification or user sync failed:', err);
-    res.status(401).json({ error: 'Authentication failed or user sync error' });
+    console.error("User sync failed:", err);
+    return res
+      .status(500)
+      .json({ error: "User sync failed", code: "user-sync-error" });
+  }
+});
+
+/**
+ * GET /api/users/me
+ * Returns the authenticated user's profile from the database.
+ */
+router.get("/me", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { uid: firebaseUid } = req.user || {};
+    if (!firebaseUid) {
+      return res.status(401).json({ error: "Invalid token: uid missing" });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { firebaseUid },
+    });
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    return res.json({
+      user: {
+        id: user.id,
+        firebaseUid: user.firebaseUid,
+        email: user.email,
+        displayName: user.displayName,
+        photoUrl: user.photoUrl,
+        emailVerified: user.emailVerified,
+      },
+    });
+  } catch (err) {
+    console.error("Fetch current user failed:", err);
+    return res
+      .status(500)
+      .json({ error: "Failed to fetch profile", code: "user-fetch-error" });
   }
 });
 
