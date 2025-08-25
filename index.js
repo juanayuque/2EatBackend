@@ -25,7 +25,9 @@ const app = express();
 app.set("trust proxy", 1);
 
 // Common security headers, gzip compression, and request logging for observability.
-app.use(helmet());
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" }, // <-- allow images cross-origin
+}));
 app.use(compression());
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
