@@ -40,7 +40,10 @@ model User {
   searchDistance       Int?          @map("search_distance") // Distance in km
   budgetRange          BudgetLevel[] @map("budget_range") // 
   dietaryNeeds         String[]     @map("dietary_needs") // Array of strings (e.g., "Vegetarian", "Gluten-Free")
-  preferredCuisines    String[]     @map("preferred_cuisines") // Array of strings 
+  preferredCuisines    String[]     @map("preferred_cuisines") // Array of strings
+  displayName      String?      // username ?
+  photoUrl         String?      // profile pic
+  emailVerified    Boolean? @default 
   createdAt            DateTime      @default(now()) @map("created_at")
   updatedAt            DateTime      @updatedAt @map("updated_at")
 
