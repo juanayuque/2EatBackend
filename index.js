@@ -62,7 +62,6 @@ const corsOptions = {
 
 // CORS is registered before any routes and preflights are explicitly handled on all paths.
 app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
 
 /* ───────────────────────────────── Request parsing ─────────────────────────────── */
 

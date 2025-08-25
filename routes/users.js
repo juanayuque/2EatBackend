@@ -3,8 +3,6 @@ const router = express.Router();
 const prisma = require("../src/prisma");
 const verifyFirebaseToken = require("../middleware/auth");
 
-// Allow preflight fast-path on this router (optional; app.options('*') already handles it)
-router.options("*", (_req, res) => res.sendStatus(204));
 
 /**
  * POST /api/users/sync-profile
