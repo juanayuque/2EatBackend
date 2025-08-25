@@ -36,23 +36,58 @@ function haversineKm(a, b) {
  * Streams a Google Places photo to the client without exposing your API key.
  * Usage: GET /api/places/photo?name=places/XXX/photos/YYY&maxWidthPx=800
  */
+// GET /api/places/photo?name=<encoded places/.../photos/...>&maxWidthPx=800&maxHeightPx=...
 router.get('/places/photo', async (req, res) => {
   try {
-    const { name, maxWidthPx = 800 } = req.query;
-    if (!name) return res.status(400).json({ error: "Missing 'name' photo id" });
+    const { name, maxWidthPx, maxHeightPx } = req.query;
+    if (!name) return res.status(400).json({ error: 'Missing "name" param' });
 
-    const url = `https://places.googleapis.com/v1/${encodeURIComponent(
-      name
-    )}/media?maxWidthPx=${maxWidthPx}&key=${process.env.GOOGLE_API_KEY}`;
+    const apiKey = process.env.GOOGLE_API_KEY_SERVER || process.env.GOOGLE_API_KEY;
+    if (!apiKey) return res.status(500).json({ error: 'Server photo key not configured' });
 
-    const response = await axios.get(url, { responseType: 'arraybuffer' });
-    res.set('Content-Type', response.headers['content-type'] || 'image/jpeg');
-    res.send(response.data);
+    // Build Google media URL with key as query param (per Places v1 docs)
+    const decodedName = decodeURIComponent(String(name));
+    const params = new URLSearchParams();
+    if (maxWidthPx) params.set('maxWidthPx', String(maxWidthPx));
+    if (maxHeightPx) params.set('maxHeightPx', String(maxHeightPx));
+    params.set('key', apiKey);
+
+    const mediaUrl = `https://places.googleapis.com/v1/${decodedName}/media?${params.toString()}`;
+
+    // 1) Hit media endpoint WITHOUT auto-following redirects
+    const head = await axios.get(mediaUrl, {
+      responseType: 'stream',
+      maxRedirects: 0,
+      validateStatus: s => s >= 200 && s < 400, // accept 302
+    });
+
+    // 2) If Google returned 302, follow it server-side
+    let finalUrl = mediaUrl;
+    if (head.status === 302 && head.headers.location) {
+      finalUrl = head.headers.location;
+    }
+
+    // 3) Stream the actual image back to the client
+    const imgResp = await axios.get(finalUrl, { responseType: 'stream' });
+
+    res.setHeader('Content-Type', imgResp.headers['content-type'] || 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=86400, s-maxage=86400');
+    // Images don’t use credentials; letting web load this from any origin is fine.
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    imgResp.data.pipe(res);
   } catch (err) {
-    console.error('Photo proxy error:', err?.response?.data || err.message);
-    res.status(500).json({ error: 'Failed to load photo' });
+    // Log status + a short snippet if available
+    const status = err?.response?.status;
+    const snippet =
+      typeof err?.response?.data === 'string'
+        ? err.response.data.slice(0, 200)
+        : err?.message;
+    console.error('Photo proxy error:', status, snippet);
+    res.status(500).json({ error: 'photo_proxy_failed' });
   }
 });
+
 
 /* -------------------- nearby restaurants (secured) ------------------- */
 router.get('/location-info', verifyFirebaseToken, async (req, res) => {
