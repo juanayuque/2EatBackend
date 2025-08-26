@@ -1,40 +1,42 @@
-// Environment variables are loaded early so that configuration is available to all modules.
+// Loads environment variables early so configuration is available everywhere.
 require("dotenv").config();
 
 const fs = require("fs");
 const http = require("http");
 const https = require("https");
 const express = require("express");
-const geocodeRoutes = require('./routes/geocode');
 const cors = require("cors");
 const helmet = require("helmet");
 const morgan = require("morgan");
 const compression = require("compression");
 const rateLimit = require("express-rate-limit");
 const admin = require("firebase-admin");
-const prisma = require("./src/prisma"); // Enables clean shutdown of Prisma connections
+const prisma = require("./src/prisma");
 
-// Route modules are kept modular for clarity and separation of concerns.
+// Route modules are kept modular for clarity.
 const locationRoutes = require("./routes/location"); // /api/places/photo + /api/location-info
-
+const geocodeRoutes = require("./routes/geocode");   // /api/geocode/*
 
 const app = express();
 
 /* ───────────────────────────── Security / performance ───────────────────────────── */
 
-// Trusting the first proxy hop ensures correct client IPs when behind Cloudflare/NGINX.
+// Trust the first proxy hop so real client IPs appear when behind Cloudflare/NGINX.
 app.set("trust proxy", 1);
 
-// Common security headers, gzip compression, and request logging for observability.
-app.use(helmet({
-  crossOriginResourcePolicy: { policy: "cross-origin" }, // <-- allow images cross-origin
-}));
+// Security headers + gzip + request logging. Cross-origin resource policy is relaxed
+// so the photo proxy can be consumed by the web app without being blocked by the browser.
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+  })
+);
 app.use(compression());
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
 /* ───────────────────────────────────── CORS ───────────────────────────────────── */
 
-// Production domains and typical local dev origins (Expo/Metro web uses 8081; Expo web often uses 19006).
+// Allow known production domains and common local dev origins (Expo/Metro).
 const allowSet = new Set([
   "https://2eatapp.com",
   "https://www.2eatapp.com",
@@ -43,14 +45,14 @@ const allowSet = new Set([
   "http://localhost:3000",  // General local dev
 ]);
 
-// LAN origins are allowed for device testing over local networks.
+// Allow typical LAN addresses for device testing (10.x, 192.168.x, 172.16–31.x).
 const devLocalRegex = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
 const devLanRegex =
   /^https?:\/\/((10\.\d{1,3}\.\d{1,3}\.\d{1,3})|(192\.168\.\d{1,3}\.\d{1,3})|(172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}))(:\d+)?$/;
 
 const corsOptions = {
   origin(origin, cb) {
-    // Requests without an Origin (mobile apps, curl, server-to-server) are allowed.
+    // Requests without an Origin (mobile apps, curl, server-to-server) should pass.
     if (!origin) return cb(null, true);
     if (allowSet.has(origin)) return cb(null, true);
     if (devLocalRegex.test(origin) || devLanRegex.test(origin)) return cb(null, true);
@@ -59,21 +61,21 @@ const corsOptions = {
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Authorization", "Content-Type"],
   credentials: true,
-  // Using 204 prevents some browsers from misreporting preflight errors.
+  // 204 avoids some browser preflight quirks.
   optionsSuccessStatus: 204,
 };
 
-// CORS is registered before any routes and preflights are explicitly handled on all paths.
+// Register CORS before any routes so preflight covers everything.
 app.use(cors(corsOptions));
 
 /* ───────────────────────────────── Request parsing ─────────────────────────────── */
 
-// JSON payload size is capped to reduce abuse potential and accidental large uploads.
+// Limit JSON payload size to reduce abuse and accidental large uploads.
 app.use(express.json({ limit: "500kb" }));
 
 /* ──────────────────────────────── Rate limiting ───────────────────────────────── */
 
-// Basic per-IP throttling; preflight (OPTIONS) requests are skipped so they do not fail CORS.
+// Throttle per-IP. OPTIONS is skipped so preflight does not get rate-limited.
 const apiLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
   max: 120,            // 120 requests/minute per IP
@@ -85,16 +87,21 @@ app.use("/api", apiLimiter);
 
 /* ───────────────────────────── Firebase Admin init ────────────────────────────── */
 
-// Firebase Admin is initialized to verify ID tokens for protected API routes.
+// Firebase Admin is used to verify ID tokens on protected endpoints.
 const serviceAccount = require("./serviceAccountKey.json");
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
 /* ─────────────────────────────────── Routes ───────────────────────────────────── */
-cconsole.log("Boot: mounting routers…");
 
-// Direct ping to prove the path is reachable even without the router
-app.get("/api/users/__ping", (_req, res) => res.json({ ok: true, via: "index" }));
+console.log("Boot: mounting routers…");
 
+// Healthcheck for load balancers/uptime monitoring.
+app.get("/", (_req, res) => res.send("2Eat API is up and running."));
+
+// Ping under /api/users to quickly confirm the path is reachable even if the users router fails to load.
+app.get("/api/users/__ping", (_req, res) => res.json({ ok: true, via: "index", ts: Date.now() }));
+
+// Load users router safely and mount under /api/users with a tiny logger to prove hits in logs.
 let usersRouter;
 try {
   usersRouter = require("./routes/users");
@@ -114,17 +121,13 @@ if (usersRouter) {
   );
 }
 
-
-// Simple healthcheck for load balancers/uptime monitoring.
-app.get("/", (_req, res) => res.send("2Eat API is up and running."));
-
-// Feature routes mounted under /api for consistency.
+// Feature routers mounted under /api for consistency.
 app.use("/api", locationRoutes);
-app.use('/api', geocodeRoutes);
+app.use("/api", geocodeRoutes);
 
 /* ─────────────────────────────── Global errors ────────────────────────────────── */
 
-// Converts CORS origin rejections into JSON and logs unexpected errors.
+// Convert CORS rejections into JSON and log unexpected errors with a 500 fallback.
 app.use((err, req, res, _next) => {
   if (err && err.message === "Not allowed by CORS") {
     return res.status(403).json({ error: "CORS blocked: origin not allowed" });
@@ -139,7 +142,7 @@ const NODE_ENV = process.env.NODE_ENV || "development";
 const HTTP_PORT = Number(process.env.PORT || 3000);
 
 if (NODE_ENV === "production") {
-  // HTTPS is served directly from Node in production using origin certificates.
+  // TLS is served directly using origin certificates so Cloudflare can connect over HTTPS.
   const SSL_KEY_PATH = process.env.SSL_KEY_PATH || "/etc/ssl/private/cloudflare.key";
   const SSL_CERT_PATH = process.env.SSL_CERT_PATH || "/etc/ssl/certs/cloudflare.crt";
   const options = {
@@ -147,18 +150,17 @@ if (NODE_ENV === "production") {
     cert: fs.readFileSync(SSL_CERT_PATH),
   };
 
-  // Binding to :443 enables Cloudflare (Full/Strict) to connect to the origin over TLS.
   https.createServer(options, app).listen(443, () => {
     console.log("✅ Backend running on https://2eatapp.com");
   });
 
-  // Optional HTTP listener for redirecting plaintext to HTTPS if no external proxy handles it.
+  // Optional: redirect plaintext to HTTPS if no external proxy handles it.
   http.createServer((req, res) => {
     res.writeHead(301, { Location: "https://2eatapp.com" + req.url });
     res.end();
   }).listen(80);
 } else {
-  // Development uses a plain HTTP port to simplify local testing.
+  // Development uses HTTP on a standard port for simplicity.
   app.listen(HTTP_PORT, () =>
     console.log(`🔧 Dev server on http://localhost:${HTTP_PORT}`)
   );
@@ -166,7 +168,7 @@ if (NODE_ENV === "production") {
 
 /* ────────────────────────────── Graceful shutdown ─────────────────────────────── */
 
-// Ensures database connections are closed before process exit to avoid corruption or hanging.
+// Ensures open DB connections are closed before exit to avoid hangs or corruption.
 function shutdown() {
   console.log("Shutting down…");
   Promise.resolve()
@@ -175,3 +177,4 @@ function shutdown() {
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+
