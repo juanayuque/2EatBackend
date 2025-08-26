@@ -5,6 +5,7 @@ const fs = require("fs");
 const http = require("http");
 const https = require("https");
 const express = require("express");
+const geocodeRoutes = require('./routes/geocode');
 const cors = require("cors");
 const helmet = require("helmet");
 const morgan = require("morgan");
@@ -96,6 +97,7 @@ app.get("/", (_req, res) => res.send("2Eat API is up and running."));
 // Feature routes mounted under /api for consistency.
 app.use("/api", locationRoutes);
 app.use("/api/users", userRoutes);
+app.use('/api', geocodeRoutes);
 
 /* ─────────────────────────────── Global errors ────────────────────────────────── */
 
