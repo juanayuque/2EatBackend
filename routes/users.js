@@ -55,150 +55,59 @@ router.post("/sync-profile", verifyFirebaseToken, async (req, res) => {
   }
 });
 
-/**
- * Returns the current preference snapshot for the authenticated user.
- * Defaults are provided when no row exists yet to keep the UI stable.
- */
+// small ping to confirm the router is mounted
+router.get("/__ping", (_req, res) => res.json({ ok: true }));
+
+// read current prefs
 router.get("/preferences", verifyFirebaseToken, async (req, res) => {
-  try {
-    const user = await prisma.user.findUnique({
-      where: { firebaseUid: req.user.uid },
-      select: {
-        preferredCuisines: true,
-        dietaryNeeds: true,
-        maxBudget: true,
-        preferredPriceLevel: true,
-        searchDistance: true,
-        budgetRange: true, // kept for backward compatibility if needed elsewhere
-      },
-    });
-
-    if (!user) {
-      return res.json({
-        cuisines: [],
-        diet: [],
-        budgetMax: 25,
-        priceLevel: 2,
-        distanceKm: 5,
-        budgetRange: [],
-      });
-    }
-
-    return res.json({
-      cuisines: user.preferredCuisines ?? [],
-      diet: user.dietaryNeeds ?? [],
-      budgetMax: user.maxBudget ?? 25,
-      priceLevel:
-        typeof user.preferredPriceLevel === "number"
-          ? user.preferredPriceLevel
-          : 2,
-      distanceKm:
-        typeof user.searchDistance === "number" ? user.searchDistance : null, // null = Unlimited
-      budgetRange: user.budgetRange ?? [],
-    });
-  } catch (err) {
-    console.error("Fetch preferences failed:", err);
-    return res.status(500).json({ error: "Failed to load preferences" });
-  }
+  const uid = req.user.uid;
+  const user = await prisma.user.findUnique({
+    where: { firebaseUid: uid },
+    select: {
+      firebaseUid: true,
+      budgetMax: true,
+      priceLevelStars: true,
+      searchDistance: true,
+      dietaryNeeds: true,
+      preferredCuisines: true,
+    },
+  });
+  if (!user) return res.status(404).json({ error: "User not found" });
+  res.json(user);
 });
 
-/**
- * Saves preference updates. Values are sanitized to expected ranges and
- * a derived price level is kept in sync with max budget for easier querying.
- */
+// upsert prefs
 router.post("/preferences", verifyFirebaseToken, async (req, res) => {
-  try {
-    const {
-      cuisines = [],
-      diet = [],
+  const uid = req.user.uid;
+  const {
+    budgetMax,           // number 0..100
+    priceLevelStars,     // 0..4
+    searchDistance,      // number (km) or null for unlimited
+    dietaryNeeds,        // string[]
+    preferredCuisines,   // string[]
+  } = req.body || {};
+
+  const saved = await prisma.user.upsert({
+    where: { firebaseUid: uid },
+    update: {
       budgetMax,
-      priceLevel,
-      distanceKm, // number or null (Unlimited)
-    } = req.body || {};
+      priceLevelStars,
+      searchDistance: searchDistance ?? null,
+      dietaryNeeds: Array.isArray(dietaryNeeds) ? dietaryNeeds : [],
+      preferredCuisines: Array.isArray(preferredCuisines) ? preferredCuisines : [],
+    },
+    create: {
+      firebaseUid: uid,
+      email: req.user.email ?? null,
+      budgetMax: budgetMax ?? 0,
+      priceLevelStars: priceLevelStars ?? 0,
+      searchDistance: searchDistance ?? null,
+      dietaryNeeds: Array.isArray(dietaryNeeds) ? dietaryNeeds : [],
+      preferredCuisines: Array.isArray(preferredCuisines) ? preferredCuisines : [],
+    },
+  });
 
-    const toStringArray = (v) =>
-      Array.isArray(v) ? v.map((x) => String(x)).filter(Boolean) : [];
-
-    const preferredCuisines = toStringArray(cuisines);
-    const dietaryNeeds = toStringArray(diet);
-
-    // Clamp numeric inputs to expected ranges
-    const nb =
-      typeof budgetMax === "number"
-        ? Math.max(0, Math.min(100, Math.round(budgetMax)))
-        : null;
-
-    // If priceLevel not provided, derive from maxBudget using UI bands
-    const pl =
-      typeof priceLevel === "number"
-        ? Math.max(0, Math.min(4, Math.round(priceLevel)))
-        : nb === null
-        ? null
-        : nb <= 0
-        ? 0
-        : nb <= 15
-        ? 1
-        : nb <= 30
-        ? 2
-        : nb <= 60
-        ? 3
-        : 4;
-
-    // Null means “Unlimited” in the UI
-    const sd =
-      distanceKm === null
-        ? null
-        : typeof distanceKm === "number"
-        ? Math.max(0, Math.min(1000, Math.round(distanceKm)))
-        : null;
-
-    const updated = await prisma.user.upsert({
-      where: { firebaseUid: req.user.uid },
-      update: {
-        preferredCuisines,
-        dietaryNeeds,
-        maxBudget: nb,
-        preferredPriceLevel: pl,
-        searchDistance: sd,
-        updatedAt: new Date(),
-      },
-      create: {
-        firebaseUid: req.user.uid,
-        preferredCuisines,
-        dietaryNeeds,
-        maxBudget: nb,
-        preferredPriceLevel: pl,
-        searchDistance: sd,
-      },
-      select: {
-        preferredCuisines: true,
-        dietaryNeeds: true,
-        maxBudget: true,
-        preferredPriceLevel: true,
-        searchDistance: true,
-      },
-    });
-
-    return res.status(200).json({
-      message: "Preferences saved",
-      preferences: {
-        cuisines: updated.preferredCuisines ?? [],
-        diet: updated.dietaryNeeds ?? [],
-        budgetMax: updated.maxBudget ?? 0,
-        priceLevel:
-          typeof updated.preferredPriceLevel === "number"
-            ? updated.preferredPriceLevel
-            : 0,
-        distanceKm:
-          typeof updated.searchDistance === "number"
-            ? updated.searchDistance
-            : null,
-      },
-    });
-  } catch (err) {
-    console.error("Save preferences failed:", err);
-    return res.status(500).json({ error: "Failed to save preferences" });
-  }
+  res.json({ ok: true, preferences: saved });
 });
 
 module.exports = router;
