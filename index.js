@@ -13,9 +13,6 @@ const rateLimit = require("express-rate-limit");
 const admin = require("firebase-admin");
 const prisma = require("./src/prisma");
 
-// Route modules are kept modular for clarity.
-const locationRoutes = require("./routes/location"); // /api/places/photo + /api/location-info
-const geocodeRoutes = require("./routes/geocode");   // /api/geocode/*
 
 const app = express();
 
