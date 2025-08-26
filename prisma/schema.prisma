@@ -32,20 +32,20 @@ enum BudgetLevel {
 }
 
 model User {
-  id                String        @id @default(cuid())
-  firebaseUid       String        @unique
-  email             String?       @unique
+  id                String   @id @default(cuid())
+  firebaseUid       String   @unique
+  email             String?  @unique
   age               Int? // Optional, if user provides it
   gender            Gender? // Optional, using the Gender enum
-  searchDistance    Int?          @map("search_distance") // Distance in km
-  budgetMax Int? @map("budget_max")
-  dietaryNeeds      String[]      @map("dietary_needs") // Array of strings (e.g., "Vegetarian", "Gluten-Free")
-  preferredCuisines String[]      @map("preferred_cuisines") // Array of strings
+  searchDistance    Int?     @map("search_distance") // Distance in km
+  budgetMax         Int?     @map("budget_max")
+  dietaryNeeds      String[] @map("dietary_needs") // Array of strings (e.g., "Vegetarian", "Gluten-Free")
+  preferredCuisines String[] @map("preferred_cuisines") // Array of strings
   displayName       String? // username ?
   photoUrl          String? // avatar url
-  emailVerified     Boolean?      @default(false)
-  createdAt         DateTime      @default(now()) @map("created_at")
-  updatedAt         DateTime      @updatedAt @map("updated_at")
+  emailVerified     Boolean? @default(false)
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
 
   @@map("users")
 }
