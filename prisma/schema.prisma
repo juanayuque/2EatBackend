@@ -14,7 +14,7 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// Predefined options for gender selection
+//Predefined options
 enum Gender {
   MALE
   FEMALE
@@ -22,114 +22,96 @@ enum Gender {
   PREFER_NOT_TO_SAY
 }
 
-// Budget bands used as a coarse preference signal
+// Budget Ranges
 enum BudgetLevel {
-  VERY_CHEAP       // e.g., 0–5 pounds
-  CHEAP            // e.g., 0–10 pounds
-  MODERATE         // e.g., 0–20 pounds
-  EXPENSIVE        // e.g., 0–40 pounds
-  VERY_EXPENSIVE   // e.g., any
+  VERY_CHEAP // e.g., 0-5 pounds
+  CHEAP // e.g., 0-10 pounds
+  MODERATE // e.g., 0-20 pounds
+  EXPENSIVE // e.g., 0-40 pounds
+  VERY_EXPENSIVE // e.g., any
 }
 
 model User {
-  id                    String        @id @default(cuid())
-  firebaseUid           String        @unique
-  email                 String?       @unique
-
-  // Optional demographics and preference fields
-  age                   Int?
-  gender                Gender?
-
-  // Max search distance in km; null means "Unlimited"
-  searchDistance        Int?          @map("search_distance")
-
-  // Coarse preference bands (array) for compatibility with older/alt UIs
-  budgetRange           BudgetLevel[] @map("budget_range")
-
-  // Fine-grained max budget in pounds, 0–100 (UI slider)
-  maxBudget             Int?          @map("max_budget")
-
-  // Derived 0–4 star preference from maxBudget; stored to avoid recompute in queries
-  preferredPriceLevel   Int?          @map("preferred_price_level")
-
-  // Arrays stored as Postgres arrays for easy inclusion/exclusion filtering
-  dietaryNeeds          String[]      @map("dietary_needs")
-  preferredCuisines     String[]      @map("preferred_cuisines")
-
-  // Auth profile mirroring for convenience in UI
-  displayName           String?
-  photoUrl              String?
-  emailVerified         Boolean?      @default(false)
-
-  createdAt             DateTime      @default(now()) @map("created_at")
-  updatedAt             DateTime      @updatedAt      @map("updated_at")
+  id                String        @id @default(cuid())
+  firebaseUid       String        @unique
+  email             String?       @unique
+  age               Int? // Optional, if user provides it
+  gender            Gender? // Optional, using the Gender enum
+  searchDistance    Int?          @map("search_distance") // Distance in km
+  budgetRange       BudgetLevel[] @map("budget_range") // 
+  dietaryNeeds      String[]      @map("dietary_needs") // Array of strings (e.g., "Vegetarian", "Gluten-Free")
+  preferredCuisines String[]      @map("preferred_cuisines") // Array of strings
+  displayName       String? // username ?
+  photoUrl          String? // avatar url
+  emailVerified     Boolean?      @default(false)
+  createdAt         DateTime      @default(now()) @map("created_at")
+  updatedAt         DateTime      @updatedAt @map("updated_at")
 
   @@map("users")
 }
 
 model Restaurant {
-  // Internal id separate from Google Place ID to allow merging/renames if needed
-  id                        String     @id @default(uuid())
+  // We use `googlePlaceId` as the unique identifier for Google Places.
+  id                       String   @id @default(uuid())
+  googlePlaceId            String   @unique @map("google_place_id") // Google's unique Place ID, MUST be NOT NULL
+  name                     String
+  latitude                 Decimal  @db.Decimal(10, 7) // Store with specific precision for lat/lng
+  longitude                Decimal  @db.Decimal(10, 7)
+  formattedAddress         String?  @map("formatted_address") @db.Text // Use @db.Text for longer strings
+  internationalPhoneNumber String?  @map("international_phone_number")
+  websiteUri               String?  @map("website_uri") @db.Text
+  primaryTypeDisplayName   String?  @map("primary_type_display_name")
+  rating                   Decimal? @db.Decimal(2, 1) // Store with specific precision for rating
+  userRatingCount          Int?     @map("user_rating_count")
+  priceLevel               Int?     @map("price_level")
+  servesVegetarianFood     Boolean? @default(false) @map("serves_vegetarian_food")
+  editorialSummary         String?  @map("editorial_summary") @db.Text
+  plusCode                 String?  @map("plus_code")
+  takeout                  Boolean? @default(false)
+  dineIn                   Boolean? @default(false) @map("dine_in")
+  curbsidePickup           Boolean? @default(false) @map("curbside_pickup")
+  delivery                 Boolean? @default(false)
+  outdoorSeating           Boolean? @default(false) @map("outdoor_seating")
+  allowsDogs               Boolean? @default(false) @map("allows_dogs")
+  parkingOptions           Json?    @map("parking_options") // Use Json for PostgreSQL's JSONB type
+  regularOpeningHours      Json?    @map("regular_opening_hours") // Use Json for PostgreSQL's JSONB type
 
-  // Google's unique Place ID for deduping and external joins
-  googlePlaceId             String     @unique @map("google_place_id")
+  // Relations to other models
+  reviews Review[]
+  photos  Photo[]
 
-  name                      String
-  latitude                  Decimal    @db.Decimal(10, 7)
-  longitude                 Decimal    @db.Decimal(10, 7)
-  formattedAddress          String?    @map("formatted_address") @db.Text
-  internationalPhoneNumber  String?    @map("international_phone_number")
-  websiteUri                String?    @map("website_uri") @db.Text
-  primaryTypeDisplayName    String?    @map("primary_type_display_name")
-  rating                    Decimal?   @db.Decimal(2, 1)
-  userRatingCount           Int?       @map("user_rating_count")
-  priceLevel                Int?       @map("price_level")
-  servesVegetarianFood      Boolean?   @map("serves_vegetarian_food") @default(false)
-  editorialSummary          String?    @map("editorial_summary") @db.Text
-  plusCode                  String?    @map("plus_code")
-  takeout                   Boolean?   @default(false)
-  dineIn                    Boolean?   @map("dine_in") @default(false)
-  curbsidePickup            Boolean?   @map("curbside_pickup") @default(false)
-  delivery                  Boolean?   @default(false)
-  outdoorSeating            Boolean?   @map("outdoor_seating") @default(false)
-  allowsDogs                Boolean?   @map("allows_dogs") @default(false)
-  parkingOptions            Json?      @map("parking_options")
-  regularOpeningHours       Json?      @map("regular_opening_hours")
+  // Timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
 
-  reviews                   Review[]
-  photos                    Photo[]
-
-  createdAt                 DateTime   @default(now()) @map("created_at")
-  updatedAt                 DateTime   @updatedAt      @map("updated_at")
-
-  @@map("restaurants")
+  @@map("restaurants") // Maps this model to the 'restaurants' table in the database
 }
 
 model Review {
-  id            String      @id @default(uuid())
-  restaurant    Restaurant  @relation(fields: [restaurantId], references: [id])
-  restaurantId  String      @map("restaurant_id")
-  author        String
-  text          String?     @db.Text
-  rating        Decimal     @db.Decimal(2, 1)
-  publishTime   DateTime?   @map("publish_time")
+  id           String     @id @default(uuid())
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  restaurantId String     @map("restaurant_id")
+  author       String
+  text         String?    @db.Text
+  rating       Decimal    @db.Decimal(2, 1)
+  publishTime  DateTime?  @map("publish_time")
 
-  createdAt     DateTime    @default(now()) @map("created_at")
-  updatedAt     DateTime    @updatedAt      @map("updated_at")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
 
   @@map("reviews")
 }
 
 model Photo {
-  id            String      @id @default(uuid())
-  restaurant    Restaurant  @relation(fields: [restaurantId], references: [id])
-  restaurantId  String      @map("restaurant_id")
-  name          String
-  widthPx       Int?        @map("width_px")
-  heightPx      Int?        @map("height_px")
+  id           String     @id @default(uuid())
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  restaurantId String     @map("restaurant_id")
+  name         String
+  widthPx      Int?       @map("width_px")
+  heightPx     Int?       @map("height_px")
 
-  createdAt     DateTime    @default(now()) @map("created_at")
-  updatedAt     DateTime    @updatedAt      @map("updated_at")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
 
   @@map("photos")
 }
