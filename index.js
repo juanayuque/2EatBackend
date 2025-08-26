@@ -96,7 +96,10 @@ app.get("/", (_req, res) => res.send("2Eat API is up and running."));
 
 // Feature routes mounted under /api for consistency.
 app.use("/api", locationRoutes);
-app.use("/api/users", userRoutes);
+app.use("/api/users", (req, _res, next) => {
+  console.log("users-router hit:", req.method, req.url);
+  next();
+}, userRoutes);
 app.use('/api', geocodeRoutes);
 
 /* ─────────────────────────────── Global errors ────────────────────────────────── */
