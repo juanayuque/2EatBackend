@@ -1,108 +1,203 @@
+// routes/users.js
+require("dotenv").config();
+
 const express = require("express");
-const router = express.Router();
 const prisma = require("../src/prisma");
 const verifyFirebaseToken = require("../middleware/auth");
 
+const router = express.Router();
 
 /**
- * POST /api/users/sync-profile
- * Synchronizes the authenticated user's profile into the database.
- * Uses Firebase ID token decoded by verifyFirebaseToken.
+ * Mirrors Firebase profile into the local users table so downstream queries
+ * can avoid calling Firebase Admin repeatedly.
  */
 router.post("/sync-profile", verifyFirebaseToken, async (req, res) => {
   try {
-    // Decoded Firebase claims from middleware
+    // Token has been verified by middleware; decoded claims are on req.user
     const {
-      uid: firebaseUid,
+      uid,
       email = null,
-      name: tokenName = null,
-      picture: tokenPicture = null,
-      email_verified: emailVerified = null,
+      name = null,
+      picture = null,
+      email_verified = false,
     } = req.user || {};
 
-    if (!firebaseUid) {
-      return res.status(401).json({ error: "Invalid token: uid missing" });
-    }
-
-    // Optional client-provided overrides
-    const { displayName: bodyName, photoUrl: bodyPhotoUrl } = req.body || {};
-
-    const displayName = bodyName ?? tokenName ?? null;
-    const photoUrl = bodyPhotoUrl ?? tokenPicture ?? null;
-
-    // Upsert user by firebaseUid to keep operation idempotent
     const user = await prisma.user.upsert({
-      where: { firebaseUid },
+      where: { firebaseUid: uid },
       update: {
         email,
-        displayName,
-        photoUrl,
-        emailVerified,
+        displayName: name,
+        photoUrl: picture,
+        emailVerified: email_verified,
         updatedAt: new Date(),
       },
       create: {
-        firebaseUid,
+        firebaseUid: uid,
         email,
-        displayName,
-        photoUrl,
-        emailVerified,
+        displayName: name,
+        photoUrl: picture,
+        emailVerified: email_verified,
       },
-      // select could be used to limit response payload if the table grows
+      select: {
+        id: true,
+        firebaseUid: true,
+        email: true,
+        displayName: true,
+        photoUrl: true,
+        emailVerified: true,
+      },
     });
 
-    return res.status(200).json({
-      message: "User profile synced successfully",
-      user: {
-        id: user.id,
-        firebaseUid: user.firebaseUid,
-        email: user.email,
-        displayName: user.displayName,
-        photoUrl: user.photoUrl,
-        emailVerified: user.emailVerified,
-      },
-    });
+    return res.status(200).json({ message: "Profile synced", user });
   } catch (err) {
     console.error("User sync failed:", err);
-    return res
-      .status(500)
-      .json({ error: "User sync failed", code: "user-sync-error" });
+    return res.status(500).json({ error: "User sync error" });
   }
 });
 
 /**
- * GET /api/users/me
- * Returns the authenticated user's profile from the database.
+ * Returns the current preference snapshot for the authenticated user.
+ * Defaults are provided when no row exists yet to keep the UI stable.
  */
-router.get("/me", verifyFirebaseToken, async (req, res) => {
+router.get("/preferences", verifyFirebaseToken, async (req, res) => {
   try {
-    const { uid: firebaseUid } = req.user || {};
-    if (!firebaseUid) {
-      return res.status(401).json({ error: "Invalid token: uid missing" });
-    }
-
     const user = await prisma.user.findUnique({
-      where: { firebaseUid },
+      where: { firebaseUid: req.user.uid },
+      select: {
+        preferredCuisines: true,
+        dietaryNeeds: true,
+        maxBudget: true,
+        preferredPriceLevel: true,
+        searchDistance: true,
+        budgetRange: true, // kept for backward compatibility if needed elsewhere
+      },
     });
 
     if (!user) {
-      return res.status(404).json({ error: "User not found" });
+      return res.json({
+        cuisines: [],
+        diet: [],
+        budgetMax: 25,
+        priceLevel: 2,
+        distanceKm: 5,
+        budgetRange: [],
+      });
     }
 
     return res.json({
-      user: {
-        id: user.id,
-        firebaseUid: user.firebaseUid,
-        email: user.email,
-        displayName: user.displayName,
-        photoUrl: user.photoUrl,
-        emailVerified: user.emailVerified,
+      cuisines: user.preferredCuisines ?? [],
+      diet: user.dietaryNeeds ?? [],
+      budgetMax: user.maxBudget ?? 25,
+      priceLevel:
+        typeof user.preferredPriceLevel === "number"
+          ? user.preferredPriceLevel
+          : 2,
+      distanceKm:
+        typeof user.searchDistance === "number" ? user.searchDistance : null, // null = Unlimited
+      budgetRange: user.budgetRange ?? [],
+    });
+  } catch (err) {
+    console.error("Fetch preferences failed:", err);
+    return res.status(500).json({ error: "Failed to load preferences" });
+  }
+});
+
+/**
+ * Saves preference updates. Values are sanitized to expected ranges and
+ * a derived price level is kept in sync with max budget for easier querying.
+ */
+router.post("/preferences", verifyFirebaseToken, async (req, res) => {
+  try {
+    const {
+      cuisines = [],
+      diet = [],
+      budgetMax,
+      priceLevel,
+      distanceKm, // number or null (Unlimited)
+    } = req.body || {};
+
+    const toStringArray = (v) =>
+      Array.isArray(v) ? v.map((x) => String(x)).filter(Boolean) : [];
+
+    const preferredCuisines = toStringArray(cuisines);
+    const dietaryNeeds = toStringArray(diet);
+
+    // Clamp numeric inputs to expected ranges
+    const nb =
+      typeof budgetMax === "number"
+        ? Math.max(0, Math.min(100, Math.round(budgetMax)))
+        : null;
+
+    // If priceLevel not provided, derive from maxBudget using UI bands
+    const pl =
+      typeof priceLevel === "number"
+        ? Math.max(0, Math.min(4, Math.round(priceLevel)))
+        : nb === null
+        ? null
+        : nb <= 0
+        ? 0
+        : nb <= 15
+        ? 1
+        : nb <= 30
+        ? 2
+        : nb <= 60
+        ? 3
+        : 4;
+
+    // Null means “Unlimited” in the UI
+    const sd =
+      distanceKm === null
+        ? null
+        : typeof distanceKm === "number"
+        ? Math.max(0, Math.min(1000, Math.round(distanceKm)))
+        : null;
+
+    const updated = await prisma.user.upsert({
+      where: { firebaseUid: req.user.uid },
+      update: {
+        preferredCuisines,
+        dietaryNeeds,
+        maxBudget: nb,
+        preferredPriceLevel: pl,
+        searchDistance: sd,
+        updatedAt: new Date(),
+      },
+      create: {
+        firebaseUid: req.user.uid,
+        preferredCuisines,
+        dietaryNeeds,
+        maxBudget: nb,
+        preferredPriceLevel: pl,
+        searchDistance: sd,
+      },
+      select: {
+        preferredCuisines: true,
+        dietaryNeeds: true,
+        maxBudget: true,
+        preferredPriceLevel: true,
+        searchDistance: true,
+      },
+    });
+
+    return res.status(200).json({
+      message: "Preferences saved",
+      preferences: {
+        cuisines: updated.preferredCuisines ?? [],
+        diet: updated.dietaryNeeds ?? [],
+        budgetMax: updated.maxBudget ?? 0,
+        priceLevel:
+          typeof updated.preferredPriceLevel === "number"
+            ? updated.preferredPriceLevel
+            : 0,
+        distanceKm:
+          typeof updated.searchDistance === "number"
+            ? updated.searchDistance
+            : null,
       },
     });
   } catch (err) {
-    console.error("Fetch current user failed:", err);
-    return res
-      .status(500)
-      .json({ error: "Failed to fetch profile", code: "user-fetch-error" });
+    console.error("Save preferences failed:", err);
+    return res.status(500).json({ error: "Failed to save preferences" });
   }
 });
 
