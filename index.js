@@ -91,37 +91,24 @@ app.use("/api", apiLimiter);
 const serviceAccount = require("./serviceAccountKey.json");
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
-/* ─────────────────────────────────── Routes ───────────────────────────────────── */
+/* ───────────────────────────── Routes ───────────────────────────── */
 
-console.log("Boot: mounting routers…");
-
-// Healthcheck for load balancers/uptime monitoring.
+// Health check
 app.get("/", (_req, res) => res.send("2Eat API is up and running."));
 
-// Ping under /api/users to quickly confirm the path is reachable even if the users router fails to load.
+// Add a simple ping inside the /api/users namespace to verify mount works.
 app.get("/api/users/__ping", (_req, res) => res.json({ ok: true, via: "index", ts: Date.now() }));
 
-// Load users router safely and mount under /api/users with a tiny logger to prove hits in logs.
-let usersRouter;
-try {
-  usersRouter = require("./routes/users");
-  console.log("Boot: users router loaded");
-} catch (e) {
-  console.error("Boot: users router FAILED to load:", e);
-}
+// Load and mount users router ONCE
+const usersRouter = require("./routes/users");
+app.use("/api/users", (req, _res, next) => {
+  console.log("users-router hit:", req.method, req.url);
+  next();
+}, usersRouter);
 
-if (usersRouter) {
-  app.use(
-    "/api/users",
-    (req, _res, next) => {
-      console.log("users-router hit:", req.method, req.url);
-      next();
-    },
-    usersRouter
-  );
-}
-
-// Feature routers mounted under /api for consistency.
+// Other feature routers
+const locationRoutes = require("./routes/location");
+const geocodeRoutes = require("./routes/geocode");
 app.use("/api", locationRoutes);
 app.use("/api", geocodeRoutes);
 
