@@ -38,7 +38,7 @@ model User {
   age               Int? // Optional, if user provides it
   gender            Gender? // Optional, using the Gender enum
   searchDistance    Int?          @map("search_distance") // Distance in km
-  budgetRange       BudgetLevel[] @map("budget_range") // 
+  budgetMax Int? @map("budget_max")
   dietaryNeeds      String[]      @map("dietary_needs") // Array of strings (e.g., "Vegetarian", "Gluten-Free")
   preferredCuisines String[]      @map("preferred_cuisines") // Array of strings
   displayName       String? // username ?
