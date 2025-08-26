@@ -90,16 +90,28 @@ const serviceAccount = require("./serviceAccountKey.json");
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
 /* ─────────────────────────────────── Routes ───────────────────────────────────── */
+console.log("Boot: mounting routers…");
+
+app.get("/api/users/__ping", (_req, res) => res.json({ ok: true, via: "index" }));
+
+let userRoutes;
+try {
+  userRoutes = require("./routes/users");
+  console.log("Boot: users router loaded");
+} catch (e) {
+  console.error("Boot: users router FAILED to load:", e);
+}
+
+app.use("/api/users", (req, _res, next) => {
+  console.log("users-router hit:", req.method, req.url);
+  next();
+}, userRoutes);
 
 // Simple healthcheck for load balancers/uptime monitoring.
 app.get("/", (_req, res) => res.send("2Eat API is up and running."));
 
 // Feature routes mounted under /api for consistency.
 app.use("/api", locationRoutes);
-app.use("/api/users", (req, _res, next) => {
-  console.log("users-router hit:", req.method, req.url);
-  next();
-}, userRoutes);
 app.use('/api', geocodeRoutes);
 
 /* ─────────────────────────────── Global errors ────────────────────────────────── */
