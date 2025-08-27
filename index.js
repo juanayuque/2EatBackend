@@ -106,8 +106,12 @@ app.use("/api/users", (req, _res, next) => {
 // Other feature routers
 const locationRoutes = require("./routes/location");
 const geocodeRoutes = require("./routes/geocode");
+const recsRoutes = require("./routes/recs");
+
 app.use("/api", locationRoutes);
 app.use("/api", geocodeRoutes);
+app.use("/api/recs", recsRoutes);
+
 
 /* ─────────────────────────────── Global errors ────────────────────────────────── */
 
