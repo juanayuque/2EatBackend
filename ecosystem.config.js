@@ -7,10 +7,12 @@ module.exports = {
       exec_mode: "fork",
       env: {
         NODE_ENV: "production",
+        USE_LOCAL_TLS: "1", // <— enable local TLS in index.js
+        SSL_KEY_PATH: "/home/ubuntu/certs/cloudflare.key",
+        SSL_CERT_PATH: "/home/ubuntu/certs/cloudflare.crt",
+        PORT: "3000",
         BACKEND_PUBLIC_URL: "https://2eatapp.com",
-        SSL_KEY_PATH: "/etc/ssl/private/cloudflare.key",
-        SSL_CERT_PATH: "/etc/ssl/certs/cloudflare.crt",
-        GOOGLE_API_KEY: process.env.GOOGLE_API_KEY
+        GOOGLE_API_KEY: process.env.GOOGLE_API_KEY || ""
       }
     }
   ]
