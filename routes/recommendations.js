@@ -1,4 +1,5 @@
 // routes/recommendations.js
+require('dotenv').config();
 const express = require("express");
 const prisma = require("../src/prisma");
 const verifyFirebaseToken = require("../middleware/auth");
