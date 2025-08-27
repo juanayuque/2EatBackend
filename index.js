@@ -15,7 +15,7 @@ const prisma = require("./src/prisma");
 
 const app = express();
 
-/* ───────────────────────────── Security / perf ───────────────────────────── */
+/* ───────────────────────────── Security / performance ───────────────────────────── */
 
 app.set("trust proxy", 1);
 
@@ -121,32 +121,28 @@ app.use((err, _req, res, _next) => {
 
 const NODE_ENV = process.env.NODE_ENV || "development";
 const HTTP_PORT = Number(process.env.PORT || 3000);
+const USE_LOCAL_TLS = process.env.USE_LOCAL_TLS === "1";
 
-if (NODE_ENV === "production") {
-  const SSL_KEY_PATH = process.env.SSL_KEY_PATH || "/etc/ssl/private/cloudflare.key";
-  const SSL_CERT_PATH = process.env.SSL_CERT_PATH || "/etc/ssl/certs/cloudflare.crt";
+if (NODE_ENV === "production" && USE_LOCAL_TLS) {
+  const keyPath  = process.env.SSL_KEY_PATH;
+  const certPath = process.env.SSL_CERT_PATH;
   const options = {
-    key: fs.readFileSync(SSL_KEY_PATH),
-    cert: fs.readFileSync(SSL_CERT_PATH),
+    key: fs.readFileSync(keyPath),
+    cert: fs.readFileSync(certPath),
   };
-
   https.createServer(options, app).listen(443, () => {
     console.log("✅ Backend running on https://2eatapp.com");
   });
-
-  http
-    .createServer((req, res) => {
-      res.writeHead(301, { Location: "https://2eatapp.com" + req.url });
-      res.end();
-    })
-    .listen(80);
+  http.createServer((req, res) => {
+    res.writeHead(301, { Location: "https://2eatapp.com" + req.url });
+    res.end();
+  }).listen(80);
 } else {
-  app.listen(HTTP_PORT, () =>
-    console.log(`🔧 Dev server on http://localhost:${HTTP_PORT}`)
-  );
+  app.listen(HTTP_PORT, () => console.log(`🔧 Dev server on http://localhost:${HTTP_PORT}`));
 }
 
-/* ────────────────────────────── Graceful shutdown ─────────────────────────────── */
+
+/* ────────────────────────────── Safe shutdown ─────────────────────────────── */
 
 function shutdown() {
   console.log("Shutting down…");
