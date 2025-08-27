@@ -22,13 +22,73 @@ enum Gender {
   PREFER_NOT_TO_SAY
 }
 
-// Budget Ranges
-enum BudgetLevel {
-  VERY_CHEAP // e.g., 0-5 pounds
-  CHEAP // e.g., 0-10 pounds
-  MODERATE // e.g., 0-20 pounds
-  EXPENSIVE // e.g., 0-40 pounds
-  VERY_EXPENSIVE // e.g., any
+enum SwipeAction {
+  LIKE
+  PASS
+  SUPERSTAR
+}
+
+model SwipeSession {
+  id           String     @id @default(cuid())
+  userId       String
+  user         User       @relation(fields: [userId], references: [id])
+  status       String     @default("active") // active|completed
+  startedAt    DateTime   @default(now())
+  endedAt      DateTime?
+  totalSwipes  Int        @default(0)
+
+  events       SwipeEvent[]
+  match        Match?
+
+  @@index([userId, status])
+  @@map("swipe_sessions")
+}
+
+model SwipeEvent {
+  id           String      @id @default(cuid())
+  sessionId    String
+  session      SwipeSession @relation(fields: [sessionId], references: [id])
+  userId       String
+  user         User        @relation(fields: [userId], references: [id])
+  restaurantId String
+  action       SwipeAction
+  position     Int         // 1..N within session
+  createdAt    DateTime    @default(now())
+
+  @@index([userId])
+  @@index([restaurantId])
+  @@map("swipe_events")
+}
+
+model Superstar {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
+  restaurantId String
+  sessionId    String?
+  createdAt    DateTime @default(now())
+
+  @@unique([userId, restaurantId])
+  @@index([sessionId])
+  @@map("superstars")
+}
+
+model Match {
+  id                     String   @id @default(cuid())
+  userId                 String
+  user                   User     @relation(fields: [userId], references: [id])
+  sessionId              String   @unique
+  session                SwipeSession @relation(fields: [sessionId], references: [id])
+
+  top1RestaurantId       String
+  top2RestaurantId       String?
+  top3RestaurantId       String?
+  superStarRestaurantId  String?
+  winnerRestaurantId     String
+  createdAt              DateTime @default(now())
+
+  @@index([userId])
+  @@map("matches")
 }
 
 model User {
@@ -43,9 +103,13 @@ model User {
   preferredCuisines String[] @map("preferred_cuisines") // Array of strings
   displayName       String? // username ?
   photoUrl          String? // avatar url
-  emailVerified     Boolean? @default(false)
-  createdAt         DateTime @default(now()) @map("created_at")
-  updatedAt         DateTime @updatedAt @map("updated_at")
+  sessions    SwipeSession[]
+  events      SwipeEvent[]
+  superstars  Superstar[]
+  matches     Match[]
+  emailVerified     Boolean?      @default(false)
+  createdAt         DateTime      @default(now()) @map("created_at")
+  updatedAt         DateTime      @updatedAt @map("updated_at")
 
   @@map("users")
 }
