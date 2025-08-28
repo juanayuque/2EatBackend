@@ -109,6 +109,7 @@ const PLACES_FIELD_MASK = [
   "places.priceLevel",
   "places.rating",
   "places.userRatingCount",
+  "places.editorialSummary",
   "places.photos.widthPx",
   "places.photos.heightPx",
   "places.photos.name",
@@ -175,11 +176,12 @@ function mapPlaceToRestaurantCreate(place) {
       formattedAddress: place.formattedAddress || null,
       internationalPhoneNumber: place.nationalPhoneNumber || null,
       websiteUri: place.websiteUri || null,
-      primaryTypeDisplayName: ptdn,
+      primaryTypeDisplayName: place.primaryTypeDisplayName?.text || null,
       primaryType: place.primaryType || null,
       types: Array.isArray(place.types) ? place.types : [],
       rating: place.rating != null ? String(place.rating) : null,
       userRatingCount: place.userRatingCount ?? null,
+      editorialSummary: place.editorialSummary?.text || null,
       priceLevel, // <-- INT or null
       servesVegetarianFood: false,
       takeout: false,
@@ -216,7 +218,8 @@ async function upsertPlacesBatch(places) {
         types: mapped.restaurant.types,
         rating: mapped.restaurant.rating,
         userRatingCount: mapped.restaurant.userRatingCount,
-        priceLevel: mapped.restaurant.priceLevel, // <-- INT or null
+        priceLevel: mapped.restaurant.priceLevel, 
+        editorialSummary: mapped.restaurant.editorialSummary,
       },
     });
     if (mapped.photo) {
@@ -475,11 +478,14 @@ router.post("/start", async (req, res) => {
     const user = await prisma.user.findUnique({ where: { firebaseUid: uid } });
     if (!user) return res.status(404).json({ error: "User not found. Sync profile first." });
 
-    await prisma.swipeSession.updateMany({
+    let session = await prisma.swipeSession.findFirst({
       where: { userId: user.id, status: "active" },
-      data: { status: "completed", endedAt: new Date() },
+      orderBy: { createdAt: "desc" },
+      include: { events: true },
     });
-    const session = await prisma.swipeSession.create({ data: { userId: user.id } });
+    if (!session) {
+      session = await prisma.swipeSession.create({ data: { userId: user.id } });
+    }
 
     const pool = await ensureNearbyRestaurants(lat, lng, minPool);
     const filteredPool = filterAndPrioritizeByPreferences(pool, user, lat, lng, Math.max(60, minPool));
@@ -633,6 +639,8 @@ router.post("/next", async (req, res) => {
         photoUrl,
         primaryType: r.primaryType,
         types: r.types,
+        editorialSummary: r.editorialSummary || null,
+        editorial_summary: r.editorialSummary || null,
       };
     });
 
@@ -717,6 +725,28 @@ router.post("/finalize-match", async (req, res) => {
       });
     });
     res.json({ ok: true });
+    // hydrate winner for immediate UI render
+    const winner = await prisma.restaurant.findUnique({
+      where: { id: winnerRestaurantId },
+      include: { photos: { take: 1 } },
+    });
+    let winnerPhotoUrl = null;
+    const photoName = winner?.photos?.[0]?.name || null;
+    if (photoName) {
+      winnerPhotoUrl = `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(photoName)}&w=1200`;
+    }
+    const payloadWinner = winner && {
+      id: winner.id,
+      name: winner.name,
+      address: winner.formattedAddress,
+      priceLevel: winner.priceLevel ?? null,
+      primaryType: winner.primaryType,
+     types: winner.types,
+      editorialSummary: winner.editorialSummary || null,
+      editorial_summary: winner.editorialSummary || null, // alias
+      photoUrl: winnerPhotoUrl,
+    };
+    res.json({ ok: true, winner: payloadWinner });
   } catch (e) {
     console.error("recs/finalize-match error:", e);
     res.status(500).json({ error: "finalize failed" });
@@ -733,8 +763,27 @@ router.get("/winner", async (req, res) => {
       orderBy: { createdAt: "desc" },
     });
     if (!m) return res.json({ winner: null });
-    const r = await prisma.restaurant.findUnique({ where: { id: m.winnerRestaurantId } });
-    res.json({ winner: r });
+    const r = await prisma.restaurant.findUnique({
+      where: { id: m.winnerRestaurantId },
+      include: { photos: { take: 1 } },
+    });
+    const photoName = r?.photos?.[0]?.name || null;
+    const photoUrl = photoName
+      ? `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(photoName)}&w=1200`
+      : null;
+    res.json({
+      winner: r && {
+        id: r.id,
+        name: r.name,
+        address: r.formattedAddress,
+        priceLevel: r.priceLevel ?? null,
+        primaryType: r.primaryType,
+        types: r.types,
+        editorialSummary: r.editorialSummary || null,
+        editorial_summary: r.editorialSummary || null, // alias
+        photoUrl,
+      },
+    });
   } catch (e) {
     console.error("recs/winner error:", e);
     res.status(500).json({ error: "winner failed" });
