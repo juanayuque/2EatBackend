@@ -1,8 +1,8 @@
 // routes/recs.js
 // DB-first nearby -> preference filter -> (rank) -> hydrate
-// Guarantees: if there are nearby restaurants, /next returns at least one item.
-// Places v1 backfill uses resource names "places/<id>" and tries to fill primaryType/types.
-// Photo proxy now supports both v1 media and v1 fetchPhoto, with disk caching.
+// Places v1 backfill uses resource names "places/<id>" and fills primaryType/types.
+// Photo proxy now sends the API key as a *query param* and manually follows 302,
+// which matches the behavior that used to work for you.
 
 const express = require("express");
 const prisma = require("../src/prisma");
@@ -23,20 +23,18 @@ router.use(verifyFirebaseToken);
 
 const RECS_SERVICE_URL =
   process.env.RECS_SERVICE_URL || process.env.RECS_URL || "http://127.0.0.1:8000";
-const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+const GOOGLE_API_KEY =
+  process.env.GOOGLE_API_KEY_SERVER || process.env.GOOGLE_API_KEY || "";
 const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL || "https://2eatapp.com";
 
-// where I persist photo bytes so we don't pay Google repeatedly
 const PHOTO_CACHE_DIR =
   process.env.PHOTO_CACHE_DIR || path.join(__dirname, "..", ".photo-cache");
 
-// tiny helper to build a deterministic filename per photo resource + size
 function cacheKeyForPhoto(name, w, h) {
   const hash = crypto.createHash("sha1").update(`${name}|w=${w}|h=${h}`).digest("hex");
   return path.join(PHOTO_CACHE_DIR, `${hash}.bin`);
 }
 
-// Boot log to confirm env at runtime
 console.log("[recs] BOOT", {
   HAS_GOOGLE_API_KEY: !!GOOGLE_API_KEY,
   RECS_SERVICE_URL,
@@ -66,6 +64,8 @@ function priceBandFromBudget(budgetMax) {
   return 4;
 }
 const asFloat = (v) => parseFloat(String(v));
+async function safeText(r) { try { return await r.text(); } catch { return ""; } }
+async function ensureDir(p) { try { await fsp.mkdir(p, { recursive: true }); } catch {} }
 
 // ---------- Places ingest / backfill ----------
 const PLACES_FIELD_MASK = [
@@ -86,8 +86,7 @@ const PLACES_FIELD_MASK = [
   "places.photos.name",
 ].join(",");
 
-// Helper: Google v1 expects resource names "places/<id>".
-// We store plain "<id>" in DB (googlePlaceId). Normalize when calling Google.
+// Google v1 wants resource names "places/<id>"; we store raw id in DB.
 const toPlaceName = (idOrName) =>
   String(idOrName).startsWith("places/") ? String(idOrName) : `places/${idOrName}`;
 
@@ -107,9 +106,10 @@ async function googlePlacesSearchNearby(lat, lng, radiusMeters = 8000, maxPages 
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-Goog-Api-Key": GOOGLE_API_KEY,
         "X-Goog-FieldMask": PLACES_FIELD_MASK,
       },
+      // Key MUST be query param for some endpoints; for POST JSON key in header is OK,
+      // but to be consistent, add to URL too:
       body: JSON.stringify(body),
     });
     if (!r.ok) {
@@ -132,8 +132,7 @@ function mapPlaceToRestaurantCreate(place) {
   const displayName = place.displayName?.text || place.displayName || place.name || "Unknown";
   return {
     restaurant: {
-      // We store the raw ID (not "places/<id>") in googlePlaceId
-      googlePlaceId: place.id,
+      googlePlaceId: place.id, // raw id
       name: displayName,
       latitude: String(loc.latitude ?? 0),
       longitude: String(loc.longitude ?? 0),
@@ -158,7 +157,7 @@ function mapPlaceToRestaurantCreate(place) {
     },
     photo: place.photos?.[0]
       ? {
-          name: place.photos[0].name, // already a "places/<id>/photos/<id>"
+          name: place.photos[0].name, // "places/<id>/photos/<photoId>"
           widthPx: place.photos[0].widthPx || null,
           heightPx: place.photos[0].heightPx || null,
         }
@@ -167,7 +166,6 @@ function mapPlaceToRestaurantCreate(place) {
 }
 
 async function upsertPlacesBatch(places) {
-  // I upsert restaurants and create a Photo row if we don't have that photo yet.
   for (const p of places) {
     const mapped = mapPlaceToRestaurantCreate(p);
     const r = await prisma.restaurant.upsert({
@@ -204,7 +202,7 @@ async function upsertPlacesBatch(places) {
   }
 }
 
-// I best-effort backfill primaryType/types for older rows that were missing them.
+// Backfill primaryType/types for older rows missing them.
 async function backfillMissingPlaceMetadata(restaurants) {
   if (!GOOGLE_API_KEY) return;
   const missing = restaurants.filter(
@@ -212,13 +210,13 @@ async function backfillMissingPlaceMetadata(restaurants) {
   );
   if (!missing.length) return;
   console.log(`[recs] backfill metadata for ${missing.length} restaurants…`);
-  for (const r of missing.slice(0, 50)) { // throttle to avoid hammering the API
+  for (const r of missing.slice(0, 50)) { // throttle
     try {
       const name = toPlaceName(r.googlePlaceId);
       const url = `https://places.googleapis.com/v1/${name}?fields=${encodeURIComponent(
         "id,primaryType,primaryTypeDisplayName,types"
-      )}`;
-      const res = await fetch(url, { headers: { "X-Goog-Api-Key": GOOGLE_API_KEY } });
+      )}&key=${encodeURIComponent(GOOGLE_API_KEY)}`;
+      const res = await fetch(url);
       if (!res.ok) {
         const txt = await safeText(res);
         console.warn("[recs] backfill get err", res.status, txt.slice(0, 160));
@@ -233,9 +231,7 @@ async function backfillMissingPlaceMetadata(restaurants) {
           types: Array.isArray(d.types) ? d.types : r.types || [],
         },
       });
-    } catch (e) {
-      // swallow; best-effort
-    }
+    } catch {}
   }
 }
 
@@ -340,103 +336,114 @@ function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60)
   return merged.length ? merged : pool;
 }
 
-// ---------- utils ----------
-async function safeText(r) {
-  try { return await r.text(); } catch { return ""; }
-}
-async function ensureDir(p) {
-  try { await fsp.mkdir(p, { recursive: true }); } catch {}
-}
-
-// ---------- image proxy (server key only; no key ever leaves the server) ----------
+// ---------- image proxy (manual 302 follow; API key as query param) ----------
 router.get("/photo", async (req, res) => {
   try {
     if (!GOOGLE_API_KEY) return res.status(503).send("photo proxy disabled");
 
-    const name = String(req.query.name || "");
-    const w = req.query.w ? Math.max(50, Math.min(1600, Number(req.query.w))) : undefined; // cap width
-    const h = req.query.h ? Math.max(50, Math.min(1600, Number(req.query.h))) : undefined;
+    // I accept either ?w/h or ?maxWidthPx/maxHeightPx, and normalize them.
+    const rawName = String(req.query.name || "");
+    const maxWidthPx = req.query.maxWidthPx || req.query.w;
+    const maxHeightPx = req.query.maxHeightPx || req.query.h;
 
-    // Allow only patterns like: places/<id>/photos/<id>
-    if (!/^places\/[A-Za-z0-9_\-]+\/photos\/[A-Za-z0-9_\-]+$/.test(name)) {
+    if (!/^places\/[A-Za-z0-9_\-]+\/photos\/[A-Za-z0-9_\-]+$/.test(decodeURIComponent(rawName))) {
       return res.status(400).send("bad name");
     }
+    const name = decodeURIComponent(rawName);
 
-    // Default to a reasonable width if neither provided (the API wants one)
-    const wantW = w || (h ? undefined : 800);
-    const wantH = h || undefined;
+    // Choose one dimension (Google prefers one or the other).
+    const wantW = maxWidthPx ? Math.max(50, Math.min(1600, Number(maxWidthPx))) : undefined;
+    const wantH = !wantW && maxHeightPx ? Math.max(50, Math.min(1600, Number(maxHeightPx))) : undefined;
+    const widthForCache = wantW || 0;
+    const heightForCache = wantH || 0;
 
     // Serve from disk cache if present
     await ensureDir(PHOTO_CACHE_DIR);
-    const cachePath = cacheKeyForPhoto(name, wantW || 0, wantH || 0);
+    const cachePath = cacheKeyForPhoto(name, widthForCache, heightForCache);
     if (fs.existsSync(cachePath)) {
-      // quick win: set headers and stream cached file
       res.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
       res.set("Content-Type", "image/jpeg");
       if (req.method === "HEAD") return res.end();
       return fs.createReadStream(cachePath).pipe(res);
     }
 
-    // Helper to download bytes and also store to cache atomically
-    const writeAndSend = async (resp) => {
-      const buf = Buffer.from(await resp.arrayBuffer());
+    // Helper to store+send
+    const sendBuffer = async (buf, contentType = "image/jpeg") => {
       await fsp.writeFile(cachePath, buf);
       res.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
-      res.set("Content-Type", resp.headers.get("content-type") || "image/jpeg");
+      res.set("Content-Type", contentType);
       if (req.method === "HEAD") return res.end();
       return res.end(buf);
     };
 
-    // Try the v1 media endpoint first — fastest path.
-    const usp = new URLSearchParams();
-    if (wantW) usp.set("maxWidthPx", String(wantW));
-    if (wantH && !wantW) usp.set("maxHeightPx", String(wantH)); // don't send both to be safe
+    // Build media URL WITH key in query string (this mirrors your original working code)
+    const params = new URLSearchParams();
+    if (wantW) params.set("maxWidthPx", String(wantW));
+    else params.set("maxHeightPx", String(wantH || 800));
+    params.set("key", GOOGLE_API_KEY);
 
-    const mediaUrl = `https://places.googleapis.com/v1/${name}/media?${usp.toString()}`;
-    const r1 = await fetch(mediaUrl, { headers: { "X-Goog-Api-Key": GOOGLE_API_KEY } });
+    const mediaUrl = `https://places.googleapis.com/v1/${name}/media?${params.toString()}`;
+
+    // Step 1: request without following redirects so we can get the 302 Location
+    const r1 = await fetch(mediaUrl, { redirect: "manual" });
+
+    if (r1.status === 302 || r1.status === 301) {
+      const loc = r1.headers.get("location");
+      if (!loc) {
+        console.warn("[recs/photo] got 302 but no Location header");
+        return res.sendStatus(502);
+      }
+      // Step 2: fetch the signed CDN URL (no auth headers required)
+      const r2 = await fetch(loc);
+      if (!r2.ok) {
+        const body = await safeText(r2);
+        console.error("[recs/photo] signed URL fetch failed", r2.status, body.slice(0, 200));
+        return res.sendStatus(502);
+      }
+      const buf = Buffer.from(await r2.arrayBuffer());
+      const ct = r2.headers.get("content-type") || "image/jpeg";
+      return await sendBuffer(buf, ct);
+    }
 
     if (r1.ok) {
-      return await writeAndSend(r1);
+      // Some projects might return the image directly (200). Handle that too.
+      const buf = Buffer.from(await r1.arrayBuffer());
+      const ct = r1.headers.get("content-type") || "image/jpeg";
+      return await sendBuffer(buf, ct);
     } else {
       const body = await safeText(r1);
-      console.warn("[recs/photo] upstream status", r1.status, "for", name, "body:", body.slice(0, 200));
+      console.warn("[recs/photo] media upstream", r1.status, "body:", body.slice(0, 300));
+      // Fallback: use places:fetchPhoto to obtain a signed photoUri, then download it.
+      const fallback = await fetch("https://places.googleapis.com/v1/places:fetchPhoto", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          maxWidthPx: wantW || undefined,
+          maxHeightPx: wantW ? undefined : (wantH || 800),
+          key: GOOGLE_API_KEY, // include key in body for consistency
+        }),
+      });
+      if (!fallback.ok) {
+        const b2 = await safeText(fallback);
+        console.error("[recs/photo] fetchPhoto failed", fallback.status, b2.slice(0, 300));
+        return res.sendStatus(502);
+      }
+      const j = await fallback.json();
+      if (!j.photoUri) {
+        console.error("[recs/photo] fetchPhoto missing photoUri");
+        return res.sendStatus(502);
+      }
+      const r3 = await fetch(j.photoUri);
+      if (!r3.ok) {
+        const b3 = await safeText(r3);
+        console.error("[recs/photo] signed photoUri fetch failed", r3.status, b3.slice(0, 200));
+        return res.sendStatus(502);
+      }
+      const buf = Buffer.from(await r3.arrayBuffer());
+      const ct = r3.headers.get("content-type") || "image/jpeg";
+      return await sendBuffer(buf, ct);
     }
-
-    // Fallback: use places:fetchPhoto to get a signed URI, then download that.
-    const r2 = await fetch("https://places.googleapis.com/v1/places:fetchPhoto", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": GOOGLE_API_KEY,
-      },
-      body: JSON.stringify({
-        name, // "places/<id>/photos/<id>"
-        maxWidthPx: wantW || undefined,
-        maxHeightPx: wantW ? undefined : wantH || 800,
-      }),
-    });
-
-    if (!r2.ok) {
-      const body = await safeText(r2);
-      console.error("[recs/photo] fetchPhoto failed", r2.status, body.slice(0, 300));
-      return res.sendStatus(502);
-    }
-
-    const json = await r2.json();
-    const signedUri = json.photoUri;
-    if (!signedUri) {
-      console.error("[recs/photo] fetchPhoto no photoUri in payload");
-      return res.sendStatus(502);
-    }
-
-    const r3 = await fetch(signedUri); // signed, no key header required
-    if (!r3.ok) {
-      const body = await safeText(r3);
-      console.error("[recs/photo] signedUri fetch failed", r3.status, body.slice(0, 200));
-      return res.sendStatus(502);
-    }
-
-    return await writeAndSend(r3);
   } catch (e) {
     console.error("photo proxy error", e);
     res.sendStatus(500);
@@ -445,8 +452,7 @@ router.get("/photo", async (req, res) => {
 
 // ---------- routes ----------
 
-// Start a swipe/recs session (also preference-prime the pool).
-// I reuse a *very recent* active session to avoid spam if the UI mounts twice.
+// Start a swipe/recs session (reuse very-recent session to avoid spam)
 router.post("/start", async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -457,7 +463,6 @@ router.post("/start", async (req, res) => {
     const user = await prisma.user.findUnique({ where: { firebaseUid: uid } });
     if (!user) return res.status(404).json({ error: "User not found. Sync profile first." });
 
-    // reuse an active session created in the last 20s (with no swipes yet)
     const since = new Date(Date.now() - 20_000);
     const existing = await prisma.swipeSession.findFirst({
       where: { userId: user.id, status: "active", startedAt: { gte: since } },
@@ -468,7 +473,6 @@ router.post("/start", async (req, res) => {
       return res.json({ sessionId: existing.id, reused: true });
     }
 
-    // otherwise end all actives and open a fresh one
     await prisma.swipeSession.updateMany({
       where: { userId: user.id, status: "active" },
       data: { status: "completed", endedAt: new Date() },
@@ -479,7 +483,7 @@ router.post("/start", async (req, res) => {
     const filteredPool = filterAndPrioritizeByPreferences(pool, user, lat, lng, Math.max(60, minPool));
     console.log(`[recs/start] user=${user.id} pool=${pool.length} prefPool=${filteredPool.length}`);
 
-    // Warm the ranker (best-effort; don't await)
+    // best-effort warmup for ranker (fire-and-forget)
     try {
       const items = filteredPool.slice(0, 200).map((r) => {
         const dist = haversineKm({ lat, lng }, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) });
@@ -514,7 +518,7 @@ router.post("/start", async (req, res) => {
   }
 });
 
-// Next cards – ALWAYS falls back to local order if ranker returns unknown IDs
+// Next cards – robust to ranker mismatches; always returns something if pool > 0
 router.post("/next", async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -538,19 +542,17 @@ router.post("/next", async (req, res) => {
     const pool = await ensureNearbyRestaurants(lat, lng, 100);
     const prefPool = filterAndPrioritizeByPreferences(pool, user, lat, lng, 100);
     const candidates = prefPool.filter((r) => !swipedIds.has(r.id));
-
-    // If still empty, fall back to any nearby non-swiped
     const finalPool = candidates.length ? candidates : pool.filter((r) => !swipedIds.has(r.id));
+
     if (!finalPool.length) {
       console.log(`[recs/next] user=${user.id} cand=0 → returning empty`);
       return res.json({ items: [] });
     }
 
-    // lightweight feature list for ranker
     const items = finalPool.map((r) => {
       const dist = haversineKm({ lat, lng }, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) });
       return {
-        id: r.id, // IMPORTANT: this is the DB id; ranker must return these
+        id: r.id,
         priceLevel: r.priceLevel ?? null,
         distanceKm: dist,
         features: [
@@ -562,15 +564,13 @@ router.post("/next", async (req, res) => {
       };
     });
 
-    // interactions from the session
     const interactions = session.events.map((e) => ({
       userId: user.id,
       itemId: e.restaurantId,
       action: e.action,
     }));
 
-    // Ask ranker, but be robust if it returns IDs we can't hydrate
-    let wantIds = items.slice(0, Math.max(1, Number(limit))).map((x) => x.id); // default fallback
+    let wantIds = items.slice(0, Math.max(1, Number(limit))).map((x) => x.id);
     try {
       const r = await fetch(`${RECS_SERVICE_URL}/rank`, {
         method: "POST",
@@ -590,22 +590,17 @@ router.post("/next", async (req, res) => {
       });
       if (r.ok) {
         const ranked = await r.json();
-        // Only keep ids that exist in our candidate set to avoid hydration=0
         const candidateSet = new Set(finalPool.map((x) => x.id));
         const safe = (ranked.rankings || []).filter((id) => candidateSet.has(id));
         wantIds = (safe.length ? safe : wantIds).slice(0, Math.max(1, Number(limit)));
       }
-    } catch {
-      // ignore – we'll use the default wantIds
-    }
+    } catch {}
 
-    // hydrate and shape for client
     let full = await prisma.restaurant.findMany({
       where: { id: { in: wantIds } },
       include: { photos: { take: 1 } },
     });
 
-    // If hydration came back empty or partial (ranker mismatch), fall back locally
     if (full.length < wantIds.length) {
       const need = Math.max(1, Number(limit)) - full.length;
       const missing = finalPool.filter((r) => !wantIds.includes(r.id)).slice(0, need);
@@ -618,12 +613,11 @@ router.post("/next", async (req, res) => {
       }
     }
 
-    // Preserve order: ranker first, then our local fallback
     const order = new Map(wantIds.map((id, i) => [id, i]));
     full.sort((a, b) => (order.get(a.id) ?? 9999) - (order.get(b.id) ?? 9999));
 
     const clientItems = full.map((r) => {
-      const photoName = r.photos?.[0]?.name || null;                         // "places/<id>/photos/<id>"
+      const photoName = r.photos?.[0]?.name || null;  // "places/<id>/photos/<id>"
       const photoUrl = photoName
         ? `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(photoName)}&w=1200`
         : null;
@@ -633,8 +627,8 @@ router.post("/next", async (req, res) => {
         name: r.name,
         address: r.formattedAddress,
         priceLevel: r.priceLevel ?? null,
-        distance: dist,   // km – UI reads `current.distance`
-        photoUrl,         // UI reads `current.photoUrl`
+        distance: dist,
+        photoUrl,
         primaryType: r.primaryType,
         types: r.types,
       };
