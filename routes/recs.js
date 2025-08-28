@@ -1,8 +1,9 @@
 // routes/recs.js
-// DB-first nearby -> preference filter -> (rank) -> hydrate
-// Places v1 backfill uses resource names "places/<id>" and fills primaryType/types.
-// Photo proxy now sends the API key as a *query param* and manually follows 302,
-// which matches the behavior that used to work for you.
+// Nearby -> preference filter -> (rank) -> hydrate
+// Notes:
+// - /photo is PUBLIC (no auth) because <img> can't carry your Firebase token.
+// - places:searchNearby now includes X-Goog-Api-Key to avoid 403.
+// - Photo proxy puts the key in the query string, follows Google's 302, and caches to disk.
 
 const express = require("express");
 const prisma = require("../src/prisma");
@@ -18,22 +19,12 @@ const router = express.Router();
 router.get("/__ping", (_req, res) => res.json({ ok: true, via: "recs", ts: Date.now() }));
 router.get("/health", (_req, res) => res.json({ ok: true }));
 
-// Everything below here requires a Firebase ID token
-router.use(verifyFirebaseToken);
-
 const RECS_SERVICE_URL =
   process.env.RECS_SERVICE_URL || process.env.RECS_URL || "http://127.0.0.1:8000";
 const GOOGLE_API_KEY =
   process.env.GOOGLE_API_KEY_SERVER || process.env.GOOGLE_API_KEY || "";
 const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL || "https://2eatapp.com";
-
-const PHOTO_CACHE_DIR =
-  process.env.PHOTO_CACHE_DIR || path.join(__dirname, "..", ".photo-cache");
-
-function cacheKeyForPhoto(name, w, h) {
-  const hash = crypto.createHash("sha1").update(`${name}|w=${w}|h=${h}`).digest("hex");
-  return path.join(PHOTO_CACHE_DIR, `${hash}.bin`);
-}
+const PHOTO_CACHE_DIR = process.env.PHOTO_CACHE_DIR || path.join(__dirname, "..", ".photo-cache");
 
 console.log("[recs] BOOT", {
   HAS_GOOGLE_API_KEY: !!GOOGLE_API_KEY,
@@ -66,6 +57,10 @@ function priceBandFromBudget(budgetMax) {
 const asFloat = (v) => parseFloat(String(v));
 async function safeText(r) { try { return await r.text(); } catch { return ""; } }
 async function ensureDir(p) { try { await fsp.mkdir(p, { recursive: true }); } catch {} }
+function cacheKeyForPhoto(name, w, h) {
+  const hash = crypto.createHash("sha1").update(`${name}|w=${w}|h=${h}`).digest("hex");
+  return path.join(PHOTO_CACHE_DIR, `${hash}.bin`);
+}
 
 // ---------- Places ingest / backfill ----------
 const PLACES_FIELD_MASK = [
@@ -106,10 +101,9 @@ async function googlePlacesSearchNearby(lat, lng, radiusMeters = 8000, maxPages 
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_API_KEY,          // ← fix 403
         "X-Goog-FieldMask": PLACES_FIELD_MASK,
       },
-      // Key MUST be query param for some endpoints; for POST JSON key in header is OK,
-      // but to be consistent, add to URL too:
       body: JSON.stringify(body),
     });
     if (!r.ok) {
@@ -127,7 +121,7 @@ async function googlePlacesSearchNearby(lat, lng, radiusMeters = 8000, maxPages 
 }
 
 function mapPlaceToRestaurantCreate(place) {
-  // I normalize Google's place payload to our Restaurant + first Photo.
+  // Normalize Google's place payload to our Restaurant + first Photo.
   const loc = place.location || {};
   const displayName = place.displayName?.text || place.displayName || place.name || "Unknown";
   return {
@@ -238,7 +232,6 @@ async function backfillMissingPlaceMetadata(restaurants) {
 // Build/refresh nearby pool; ingest if thin; always log the count.
 async function ensureNearbyRestaurants(lat, lng, minCount = 100) {
   const here = { lat, lng };
-
   const all = await prisma.restaurant.findMany({
     take: 1500,
     include: { photos: { take: 1 } },
@@ -336,47 +329,48 @@ function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60)
   return merged.length ? merged : pool;
 }
 
-// ---------- image proxy (manual 302 follow; API key as query param) ----------
+/* ----------------------- photo proxy (PUBLIC) ---------------------- */
+/**
+ * Streams a Google Places photo to the client without exposing your API key.
+ * Usage: GET /api/recs/photo?name=places/XXX/photos/YYY&w=1200
+ * - Accepts w/h or maxWidthPx/maxHeightPx.
+ * - Adds ?key=… to the media URL, manually follows 302, caches to disk.
+ */
 router.get("/photo", async (req, res) => {
   try {
     if (!GOOGLE_API_KEY) return res.status(503).send("photo proxy disabled");
 
-    // I accept either ?w/h or ?maxWidthPx/maxHeightPx, and normalize them.
+    // Allow CORS + image embedding
+    res.setHeader("Access-Control-Allow-Origin", "*");
+
     const rawName = String(req.query.name || "");
+    const name = decodeURIComponent(rawName);
     const maxWidthPx = req.query.maxWidthPx || req.query.w;
     const maxHeightPx = req.query.maxHeightPx || req.query.h;
 
-    if (!/^places\/[A-Za-z0-9_\-]+\/photos\/[A-Za-z0-9_\-]+$/.test(decodeURIComponent(rawName))) {
+    if (!/^places\/[A-Za-z0-9_\-]+\/photos\/[A-Za-z0-9_\-]+$/.test(name)) {
       return res.status(400).send("bad name");
     }
-    const name = decodeURIComponent(rawName);
 
-    // Choose one dimension (Google prefers one or the other).
     const wantW = maxWidthPx ? Math.max(50, Math.min(1600, Number(maxWidthPx))) : undefined;
     const wantH = !wantW && maxHeightPx ? Math.max(50, Math.min(1600, Number(maxHeightPx))) : undefined;
-    const widthForCache = wantW || 0;
-    const heightForCache = wantH || 0;
 
-    // Serve from disk cache if present
     await ensureDir(PHOTO_CACHE_DIR);
-    const cachePath = cacheKeyForPhoto(name, widthForCache, heightForCache);
+    const cachePath = cacheKeyForPhoto(name, wantW || 0, wantH || 0);
     if (fs.existsSync(cachePath)) {
       res.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
       res.set("Content-Type", "image/jpeg");
-      if (req.method === "HEAD") return res.end();
       return fs.createReadStream(cachePath).pipe(res);
     }
 
-    // Helper to store+send
     const sendBuffer = async (buf, contentType = "image/jpeg") => {
       await fsp.writeFile(cachePath, buf);
       res.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
       res.set("Content-Type", contentType);
-      if (req.method === "HEAD") return res.end();
       return res.end(buf);
     };
 
-    // Build media URL WITH key in query string (this mirrors your original working code)
+    // Build media URL WITH key in query string
     const params = new URLSearchParams();
     if (wantW) params.set("maxWidthPx", String(wantW));
     else params.set("maxHeightPx", String(wantH || 800));
@@ -384,15 +378,11 @@ router.get("/photo", async (req, res) => {
 
     const mediaUrl = `https://places.googleapis.com/v1/${name}/media?${params.toString()}`;
 
-    // Step 1: request without following redirects so we can get the 302 Location
+    // Step 1: request without following redirects to get the 302 Location
     const r1 = await fetch(mediaUrl, { redirect: "manual" });
-
     if (r1.status === 302 || r1.status === 301) {
       const loc = r1.headers.get("location");
-      if (!loc) {
-        console.warn("[recs/photo] got 302 but no Location header");
-        return res.sendStatus(502);
-      }
+      if (!loc) return res.sendStatus(502);
       // Step 2: fetch the signed CDN URL (no auth headers required)
       const r2 = await fetch(loc);
       if (!r2.ok) {
@@ -406,14 +396,13 @@ router.get("/photo", async (req, res) => {
     }
 
     if (r1.ok) {
-      // Some projects might return the image directly (200). Handle that too.
       const buf = Buffer.from(await r1.arrayBuffer());
       const ct = r1.headers.get("content-type") || "image/jpeg";
       return await sendBuffer(buf, ct);
     } else {
       const body = await safeText(r1);
       console.warn("[recs/photo] media upstream", r1.status, "body:", body.slice(0, 300));
-      // Fallback: use places:fetchPhoto to obtain a signed photoUri, then download it.
+      // Fallback: signed photoUri via fetchPhoto
       const fallback = await fetch("https://places.googleapis.com/v1/places:fetchPhoto", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -421,7 +410,7 @@ router.get("/photo", async (req, res) => {
           name,
           maxWidthPx: wantW || undefined,
           maxHeightPx: wantW ? undefined : (wantH || 800),
-          key: GOOGLE_API_KEY, // include key in body for consistency
+          key: GOOGLE_API_KEY,
         }),
       });
       if (!fallback.ok) {
@@ -430,16 +419,9 @@ router.get("/photo", async (req, res) => {
         return res.sendStatus(502);
       }
       const j = await fallback.json();
-      if (!j.photoUri) {
-        console.error("[recs/photo] fetchPhoto missing photoUri");
-        return res.sendStatus(502);
-      }
+      if (!j.photoUri) return res.sendStatus(502);
       const r3 = await fetch(j.photoUri);
-      if (!r3.ok) {
-        const b3 = await safeText(r3);
-        console.error("[recs/photo] signed photoUri fetch failed", r3.status, b3.slice(0, 200));
-        return res.sendStatus(502);
-      }
+      if (!r3.ok) return res.sendStatus(502);
       const buf = Buffer.from(await r3.arrayBuffer());
       const ct = r3.headers.get("content-type") || "image/jpeg";
       return await sendBuffer(buf, ct);
@@ -450,9 +432,10 @@ router.get("/photo", async (req, res) => {
   }
 });
 
-// ---------- routes ----------
+// ---------- everything below here REQUIRES a Firebase token ----------
+router.use(verifyFirebaseToken);
 
-// Start a swipe/recs session (reuse very-recent session to avoid spam)
+// ---------- routes ----------
 router.post("/start", async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -463,6 +446,7 @@ router.post("/start", async (req, res) => {
     const user = await prisma.user.findUnique({ where: { firebaseUid: uid } });
     if (!user) return res.status(404).json({ error: "User not found. Sync profile first." });
 
+    // Reuse a very fresh empty session to avoid home-mount spam
     const since = new Date(Date.now() - 20_000);
     const existing = await prisma.swipeSession.findFirst({
       where: { userId: user.id, status: "active", startedAt: { gte: since } },
@@ -483,7 +467,7 @@ router.post("/start", async (req, res) => {
     const filteredPool = filterAndPrioritizeByPreferences(pool, user, lat, lng, Math.max(60, minPool));
     console.log(`[recs/start] user=${user.id} pool=${pool.length} prefPool=${filteredPool.length}`);
 
-    // best-effort warmup for ranker (fire-and-forget)
+    // Warm the ranker (best-effort)
     try {
       const items = filteredPool.slice(0, 200).map((r) => {
         const dist = haversineKm({ lat, lng }, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) });
