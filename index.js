@@ -1,4 +1,4 @@
-// Environment first
+// Loads environment variables early so configuration is available everywhere.
 require("dotenv").config();
 
 const fs = require("fs");
@@ -17,8 +17,11 @@ const app = express();
 
 /* ───────────────────────────── Security / performance ───────────────────────────── */
 
+// Trust the first proxy hop so real client IPs appear when behind Cloudflare/NGINX.
 app.set("trust proxy", 1);
 
+// Security headers + gzip + request logging. Cross-origin resource policy is relaxed
+// so the photo proxy can be consumed by the web app without being blocked by the browser.
 app.use(
   helmet({
     crossOriginResourcePolicy: { policy: "cross-origin" },
@@ -29,20 +32,23 @@ app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
 /* ───────────────────────────────────── CORS ───────────────────────────────────── */
 
+// Allow known production domains and common local dev origins (Expo/Metro).
 const allowSet = new Set([
   "https://2eatapp.com",
   "https://www.2eatapp.com",
-  "http://localhost:8081",
-  "http://localhost:19006",
-  "http://localhost:3000",
+  "http://localhost:8081",  // Expo Metro (web preview)
+  "http://localhost:19006", // Expo web dev
+  "http://localhost:3000",  // General local dev
 ]);
 
+// Allow typical LAN addresses for device testing (10.x, 192.168.x, 172.16–31.x).
 const devLocalRegex = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
 const devLanRegex =
   /^https?:\/\/((10\.\d{1,3}\.\d{1,3}\.\d{1,3})|(192\.168\.\d{1,3}\.\d{1,3})|(172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}))(:\d+)?$/;
 
 const corsOptions = {
   origin(origin, cb) {
+    // Requests without an Origin (mobile apps, curl, server-to-server) should pass.
     if (!origin) return cb(null, true);
     if (allowSet.has(origin)) return cb(null, true);
     if (devLocalRegex.test(origin) || devLanRegex.test(origin)) return cb(null, true);
@@ -51,65 +57,71 @@ const corsOptions = {
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Authorization", "Content-Type"],
   credentials: true,
-  optionsSuccessStatus: 204,
+  optionsSuccessStatus: 204, // 204 avoids some browser preflight quirks.
 };
 
+// Register CORS before any routes so preflight covers everything.
 app.use(cors(corsOptions));
 
-/* ─────────────────────────────── Parsing / limits ─────────────────────────────── */
+/* ───────────────────────────────── Request parsing ─────────────────────────────── */
 
+// Limit JSON payload size to reduce abuse and accidental large uploads.
 app.use(express.json({ limit: "500kb" }));
 
 /* ──────────────────────────────── Rate limiting ───────────────────────────────── */
 
+// Throttle per-IP. OPTIONS is skipped so preflight does not get rate-limited.
 const apiLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 120,
+  windowMs: 60 * 1000, // 1 minute
+  max: 120,            // 120 requests/minute per IP
   standardHeaders: true,
   legacyHeaders: false,
   skip: (req) => req.method === "OPTIONS",
 });
 app.use("/api", apiLimiter);
 
-/* ───────────────────────────── Firebase Admin ───────────────────────────── */
+/* ───────────────────────────── Firebase Admin init ────────────────────────────── */
 
+// Firebase Admin is used to verify ID tokens on protected endpoints.
 const serviceAccount = require("./serviceAccountKey.json");
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
-/* ───────────────────────────── Health / pings ───────────────────────────── */
+/* ───────────────────────────── Routes ───────────────────────────── */
 
+// Health check
 app.get("/", (_req, res) => res.send("2Eat API is up and running."));
-app.get("/api/users/__ping", (_req, res) =>
-  res.json({ ok: true, via: "index", ts: Date.now() })
-);
 
-/* ───────────────────────────── Routers (safe mount) ───────────────────────────── */
+// Add a simple ping inside the /api/users namespace to verify mount works.
+app.get("/api/users/__ping", (_req, res) => res.json({ ok: true, via: "index", ts: Date.now() }));
 
-function safeMount(path, router, label) {
-  if (typeof router === "function") {
-    app.use(path, router);
-    console.log(`Mounted ${label} at ${path}`);
-  } else {
-    console.error(`NOT mounting ${label}: expected a router function, got ${typeof router}`);
-    app.use(path, (_req, res) =>
-      res.status(500).json({ error: `${label} router missing` })
-    );
-  }
-}
-
+// Load and mount users router ONCE
 const usersRouter = require("./routes/users");
+app.use("/api/users", (req, _res, next) => {
+  console.log("users-router hit:", req.method, req.url);
+  next();
+}, usersRouter);
+
+// Other feature routers
 const locationRoutes = require("./routes/location");
 const geocodeRoutes = require("./routes/geocode");
-const recsRoutes = require("./routes/recs");
+let recsRoutes = require("./routes/recs");
 
-safeMount("/api/users", usersRouter, "users");
-safeMount("/api", locationRoutes, "location");
-safeMount("/api", geocodeRoutes, "geocode");
-safeMount("/api/recs", recsRoutes, "recs");
+// Basic mounts
+app.use("/api", locationRoutes);
+app.use("/api", geocodeRoutes);
+
+// Mount recs (guard in case of wrong export)
+if (typeof recsRoutes === "function" || (recsRoutes && typeof recsRoutes.use === "function")) {
+  app.use("/api/recs", recsRoutes);
+  console.log("Mounted recs at /api/recs");
+} else {
+  console.error("NOT mounting recs: expected a router function, got", typeof recsRoutes);
+}
 
 /* ─────────────────────────────── Global errors ────────────────────────────────── */
 
-app.use((err, _req, res, _next) => {
+// Convert CORS rejections into JSON and log unexpected errors with a 500 fallback.
+app.use((err, req, res, _next) => {
   if (err && err.message === "Not allowed by CORS") {
     return res.status(403).json({ error: "CORS blocked: origin not allowed" });
   }
@@ -119,31 +131,50 @@ app.use((err, _req, res, _next) => {
 
 /* ─────────────────────────────── Server startup ───────────────────────────────── */
 
-const NODE_ENV = process.env.NODE_ENV || "development";
-const HTTP_PORT = Number(process.env.PORT || 3000);
-const USE_LOCAL_TLS = process.env.USE_LOCAL_TLS === "1";
+// Use underscored locals to avoid re-declaration if similar names exist above.
+const _NODE_ENV = process.env.NODE_ENV || "development";
+const _HTTP_PORT = Number(process.env.PORT || 3000);
 
-if (NODE_ENV === "production" && USE_LOCAL_TLS) {
-  const keyPath  = process.env.SSL_KEY_PATH;
-  const certPath = process.env.SSL_CERT_PATH;
-  const options = {
-    key: fs.readFileSync(keyPath),
-    cert: fs.readFileSync(certPath),
-  };
-  https.createServer(options, app).listen(443, () => {
-    console.log("✅ Backend running on https://2eatapp.com");
-  });
-  http.createServer((req, res) => {
-    res.writeHead(301, { Location: "https://2eatapp.com" + req.url });
-    res.end();
-  }).listen(80);
+const _FORCE_DEV_HTTP = !!process.env.FORCE_DEV_HTTP; // set "1" to force HTTP in prod
+const _SSL_KEY_PATH = process.env.SSL_KEY_PATH || "/etc/ssl/private/cloudflare.key";
+const _SSL_CERT_PATH = process.env.SSL_CERT_PATH || "/etc/ssl/certs/cloudflare.crt";
+
+console.log("BOOT ENV", {
+  NODE_ENV: _NODE_ENV,
+  FORCE_DEV_HTTP: process.env.FORCE_DEV_HTTP,
+  SSL_KEY_PATH: _SSL_KEY_PATH,
+  SSL_CERT_PATH: _SSL_CERT_PATH,
+});
+
+if (_NODE_ENV === "production" && !_FORCE_DEV_HTTP) {
+  try {
+    const key = fs.readFileSync(_SSL_KEY_PATH);
+    const cert = fs.readFileSync(_SSL_CERT_PATH);
+
+    https.createServer({ key, cert }, app).listen(443, () => {
+      console.log("✅ Backend running on https://2eatapp.com (port 443)");
+    });
+
+    // Optional: redirect plaintext to HTTPS if no external proxy handles it.
+    http.createServer((req, res) => {
+      res.writeHead(301, { Location: "https://2eatapp.com" + req.url });
+      res.end();
+    }).listen(80, () => {
+      console.log("↪️  Redirecting http://:80 to https://:443");
+    });
+  } catch (err) {
+    console.error("❌ Failed to start HTTPS server:", err);
+    process.exit(1); // fail loud so PM2 shows the real issue
+  }
 } else {
-  app.listen(HTTP_PORT, () => console.log(`🔧 Dev server on http://localhost:${HTTP_PORT}`));
+  app.listen(_HTTP_PORT, () => {
+    console.log(`🔧 Dev server on http://localhost:${_HTTP_PORT}`);
+  });
 }
 
+/* ────────────────────────────── Graceful shutdown ─────────────────────────────── */
 
-/* ────────────────────────────── Safe shutdown ─────────────────────────────── */
-
+// Ensures open DB connections are closed before exit to avoid hangs or corruption.
 function shutdown() {
   console.log("Shutting down…");
   Promise.resolve()
