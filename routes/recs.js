@@ -12,7 +12,7 @@ router.get("/health", (_req, res) => res.json({ ok: true }));
 // Everything below here requires a Firebase ID token
 router.use(verifyFirebaseToken);
 
-const RECS_SERVICE_URL = process.env.RECS_SERVICE_URL || "http://127.0.0.1:8000";
+const RECS_SERVICE_URL = process.env.RECS_SERVICE_URL || "http://127.0.0.1:8000" || process.env.RECS_URL;
 
 // Small helpers
 function haversineKm(a, b) {
@@ -77,7 +77,7 @@ router.post("/start", async (req, res) => {
       where: { userId: user.id, status: "active" },
       data: { status: "completed", endedAt: new Date() },
     });
-    const session = await prisma.swipeSession.create({ data: { userId: user.id } });
+    const session = await prisma.swipeSession.create({data: { userId: user.id, status: "active", startedAt: new Date() },});
 
     const pool = await ensureNearbyRestaurants(lat, lng, minPool);
 
@@ -145,8 +145,13 @@ router.post("/next", async (req, res) => {
       include: { events: true },
     });
     if (!session || session.userId !== user.id || session.status !== "active") {
-      return res.status(400).json({ error: "Invalid session" });
-    }
+   console.warn("recs/next invalid session", {
+     sessionFound: !!session,
+     sameUser: session ? session.userId === user.id : null,
+     status: session ? session.status : null,
+   });
+   return res.status(400).json({ error: "Invalid session" });
+ }
 
     const swipedIds = new Set(session.events.map((e) => e.restaurantId));
     const pool = await ensureNearbyRestaurants(lat, lng, 100);
