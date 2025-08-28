@@ -109,6 +109,7 @@ let recsRoutes = require("./routes/recs");
 // Basic mounts
 app.use("/api", locationRoutes);
 app.use("/api", geocodeRoutes);
+app.use("/api/matches", require("./routes/matches"));
 
 // Mount recs (guard in case of wrong export)
 if (typeof recsRoutes === "function" || (recsRoutes && typeof recsRoutes.use === "function")) {
