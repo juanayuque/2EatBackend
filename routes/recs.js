@@ -2,8 +2,6 @@
 // DB-first nearby -> preference filter -> (rank) -> hydrate
 // Guarantees: if there are nearby restaurants, /next returns at least one item.
 // Also fixes Places v1 backfill by using resource names "places/<id>".
-// Important change: /next now salvages a valid active session instead of 400-ing,
-// and returns 409 only when the user has no active session (client should /start once).
 
 const express = require("express");
 const prisma = require("../src/prisma");
@@ -15,13 +13,9 @@ const router = express.Router();
 router.get("/__ping", (_req, res) => res.json({ ok: true, via: "recs", ts: Date.now() }));
 router.get("/health", (_req, res) => res.json({ ok: true }));
 
-// Everything below here requires a Firebase ID token
-router.use(verifyFirebaseToken);
-
 const RECS_SERVICE_URL =
   process.env.RECS_SERVICE_URL || process.env.RECS_URL || "http://127.0.0.1:8000";
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
-const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL || "https://2eatapp.com";
 
 // Boot log to confirm env at runtime
 console.log("[recs] BOOT", {
@@ -50,11 +44,9 @@ function priceBandFromBudget(budgetMax) {
   if (budgetMax <= 60) return 3;
   return 4;
 }
-// Prisma Decimal -> JS number (for distance calc & client payload)
 const asFloat = (v) => parseFloat(String(v));
 
 // ---------- Places ingest / backfill ----------
-// I ask Google for only the fields we actually use to keep payloads small.
 const PLACES_FIELD_MASK = [
   "places.id",
   "places.displayName",
@@ -73,12 +65,11 @@ const PLACES_FIELD_MASK = [
   "places.photos.name",
 ].join(",");
 
-// Google v1 wants resource names "places/<id>".
-// We store the raw "<id>" in DB (googlePlaceId), so I normalize before v1 calls.
+// Helper: Google v1 expects resource names "places/<id>".
+// We store plain "<id>" in DB (googlePlaceId). Normalize when calling Google.
 const toPlaceName = (idOrName) =>
   String(idOrName).startsWith("places/") ? String(idOrName) : `places/${idOrName}`;
 
-// Pull a few pages of nearby restaurants from Places v1 (server-side; never exposes API key)
 async function googlePlacesSearchNearby(lat, lng, radiusMeters = 8000, maxPages = 3) {
   if (!GOOGLE_API_KEY) return [];
   const results = [];
@@ -109,13 +100,12 @@ async function googlePlacesSearchNearby(lat, lng, radiusMeters = 8000, maxPages 
   return results;
 }
 
-// Map a Places v1 object into our Restaurant + (optional) Photo create shape
 function mapPlaceToRestaurantCreate(place) {
   const loc = place.location || {};
   const displayName = place.displayName?.text || place.displayName || place.name || "Unknown";
   return {
     restaurant: {
-      // Store raw Places ID (e.g., "ChIJ...") in googlePlaceId
+      // We store the raw ID (not "places/<id>") in googlePlaceId
       googlePlaceId: place.id,
       name: displayName,
       latitude: String(loc.latitude ?? 0),
@@ -129,7 +119,6 @@ function mapPlaceToRestaurantCreate(place) {
       rating: place.rating != null ? String(place.rating) : null,
       userRatingCount: place.userRatingCount ?? null,
       priceLevel: place.priceLevel ?? null,
-      // The booleans below are placeholders we might fill later if needed.
       servesVegetarianFood: false,
       takeout: false,
       dineIn: false,
@@ -142,8 +131,7 @@ function mapPlaceToRestaurantCreate(place) {
     },
     photo: place.photos?.[0]
       ? {
-          // This is already a v1 resource name like "places/<id>/photos/<photoId>"
-          name: place.photos[0].name,
+          name: place.photos[0].name, // already a "places/<id>/photos/<id>"
           widthPx: place.photos[0].widthPx || null,
           heightPx: place.photos[0].heightPx || null,
         }
@@ -151,7 +139,6 @@ function mapPlaceToRestaurantCreate(place) {
   };
 }
 
-// Upsert the places we fetched. I store the first photo (if any) so we can serve it later from our photo proxy.
 async function upsertPlacesBatch(places) {
   for (const p of places) {
     const mapped = mapPlaceToRestaurantCreate(p);
@@ -189,7 +176,7 @@ async function upsertPlacesBatch(places) {
   }
 }
 
-// Best-effort backfill for older rows that are missing primaryType/types (Places v1)
+// Fix: use resource name when calling v1 get; add logging so you know it ran
 async function backfillMissingPlaceMetadata(restaurants) {
   if (!GOOGLE_API_KEY) return;
   const missing = restaurants.filter(
@@ -197,7 +184,7 @@ async function backfillMissingPlaceMetadata(restaurants) {
   );
   if (!missing.length) return;
   console.log(`[recs] backfill metadata for ${missing.length} restaurants…`);
-  for (const r of missing.slice(0, 50)) { // throttle a bit
+  for (const r of missing.slice(0, 50)) { // throttle
     try {
       const name = toPlaceName(r.googlePlaceId);
       const url = `https://places.googleapis.com/v1/${name}?fields=${encodeURIComponent(
@@ -214,8 +201,8 @@ async function backfillMissingPlaceMetadata(restaurants) {
           types: Array.isArray(d.types) ? d.types : r.types || [],
         },
       });
-    } catch {
-      // best effort only
+    } catch (e) {
+      // swallow; best-effort
     }
   }
 }
@@ -224,9 +211,8 @@ async function backfillMissingPlaceMetadata(restaurants) {
 async function ensureNearbyRestaurants(lat, lng, minCount = 100) {
   const here = { lat, lng };
 
-  // I include a single photo per restaurant so I can compute the photo URL without extra queries.
   const all = await prisma.restaurant.findMany({
-    take: 2000,
+    take: 1500,
     include: { photos: { take: 1 } },
   });
 
@@ -235,7 +221,7 @@ async function ensureNearbyRestaurants(lat, lng, minCount = 100) {
       r,
       d: haversineKm(here, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }),
     }))
-    .filter((x) => Number.isFinite(x.d) && x.d <= 15) // 15km envelope
+    .filter((x) => Number.isFinite(x.d) && x.d <= 15)
     .sort((a, b) => a.d - b.d)
     .map((x) => x.r);
 
@@ -246,7 +232,7 @@ async function ensureNearbyRestaurants(lat, lng, minCount = 100) {
     if (places.length) {
       await upsertPlacesBatch(places);
       const refreshed = await prisma.restaurant.findMany({
-        take: 3000,
+        take: 2000,
         include: { photos: { take: 1 } },
       });
       nearby = refreshed
@@ -260,7 +246,6 @@ async function ensureNearbyRestaurants(lat, lng, minCount = 100) {
     }
   }
 
-  // Kick a best-effort backfill for missing primaryType/types. I don't await this.
   backfillMissingPlaceMetadata(nearby).catch(() => {});
   console.log(`[recs] ensureNearby: ${nearby.length} within 15km`);
   return nearby;
@@ -287,8 +272,6 @@ const CUISINE_KEYWORDS = {
   persian: ["persian", "iranian"],
 };
 const norm = (s) => String(s || "").toLowerCase().replace(/[_\s-]+/g, " ").trim();
-
-// From user.preferredCuisines I derive a keyword set, expanding common synonyms
 function cuisineKeywordsFromUser(user) {
   const out = new Set();
   for (const p of user?.preferredCuisines || []) {
@@ -297,12 +280,9 @@ function cuisineKeywordsFromUser(user) {
   }
   return out;
 }
-
-// Decide if a restaurant matches the user's cuisine keywords.
-// I check primaryType (snake case), types (array of snake case), and the display/name (free text).
 function restaurantMatchesCuisine(r, keywordSet) {
   if (!keywordSet || !keywordSet.size) return true;
-  const primary = (r.primaryType || "").toLowerCase();               // e.g. "indian_restaurant"
+  const primary = (r.primaryType || "").toLowerCase();               // "indian_restaurant"
   const types = Array.isArray(r.types) ? r.types.map((t) => String(t).toLowerCase()) : [];
   const display = (r.primaryTypeDisplayName || r.name || "").toLowerCase();
   for (const k of keywordSet) {
@@ -313,8 +293,6 @@ function restaurantMatchesCuisine(r, keywordSet) {
   }
   return false;
 }
-
-// Filter by preference but keep enough supply by topping up with nearest non-matches
 function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60) {
   const keys = cuisineKeywordsFromUser(user);
   const here = { lat, lng };
@@ -330,7 +308,9 @@ function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60)
   return merged.length ? merged : pool;
 }
 
-// ---------- image proxy (no key leakage to client) ----------
+// ---------- PUBLIC image proxy (moved BEFORE auth) ----------
+// I expose the photo proxy publicly so <Image> tags can fetch without a bearer token.
+// I also add a little logging so we can see requests coming through.
 router.get("/photo", async (req, res) => {
   try {
     if (!GOOGLE_API_KEY) return res.status(503).send("photo proxy disabled");
@@ -340,6 +320,7 @@ router.get("/photo", async (req, res) => {
 
     // Allow only patterns like: places/<id>/photos/<id>
     if (!/^places\/[A-Za-z0-9_\-]+\/photos\/[A-Za-z0-9_\-]+$/.test(name)) {
+      console.warn("[recs/photo] bad name:", name);
       return res.status(400).send("bad name");
     }
 
@@ -349,17 +330,25 @@ router.get("/photo", async (req, res) => {
 
     const url = `https://places.googleapis.com/v1/${name}/media?${usp.toString()}`;
     const r = await fetch(url, { headers: { "X-Goog-Api-Key": GOOGLE_API_KEY } });
-    if (!r.ok) return res.sendStatus(r.status);
+    if (!r.ok) {
+      console.warn("[recs/photo] upstream status", r.status, "for", name);
+      return res.sendStatus(r.status);
+    }
 
+    // Cache for a day; safe since photo bits rarely change.
     res.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
     const ct = r.headers.get("content-type") || "image/jpeg";
     res.set("Content-Type", ct);
+    console.log("[recs/photo] 200 OK", name);
     return r.body.pipe(res);
   } catch (e) {
     console.error("photo proxy error", e);
     res.sendStatus(500);
   }
 });
+
+// --- Everything below here requires a Firebase ID token
+router.use(verifyFirebaseToken);
 
 // ---------- routes ----------
 
@@ -374,7 +363,6 @@ router.post("/start", async (req, res) => {
     const user = await prisma.user.findUnique({ where: { firebaseUid: uid } });
     if (!user) return res.status(404).json({ error: "User not found. Sync profile first." });
 
-    // I force single-active-session semantics: close any previous active sessions.
     await prisma.swipeSession.updateMany({
       where: { userId: user.id, status: "active" },
       data: { status: "completed", endedAt: new Date() },
@@ -411,9 +399,7 @@ router.post("/start", async (req, res) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ user: { id: user.id, features: userFeatures }, items, interactions: [] }),
       }).catch(() => {});
-    } catch {
-      // best-effort warm
-    }
+    } catch {}
 
     res.json({ sessionId: session.id });
   } catch (e) {
@@ -422,7 +408,7 @@ router.post("/start", async (req, res) => {
   }
 });
 
-// Next cards – robust to stale sessionIds; falls back to local order if ranker misbehaves
+// Next cards – ALWAYS falls back to local order if ranker returns unknown IDs
 router.post("/next", async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -434,49 +420,31 @@ router.post("/next", async (req, res) => {
     const user = await prisma.user.findUnique({ where: { firebaseUid: uid } });
     if (!user) return res.status(404).json({ error: "User not found" });
 
-    // Try the provided session first
-    let session = await prisma.swipeSession.findUnique({
+    const session = await prisma.swipeSession.findUnique({
       where: { id: sessionId },
       include: { events: true },
     });
-
-    // If it’s stale/closed or doesn’t belong to this user, salvage the latest active one
     if (!session || session.userId !== user.id || session.status !== "active") {
-      const latestActive = await prisma.swipeSession.findFirst({
-        where: { userId: user.id, status: "active" },
-        orderBy: { startedAt: "desc" },
-        include: { events: true },
-      });
-      if (!latestActive) {
-        // Tell the client to /start once. This avoids an error loop in StrictMode.
-        return res.status(409).json({ error: "No active session" });
-      }
-      session = latestActive;
+      return res.status(400).json({ error: "Invalid session" });
     }
 
     const swipedIds = new Set(session.events.map((e) => e.restaurantId));
-
-    // Build a pool from DB (ingest/backfill happens inside ensureNearby if needed)
     const pool = await ensureNearbyRestaurants(lat, lng, 100);
-
-    // Apply the user's cuisine preferences (using primaryType/types)
     const prefPool = filterAndPrioritizeByPreferences(pool, user, lat, lng, 100);
-
-    // Remove already-swiped items for this session
     const candidates = prefPool.filter((r) => !swipedIds.has(r.id));
 
-    // If nothing matches prefs, fall back to any nearby non-swiped
+    // If still empty, fall back to any nearby non-swiped
     const finalPool = candidates.length ? candidates : pool.filter((r) => !swipedIds.has(r.id));
     if (!finalPool.length) {
       console.log(`[recs/next] user=${user.id} cand=0 → returning empty`);
       return res.json({ items: [] });
     }
 
-    // Prepare lightweight feature list for ranker
+    // lightweight feature list for ranker
     const items = finalPool.map((r) => {
       const dist = haversineKm({ lat, lng }, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) });
       return {
-        id: r.id, // This is our DB id – ranker returns these
+        id: r.id, // IMPORTANT: this is the DB id; ranker must return these
         priceLevel: r.priceLevel ?? null,
         distanceKm: dist,
         features: [
@@ -488,17 +456,15 @@ router.post("/next", async (req, res) => {
       };
     });
 
-    // Build interaction history from this session
+    // interactions from the session
     const interactions = session.events.map((e) => ({
       userId: user.id,
       itemId: e.restaurantId,
       action: e.action,
     }));
 
-    // Default order (distance) in case the ranker is down or returns junk
-    let wantIds = items.slice(0, Math.max(1, Number(limit))).map((x) => x.id);
-
-    // Ask ranker (best-effort). I only accept IDs that exist in our candidate set.
+    // Ask ranker, but be robust if it returns IDs we can't hydrate
+    let wantIds = items.slice(0, Math.max(1, Number(limit))).map((x) => x.id); // default fallback
     try {
       const r = await fetch(`${RECS_SERVICE_URL}/rank`, {
         method: "POST",
@@ -518,21 +484,22 @@ router.post("/next", async (req, res) => {
       });
       if (r.ok) {
         const ranked = await r.json();
+        // Only keep ids that exist in our candidate set to avoid hydration=0
         const candidateSet = new Set(finalPool.map((x) => x.id));
         const safe = (ranked.rankings || []).filter((id) => candidateSet.has(id));
         wantIds = (safe.length ? safe : wantIds).slice(0, Math.max(1, Number(limit)));
       }
     } catch {
-      // fine – we'll fall back to default order
+      // ignore – we'll use the default wantIds
     }
 
-    // Hydrate the chosen IDs for the client (include one photo so we can build photoUrl)
+    // hydrate and shape for client
     let full = await prisma.restaurant.findMany({
       where: { id: { in: wantIds } },
       include: { photos: { take: 1 } },
     });
 
-    // If hydration is partial, top up with the next nearest items from finalPool
+    // If hydration came back empty or partial (ranker mismatch), fall back locally
     if (full.length < wantIds.length) {
       const need = Math.max(1, Number(limit)) - full.length;
       const missing = finalPool.filter((r) => !wantIds.includes(r.id)).slice(0, need);
@@ -545,24 +512,22 @@ router.post("/next", async (req, res) => {
       }
     }
 
-    // Preserve the ranker's order (fallback items come after)
+    // Preserve order: ranker first, then our local fallback
     const order = new Map(wantIds.map((id, i) => [id, i]));
     full.sort((a, b) => (order.get(a.id) ?? 9999) - (order.get(b.id) ?? 9999));
 
-    // Shape response for the app (distance + photoUrl are ready to use)
     const clientItems = full.map((r) => {
-      const photoName = r.photos?.[0]?.name || null; // "places/<id>/photos/<photoId>"
-      const photoUrl = photoName
-        ? `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(photoName)}&w=1200`
-        : null;
+      const photoName = r.photos?.[0]?.name || null; // "places/<id>/photos/<id>"
+      // ✅ Return a RELATIVE URL so it works on any origin (dev or prod) and doesn’t rely on env.
+      const photoUrl = photoName ? `/api/recs/photo?name=${encodeURIComponent(photoName)}&w=1200` : null;
       const dist = haversineKm({ lat, lng }, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) });
       return {
         id: r.id,
         name: r.name,
         address: r.formattedAddress,
         priceLevel: r.priceLevel ?? null,
-        distance: dist,   // km
-        photoUrl,         // used directly by the client
+        distance: dist,   // km – your UI reads `current.distance`
+        photoUrl,         // your UI reads `current.photoUrl`
         primaryType: r.primaryType,
         types: r.types,
       };
