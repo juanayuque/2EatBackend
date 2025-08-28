@@ -87,9 +87,12 @@ model Match {
   winnerRestaurantId     String
   createdAt              DateTime @default(now())
 
+  userComment            String?   // <— NEW
+
   @@index([userId])
   @@map("matches")
 }
+
 
 model User {
   id                String   @id @default(cuid())

@@ -1,47 +1,21 @@
 // routes/matches.js
-// History & details for user matches (modular, auth required)
-
 const express = require("express");
 const prisma = require("../src/prisma");
 const verifyFirebaseToken = require("../middleware/auth");
 
 const router = express.Router();
-
-const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL || "https://2eatapp.com";
-
-// --- Public health checks (no auth) ---
-router.get("/__ping", (_req, res) => res.json({ ok: true, via: "matches", ts: Date.now() }));
-router.get("/health", (_req, res) => res.json({ ok: true }));
-
-// Everything below requires a Firebase ID token
 router.use(verifyFirebaseToken);
 
-// Helpers
-function photoUrlFor(r) {
-  const name = r?.photos?.[0]?.name || null; // "places/<id>/photos/<photoId>"
-  return name
-    ? `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(name)}&w=800`
-    : null;
+const BACKEND_PUBLIC_URL = (process.env.BACKEND_PUBLIC_URL || "https://2eatapp.com").replace(/\/+$/, "");
+
+/** build photo url from first photo, if present */
+function photoFor(photos) {
+  const name = photos?.[0]?.name || null;
+  return name ? `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(name)}&w=800` : null;
 }
 
-function shapeRestaurant(r) {
-  if (!r) return null;
-  return {
-    id: r.id,
-    name: r.name,
-    address: r.formattedAddress,
-    priceLevel: r.priceLevel ?? null,
-    primaryType: r.primaryType,
-    types: r.types,
-    editorialSummary: r.editorialSummary || null,
-    editorial_summary: r.editorialSummary || null, // alias for frontend
-    photoUrl: photoUrlFor(r),
-  };
-}
-
-/**
- * GET /api/matches
- * Returns recent matches for the authed user, fully hydrated with restaurant data.
+/** GET /api/matches
+ *  Returns the user's match history, hydrated with restaurant basics & photos.
  */
 router.get("/", async (req, res) => {
   try {
@@ -52,88 +26,84 @@ router.get("/", async (req, res) => {
     const matches = await prisma.match.findMany({
       where: { userId: user.id },
       orderBy: { createdAt: "desc" },
-      take: 30,
+      take: 50,
     });
-    if (!matches.length) return res.json({ matches: [] });
 
-    // Collect all restaurant ids we need to hydrate in one go
+    // collect all restaurant ids we need to hydrate
     const ids = new Set();
     for (const m of matches) {
-      if (m.winnerRestaurantId) ids.add(m.winnerRestaurantId);
-      if (m.top1RestaurantId) ids.add(m.top1RestaurantId);
-      if (m.top2RestaurantId) ids.add(m.top2RestaurantId);
-      if (m.top3RestaurantId) ids.add(m.top3RestaurantId);
-      if (m.superStarRestaurantId) ids.add(m.superStarRestaurantId);
+      [m.top1RestaurantId, m.top2RestaurantId, m.top3RestaurantId, m.superStarRestaurantId, m.winnerRestaurantId]
+        .filter(Boolean)
+        .forEach((x) => ids.add(x));
     }
 
-    const restaurants = await prisma.restaurant.findMany({
+    const restos = await prisma.restaurant.findMany({
       where: { id: { in: Array.from(ids) } },
       include: { photos: { take: 1 } },
     });
-    const byId = new Map(restaurants.map((r) => [r.id, r]));
+    const byId = new Map(restos.map((r) => [r.id, r]));
+
+    function pick(id) {
+      if (!id) return null;
+      const r = byId.get(id);
+      if (!r) return null;
+      return {
+        id: r.id,
+        name: r.name,
+        address: r.formattedAddress,
+        priceLevel: r.priceLevel ?? null,
+        primaryType: r.primaryType,
+        types: r.types,
+        editorialSummary: r.editorialSummary || null,
+        editorial_summary: r.editorialSummary || null,
+        photoUrl: photoFor(r.photos),
+      };
+    }
 
     const payload = matches.map((m) => ({
       id: m.id,
       sessionId: m.sessionId,
       createdAt: m.createdAt,
-      winner: shapeRestaurant(byId.get(m.winnerRestaurantId)),
-      top1: shapeRestaurant(byId.get(m.top1RestaurantId)),
-      top2: shapeRestaurant(byId.get(m.top2RestaurantId)),
-      top3: shapeRestaurant(byId.get(m.top3RestaurantId)),
-      superStar: shapeRestaurant(byId.get(m.superStarRestaurantId)),
+      userComment: m.userComment || null,
+      winner: pick(m.winnerRestaurantId) || pick(m.top1RestaurantId),
+      top1: pick(m.top1RestaurantId),
+      top2: pick(m.top2RestaurantId),
+      top3: pick(m.top3RestaurantId),
+      superStar: pick(m.superStarRestaurantId),
     }));
 
     res.json({ matches: payload });
   } catch (e) {
-    console.error("matches/index error:", e);
-    res.status(500).json({ error: "history failed" });
+    console.error("[matches] list error:", e);
+    res.status(500).json({ error: "failed_list" });
   }
 });
 
-/**
- * GET /api/matches/:id
- * Returns one match with hydrated restaurants.
+/** PUT /api/matches/:id/comment  { comment: string }
+ *  Saves/updates a single user comment on the match (per user).
  */
-router.get("/:id", async (req, res) => {
+router.put("/:id/comment", async (req, res) => {
   try {
     const uid = req.user.uid;
     const user = await prisma.user.findUnique({ where: { firebaseUid: uid } });
     if (!user) return res.status(404).json({ error: "User not found" });
 
-    const m = await prisma.match.findFirst({
-      where: { id: req.params.id, userId: user.id },
-    });
-    if (!m) return res.status(404).json({ error: "Not found" });
+    const { id } = req.params;
+    const { comment } = req.body || {};
+    if (typeof comment !== "string") return res.status(400).json({ error: "comment required" });
 
-    const ids = [
-      m.winnerRestaurantId,
-      m.top1RestaurantId,
-      m.top2RestaurantId,
-      m.top3RestaurantId,
-      m.superStarRestaurantId,
-    ].filter(Boolean);
+    const match = await prisma.match.findUnique({ where: { id } });
+    if (!match || match.userId !== user.id) return res.status(404).json({ error: "Match not found" });
 
-    const restaurants = await prisma.restaurant.findMany({
-      where: { id: { in: ids } },
-      include: { photos: { take: 1 } },
+    const updated = await prisma.match.update({
+      where: { id },
+      data: { userComment: comment.trim() || null },
     });
-    const byId = new Map(restaurants.map((r) => [r.id, r]));
 
-    res.json({
-      match: {
-        id: m.id,
-        sessionId: m.sessionId,
-        createdAt: m.createdAt,
-        winner: shapeRestaurant(byId.get(m.winnerRestaurantId)),
-        top1: shapeRestaurant(byId.get(m.top1RestaurantId)),
-        top2: shapeRestaurant(byId.get(m.top2RestaurantId)),
-        top3: shapeRestaurant(byId.get(m.top3RestaurantId)),
-        superStar: shapeRestaurant(byId.get(m.superStarRestaurantId)),
-      },
-    });
+    res.json({ ok: true, userComment: updated.userComment });
   } catch (e) {
-    console.error("matches/show error:", e);
-    res.status(500).json({ error: "show failed" });
+    console.error("[matches] save comment error:", e);
+    res.status(500).json({ error: "failed_save_comment" });
   }
 });
 
