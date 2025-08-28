@@ -306,102 +306,85 @@ async function ensureNearbyRestaurants(lat, lng, minCount = 100) {
 
 // ----------------------- photo proxy (no auth) ----------------------
 // GET /api/recs/photo?name=places/<id>/photos/<photoId>&w=1200
+// GET /api/recs/photo?name=places/.../photos/...&w=1200&h=...
 router.get("/photo", async (req, res) => {
   try {
     if (!GOOGLE_API_KEY) return res.status(503).send("photo proxy disabled");
 
-    res.setHeader("Access-Control-Allow-Origin", "*");
-
-    const rawName = String(req.query.name || "");
-    const name = decodeURIComponent(rawName);
-    const maxWidthPx = req.query.maxWidthPx || req.query.w;
-    const maxHeightPx = req.query.maxHeightPx || req.query.h;
-
-    if (!/^places\/[^/]+\/photos\/[^/]+$/.test(name)) {
+    const raw = String(req.query.name || "");
+    const name = decodeURIComponent(raw);
+    if (!name.startsWith("places/") || !name.includes("/photos/")) {
       return res.status(400).send("bad name");
     }
 
-    const wantW = maxWidthPx ? Math.max(50, Math.min(1600, Number(maxWidthPx))) : undefined;
-    const wantH = !wantW && maxHeightPx ? Math.max(50, Math.min(1600, Number(maxHeightPx))) : undefined;
+    // accept both ?w/h and ?maxWidthPx/maxHeightPx
+    const w = req.query.maxWidthPx || req.query.w;
+    const h = req.query.maxHeightPx || req.query.h;
 
-    await fsp.mkdir(PHOTO_CACHE_DIR, { recursive: true }).catch(() => {});
-    const cachePath = path.join(PHOTO_CACHE_DIR, (name + `__w${wantW || 0}__h${wantH || 0}.bin`).replace(/[^a-zA-Z0-9._/-]/g, "_"));
-    if (fs.existsSync(cachePath)) {
-      res.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
-      res.set("Content-Type", "image/jpeg");
-      return fs.createReadStream(cachePath).pipe(res);
-    }
-
-    const sendBuffer = async (buf, contentType = "image/jpeg") => {
-      try { await fsp.writeFile(cachePath, buf); } catch {}
-      res.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
-      res.set("Content-Type", contentType);
-      return res.end(buf);
+    // 1) Try the official fetchPhoto endpoint (POST JSON)
+    const body = {
+      name,
+      ...(w ? { maxWidthPx: Number(w) } : {}),
+      ...(h ? { maxHeightPx: Number(h) } : {}),
     };
 
-    // Preferred: places:fetchPhoto (auth with header)
-    const fp = await fetch("https://places.googleapis.com/v1/places:fetchPhoto", {
+    let r = await fetch("https://places.googleapis.com/v1/places:fetchPhoto", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": GOOGLE_API_KEY,
       },
-      body: JSON.stringify({
-        name,
-        ...(wantW ? { maxWidthPx: wantW } : { maxHeightPx: wantH || 800 }),
-      }),
+      body: JSON.stringify(body),
     });
 
-    if (fp.ok) {
-      const j = await fp.json();
-      if (j.photoUri) {
-        const img = await fetch(j.photoUri);
-        if (img.ok) {
-          const buf = Buffer.from(await img.arrayBuffer());
-          const ct = img.headers.get("content-type") || "image/jpeg";
-          return await sendBuffer(buf, ct);
+    if (!r.ok) {
+      // If the photo token is stale, re-pull the place’s photos and retry once
+      console.error("[recs/photo] fetchPhoto upstream", r.status);
+      const m = /^places\/([^/]+)\/photos\/[^/]+$/.exec(name);
+      if (m) {
+        const placeId = m[1];
+        const det = await fetch(
+          `https://places.googleapis.com/v1/places/${placeId}?fields=photos.name&key=${GOOGLE_API_KEY}`
+        );
+        if (det.ok) {
+          const dj = await det.json();
+          const newName = dj?.photos?.[0]?.name;
+          if (newName && newName !== name) {
+            try { await prisma.photo.updateMany({ where: { name }, data: { name: newName } }); } catch {}
+            const retryBody = {
+              name: newName,
+              ...(w ? { maxWidthPx: Number(w) } : {}),
+              ...(h ? { maxHeightPx: Number(h) } : {}),
+            };
+            r = await fetch("https://places.googleapis.com/v1/places:fetchPhoto", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": GOOGLE_API_KEY,
+              },
+              body: JSON.stringify(retryBody),
+            });
+          }
         }
       }
-    } else {
-      const body = await fp.text();
-      console.warn("[recs/photo] fetchPhoto upstream", fp.status, body.slice(0, 300));
     }
 
-    // Fallback: /media with redirect, auth via header
-    const params = new URLSearchParams();
-    if (wantW) params.set("maxWidthPx", String(wantW));
-    else params.set("maxHeightPx", String(wantH || 800));
-    const mediaUrl = `https://places.googleapis.com/v1/${name}/media?${params.toString()}`;
-
-    const r1 = await fetch(mediaUrl, {
-      redirect: "manual",
-      headers: { "X-Goog-Api-Key": GOOGLE_API_KEY },
-    });
-
-    if (r1.status === 301 || r1.status === 302) {
-      const loc = r1.headers.get("location");
-      if (!loc) return res.sendStatus(502);
-      const r2 = await fetch(loc);
-      if (!r2.ok) return res.sendStatus(502);
-      const buf = Buffer.from(await r2.arrayBuffer());
-      const ct = r2.headers.get("content-type") || "image/jpeg";
-      return await sendBuffer(buf, ct);
+    if (!r.ok) {
+      // Let UI show its fallback image without an error splash
+      return res.status(204).end();
     }
 
-    if (r1.ok) {
-      const buf = Buffer.from(await r1.arrayBuffer());
-      const ct = r1.headers.get("content-type") || "image/jpeg";
-      return await sendBuffer(buf, ct);
-    } else {
-      const body = await r1.text();
-      console.warn("[recs/photo] media upstream", r1.status, "body:", body.slice(0, 300));
-      return res.sendStatus(502);
-    }
+    // Stream image bytes back
+    res.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
+    res.set("Content-Type", r.headers.get("content-type") || "image/jpeg");
+    res.set("Access-Control-Allow-Origin", "*");
+    return r.body.pipe(res);
   } catch (e) {
     console.error("photo proxy error", e);
-    res.sendStatus(500);
+    return res.status(204).end();
   }
 });
+
 
 /* ───────────────────────── Everything below needs auth ───────────────────── */
 router.use(verifyFirebaseToken);
