@@ -94,17 +94,17 @@ async function googlePlacesSearchNearby(lat, lng, radiusMeters = 8000, maxPages 
     const body = {
       includedTypes: ["restaurant"],
       maxResultCount: 20,
-      locationBias: { circle: { center: { latitude: lat, longitude: lng }, radius: radiusMeters } },
+    locationRestriction: { circle: { center: { latitude: lat, longitude: lng }, radius: radiusMeters } },
       pageToken,
     };
     const r = await fetch("https://places.googleapis.com/v1/places:searchNearby", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": GOOGLE_API_KEY,          // ← fix 403
-        "X-Goog-FieldMask": PLACES_FIELD_MASK,
-      },
-      body: JSON.stringify(body),
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    "X-Goog-Api-Key": GOOGLE_API_KEY,
+    "X-Goog-FieldMask": PLACES_FIELD_MASK,
+  },
+  body: JSON.stringify(body),
     });
     if (!r.ok) {
       const txt = await safeText(r);
@@ -340,7 +340,6 @@ router.get("/photo", async (req, res) => {
   try {
     if (!GOOGLE_API_KEY) return res.status(503).send("photo proxy disabled");
 
-    // Allow CORS + image embedding
     res.setHeader("Access-Control-Allow-Origin", "*");
 
     const rawName = String(req.query.name || "");
@@ -348,7 +347,8 @@ router.get("/photo", async (req, res) => {
     const maxWidthPx = req.query.maxWidthPx || req.query.w;
     const maxHeightPx = req.query.maxHeightPx || req.query.h;
 
-    if (!/^places\/[A-Za-z0-9_\-]+\/photos\/[A-Za-z0-9_\-]+$/.test(name)) {
+    // Allow "places/<placeId>/photos/<photoId>" (IDs can be long; keep it simple)
+    if (!/^places\/[^/]+\/photos\/[^/]+$/.test(name)) {
       return res.status(400).send("bad name");
     }
 
@@ -370,23 +370,55 @@ router.get("/photo", async (req, res) => {
       return res.end(buf);
     };
 
-    // Build media URL WITH key in query string
+    // ---------- Preferred path: fetchPhoto (API key in HEADER) ----------
+    const fp = await fetch("https://places.googleapis.com/v1/places:fetchPhoto", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_API_KEY,      // << key in header (not in body)
+      },
+      body: JSON.stringify({
+        name,
+        ...(wantW ? { maxWidthPx: wantW } : { maxHeightPx: wantH || 800 }),
+      }),
+    });
+
+    if (fp.ok) {
+      const j = await fp.json();
+      if (j.photoUri) {
+        const r3 = await fetch(j.photoUri);
+        if (r3.ok) {
+          const buf = Buffer.from(await r3.arrayBuffer());
+          const ct = r3.headers.get("content-type") || "image/jpeg";
+          return await sendBuffer(buf, ct);
+        }
+      } else {
+        const txt = await fp.text();
+        console.warn("[recs/photo] fetchPhoto ok but no photoUri", txt.slice(0, 200));
+      }
+    } else {
+      const txt = await fp.text();
+      console.warn("[recs/photo] fetchPhoto upstream", fp.status, txt.slice(0, 300));
+    }
+
+    // ---------- Fallback: /media with redirect (API key in HEADER) ----------
     const params = new URLSearchParams();
     if (wantW) params.set("maxWidthPx", String(wantW));
     else params.set("maxHeightPx", String(wantH || 800));
-    params.set("key", GOOGLE_API_KEY);
 
     const mediaUrl = `https://places.googleapis.com/v1/${name}/media?${params.toString()}`;
 
-    // Step 1: request without following redirects to get the 302 Location
-    const r1 = await fetch(mediaUrl, { redirect: "manual" });
+    const r1 = await fetch(mediaUrl, {
+      redirect: "manual",
+      headers: { "X-Goog-Api-Key": GOOGLE_API_KEY },  // << key in header
+    });
+
     if (r1.status === 302 || r1.status === 301) {
       const loc = r1.headers.get("location");
       if (!loc) return res.sendStatus(502);
-      // Step 2: fetch the signed CDN URL (no auth headers required)
       const r2 = await fetch(loc);
       if (!r2.ok) {
-        const body = await safeText(r2);
+        const body = await r2.text();
         console.error("[recs/photo] signed URL fetch failed", r2.status, body.slice(0, 200));
         return res.sendStatus(502);
       }
@@ -400,37 +432,16 @@ router.get("/photo", async (req, res) => {
       const ct = r1.headers.get("content-type") || "image/jpeg";
       return await sendBuffer(buf, ct);
     } else {
-      const body = await safeText(r1);
+      const body = await r1.text();
       console.warn("[recs/photo] media upstream", r1.status, "body:", body.slice(0, 300));
-      // Fallback: signed photoUri via fetchPhoto
-      const fallback = await fetch("https://places.googleapis.com/v1/places:fetchPhoto", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name,
-          maxWidthPx: wantW || undefined,
-          maxHeightPx: wantW ? undefined : (wantH || 800),
-          key: GOOGLE_API_KEY,
-        }),
-      });
-      if (!fallback.ok) {
-        const b2 = await safeText(fallback);
-        console.error("[recs/photo] fetchPhoto failed", fallback.status, b2.slice(0, 300));
-        return res.sendStatus(502);
-      }
-      const j = await fallback.json();
-      if (!j.photoUri) return res.sendStatus(502);
-      const r3 = await fetch(j.photoUri);
-      if (!r3.ok) return res.sendStatus(502);
-      const buf = Buffer.from(await r3.arrayBuffer());
-      const ct = r3.headers.get("content-type") || "image/jpeg";
-      return await sendBuffer(buf, ct);
+      return res.sendStatus(502);
     }
   } catch (e) {
     console.error("photo proxy error", e);
     res.sendStatus(500);
   }
 });
+
 
 // ---------- everything below here REQUIRES a Firebase token ----------
 router.use(verifyFirebaseToken);
