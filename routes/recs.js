@@ -259,6 +259,51 @@ async function backfillMissingPlaceMetadata(restaurants) {
   }
 }
 
+// Build/refresh nearby pool; ingest from Places if thin; always log the count
+async function ensureNearbyRestaurants(lat, lng, minCount = 100) {
+  const here = { lat, lng };
+
+  const all = await prisma.restaurant.findMany({
+    take: 2000,
+    include: { photos: { take: 1 } },
+  });
+
+  let nearby = all
+    .map((r) => ({
+      r,
+      d: haversineKm(here, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }),
+    }))
+    .filter((x) => Number.isFinite(x.d) && x.d <= 15)
+    .sort((a, b) => a.d - b.d)
+    .map((x) => x.r);
+
+  if (nearby.length < minCount && GOOGLE_API_KEY) {
+    console.log(`[recs] nearby=${nearby.length} < ${minCount} → ingesting Places…`);
+    const places = await googlePlacesSearchNearby(lat, lng, 10000, 3);
+    console.log(`[recs] ingested places: ${places.length}`);
+    if (places.length) {
+      await upsertPlacesBatch(places);
+      const refreshed = await prisma.restaurant.findMany({
+        take: 2000,
+        include: { photos: { take: 1 } },
+      });
+      nearby = refreshed
+        .map((r) => ({
+          r,
+          d: haversineKm(here, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }),
+        }))
+        .filter((x) => Number.isFinite(x.d) && x.d <= 15)
+        .sort((a, b) => a.d - b.d)
+        .map((x) => x.r);
+    }
+  }
+
+  backfillMissingPlaceMetadata(nearby).catch(() => {});
+  console.log(`[recs] ensureNearby: ${nearby.length} within 15km`);
+  return nearby;
+}
+
+
 // ----------------------- photo proxy (no auth) ----------------------
 // GET /api/recs/photo?name=places/<id>/photos/<photoId>&w=1200
 router.get("/photo", async (req, res) => {
