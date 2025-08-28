@@ -309,8 +309,30 @@ function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60)
 }
 
 // ---------- PUBLIC image proxy (moved BEFORE auth) ----------
-// I expose the photo proxy publicly so <Image> tags can fetch without a bearer token.
-// I also add a little logging so we can see requests coming through.
+// ---------- PUBLIC image proxy with local disk cache ----------
+const fs = require("fs");
+const fsp = fs.promises;
+const path = require("path");
+const crypto = require("crypto");
+
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+const PHOTO_CACHE_DIR = process.env.PHOTO_CACHE_DIR || path.join(process.cwd(), ".photo-cache");
+// optional: days to keep files before re-fetch
+const PHOTO_CACHE_TTL_MS = Number(process.env.PHOTO_CACHE_TTL_MS || 30 * 24 * 60 * 60 * 1000); // 30 days
+
+async function ensureDir(p) {
+  try { await fsp.mkdir(p, { recursive: true }); } catch {}
+}
+function cacheKeyFor(name, w, h) {
+  const key = `${name}|w=${w || ""}|h=${h || ""}`;
+  return crypto.createHash("sha1").update(key).digest("hex") + ".jpg";
+}
+function isFresh(stat) {
+  if (!PHOTO_CACHE_TTL_MS) return true;
+  const age = Date.now() - stat.mtimeMs;
+  return age < PHOTO_CACHE_TTL_MS;
+}
+
 router.get("/photo", async (req, res) => {
   try {
     if (!GOOGLE_API_KEY) return res.status(503).send("photo proxy disabled");
@@ -318,34 +340,65 @@ router.get("/photo", async (req, res) => {
     const w = req.query.w ? Number(req.query.w) : undefined;
     const h = req.query.h ? Number(req.query.h) : undefined;
 
-    // Allow only patterns like: places/<id>/photos/<id>
+    // Strictly validate resource name (prevents SSRF). Google names look like: places/<id>/photos/<id>
     if (!/^places\/[A-Za-z0-9_\-]+\/photos\/[A-Za-z0-9_\-]+$/.test(name)) {
       console.warn("[recs/photo] bad name:", name);
       return res.status(400).send("bad name");
     }
 
+    await ensureDir(PHOTO_CACHE_DIR);
+    const filename = cacheKeyFor(name, w, h);
+    const filePath = path.join(PHOTO_CACHE_DIR, filename);
+
+    // Serve cached file if fresh
+    try {
+      const stat = await fsp.stat(filePath);
+      if (stat.isFile() && isFresh(stat)) {
+        res.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
+        res.type("jpg");
+        return fs.createReadStream(filePath).pipe(res);
+      }
+    } catch (_) {
+      // cache miss
+    }
+
+    // Fetch from Google Places Photos v1
     const usp = new URLSearchParams();
     if (w) usp.set("maxWidthPx", String(w));
     if (h) usp.set("maxHeightPx", String(h));
-
     const url = `https://places.googleapis.com/v1/${name}/media?${usp.toString()}`;
+
     const r = await fetch(url, { headers: { "X-Goog-Api-Key": GOOGLE_API_KEY } });
     if (!r.ok) {
       console.warn("[recs/photo] upstream status", r.status, "for", name);
       return res.sendStatus(r.status);
     }
 
-    // Cache for a day; safe since photo bits rarely change.
+    // Stream to both disk and client
     res.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
     const ct = r.headers.get("content-type") || "image/jpeg";
     res.set("Content-Type", ct);
-    console.log("[recs/photo] 200 OK", name);
-    return r.body.pipe(res);
+
+    // Write-through cache
+    const tmpFile = filePath + ".part";
+    await ensureDir(path.dirname(filePath));
+    const out = fs.createWriteStream(tmpFile);
+    r.body.pipe(out);
+    r.body.on("end", async () => {
+      try { await fsp.rename(tmpFile, filePath); } catch {}
+    });
+    r.body.on("error", async () => {
+      try { await fsp.unlink(tmpFile); } catch {}
+    });
+
+    // Also pipe to the response
+    r.body.pipe(res);
   } catch (e) {
     console.error("photo proxy error", e);
     res.sendStatus(500);
   }
 });
+
 
 // --- Everything below here requires a Firebase ID token
 router.use(verifyFirebaseToken);
