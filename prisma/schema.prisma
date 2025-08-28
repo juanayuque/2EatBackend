@@ -125,6 +125,8 @@ model Restaurant {
   internationalPhoneNumber String?  @map("international_phone_number")
   websiteUri               String?  @map("website_uri") @db.Text
   primaryTypeDisplayName   String?  @map("primary_type_display_name")
+  primaryType              String?  @map("primary_type")
+  types                    String[] @default([]) @map("types")
   rating                   Decimal? @db.Decimal(2, 1) // Store with specific precision for rating
   userRatingCount          Int?     @map("user_rating_count")
   priceLevel               Int?     @map("price_level")
