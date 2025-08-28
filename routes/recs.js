@@ -479,10 +479,10 @@ router.post("/start", async (req, res) => {
     if (!user) return res.status(404).json({ error: "User not found. Sync profile first." });
 
     let session = await prisma.swipeSession.findFirst({
-      where: { userId: user.id, status: "active" },
-      orderBy: { createdAt: "desc" },
-      include: { events: true },
-    });
+  where: { userId: user.id, status: "active" },
+  orderBy: { startedAt: "desc" }, // use existing field
+  include: { events: true },
+});
     if (!session) {
       session = await prisma.swipeSession.create({ data: { userId: user.id } });
     }
