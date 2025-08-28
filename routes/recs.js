@@ -466,14 +466,15 @@ function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60)
 }
 
 // ---------- routes ----------
-router.get("/lookup", async (req, res) => {
+// Resolve restaurant names (and a few fields) for a list of IDs (POST)
+router.post("/lookup", async (req, res) => {
   try {
-    const idsParam = String(req.query.ids || "");
-    const ids = idsParam.split(",").map(s => s.trim()).filter(Boolean);
-    if (!ids.length) return res.json({ items: [] });
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    const uniq = [...new Set(ids.filter((s) => typeof s === "string" && s.trim().length))];
+    if (!uniq.length) return res.json({ items: [] });
 
     const rows = await prisma.restaurant.findMany({
-      where: { id: { in: ids } },
+      where: { id: { in: uniq } },
       select: {
         id: true,
         name: true,
@@ -484,7 +485,7 @@ router.get("/lookup", async (req, res) => {
       },
     });
 
-    const items = rows.map(r => ({
+    const items = rows.map((r) => ({
       id: r.id,
       name: r.name,
       editorialSummary: r.editorialSummary || null,
@@ -498,10 +499,11 @@ router.get("/lookup", async (req, res) => {
 
     res.json({ items });
   } catch (e) {
-    console.error("recs/lookup error:", e);
+    console.error("recs/lookup POST error:", e);
     res.status(500).json({ error: "lookup failed" });
   }
 });
+
 
 // Start a swipe/recs session
 router.post("/start", async (req, res) => {
