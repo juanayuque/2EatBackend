@@ -6,7 +6,7 @@
 const express = require("express");
 const prisma = require("../src/prisma");
 const verifyFirebaseToken = require("../middleware/auth");
-
+const axios = require("axios");ß
 const fs = require("fs");
 const fsp = fs.promises;
 const path = require("path");
@@ -305,85 +305,88 @@ async function ensureNearbyRestaurants(lat, lng, minCount = 100) {
 
 
 // ----------------------- photo proxy (no auth) ----------------------
-// GET /api/recs/photo?name=places/<id>/photos/<photoId>&w=1200
-// GET /api/recs/photo?name=places/.../photos/...&w=1200&h=...
 router.get("/photo", async (req, res) => {
   try {
-    if (!GOOGLE_API_KEY) return res.status(503).send("photo proxy disabled");
+    const apiKey = process.env.GOOGLE_API_KEY;
+    if (!apiKey) return res.status(503).send("photo proxy disabled");
 
     const raw = String(req.query.name || "");
     const name = decodeURIComponent(raw);
-    if (!name.startsWith("places/") || !name.includes("/photos/")) {
-      return res.status(400).send("bad name");
-    }
 
-    // accept both ?w/h and ?maxWidthPx/maxHeightPx
-    const w = req.query.maxWidthPx || req.query.w;
-    const h = req.query.maxHeightPx || req.query.h;
+    // Strictly allow only "places/<id>/photos/<photo_id>"
+    const m = /^places\/([^/]+)\/photos\/([^/]+)$/.exec(name);
+    if (!m) return res.status(400).send("bad name");
+    const placeId = m[1];
 
-    // 1) Try the official fetchPhoto endpoint (POST JSON)
-    const body = {
-      name,
-      ...(w ? { maxWidthPx: Number(w) } : {}),
-      ...(h ? { maxHeightPx: Number(h) } : {}),
+    // width/height: support both ?w/h and ?maxWidthPx/maxHeightPx
+    const w = req.query.w || req.query.maxWidthPx;
+    const h = req.query.h || req.query.maxHeightPx;
+
+    const buildMediaUrl = (photoName) => {
+      const params = new URLSearchParams();
+      if (w) params.set("maxWidthPx", String(w));
+      if (h) params.set("maxHeightPx", String(h));
+      params.set("key", apiKey); // use query param per Places v1 examples
+      return `https://places.googleapis.com/v1/${photoName}/media?${params.toString()}`;
     };
 
-    let r = await fetch("https://places.googleapis.com/v1/places:fetchPhoto", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": GOOGLE_API_KEY,
-      },
-      body: JSON.stringify(body),
-    });
+    async function streamMedia(photoName) {
+      const mediaUrl = buildMediaUrl(photoName);
 
-    if (!r.ok) {
-      // If the photo token is stale, re-pull the place’s photos and retry once
-      console.error("[recs/photo] fetchPhoto upstream", r.status);
-      const m = /^places\/([^/]+)\/photos\/[^/]+$/.exec(name);
-      if (m) {
-        const placeId = m[1];
-        const det = await fetch(
-          `https://places.googleapis.com/v1/places/${placeId}?fields=photos.name&key=${GOOGLE_API_KEY}`
-        );
-        if (det.ok) {
-          const dj = await det.json();
-          const newName = dj?.photos?.[0]?.name;
+      // First request without following redirects (expect 302)
+      const head = await axios.get(mediaUrl, {
+        responseType: "stream",
+        maxRedirects: 0,
+        validateStatus: (s) => s >= 200 && s < 400, // accept 302
+      });
+
+      const finalUrl = head.status === 302 && head.headers.location
+        ? head.headers.location
+        : mediaUrl;
+
+      const img = await axios.get(finalUrl, { responseType: "stream" });
+
+      res.setHeader("Content-Type", img.headers["content-type"] || "image/jpeg");
+      res.setHeader("Cache-Control", "public, max-age=86400, s-maxage=86400");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      img.data.pipe(res);
+    }
+
+    try {
+      // Try with the stored photo name first
+      return await streamMedia(name);
+    } catch (err) {
+      const status = err?.response?.status;
+      console.error("[recs/photo] media upstream", status || "", err?.message || "");
+
+      // If Google says the resource is invalid/stale, refresh photos for the place and retry once
+      if (status === 400 || status === 404) {
+        try {
+          const det = await axios.get(
+            `https://places.googleapis.com/v1/places/${placeId}?fields=photos.name&key=${apiKey}`
+          );
+          const newName = det?.data?.photos?.[0]?.name;
           if (newName && newName !== name) {
-            try { await prisma.photo.updateMany({ where: { name }, data: { name: newName } }); } catch {}
-            const retryBody = {
-              name: newName,
-              ...(w ? { maxWidthPx: Number(w) } : {}),
-              ...(h ? { maxHeightPx: Number(h) } : {}),
-            };
-            r = await fetch("https://places.googleapis.com/v1/places:fetchPhoto", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "X-Goog-Api-Key": GOOGLE_API_KEY,
-              },
-              body: JSON.stringify(retryBody),
-            });
+            // best-effort DB update so we stop requesting the stale token
+            try {
+              await prisma.photo.updateMany({ where: { name }, data: { name: newName } });
+            } catch (_) {}
+            return await streamMedia(newName);
           }
+        } catch (e2) {
+          console.error("[recs/photo] details fetch failed", e2?.response?.status || "", e2?.message || "");
         }
       }
-    }
 
-    if (!r.ok) {
-      // Let UI show its fallback image without an error splash
+      // Graceful no-content so the UI can show its fallback image
       return res.status(204).end();
     }
-
-    // Stream image bytes back
-    res.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
-    res.set("Content-Type", r.headers.get("content-type") || "image/jpeg");
-    res.set("Access-Control-Allow-Origin", "*");
-    return r.body.pipe(res);
   } catch (e) {
     console.error("photo proxy error", e);
     return res.status(204).end();
   }
 });
+
 
 
 /* ───────────────────────── Everything below needs auth ───────────────────── */
