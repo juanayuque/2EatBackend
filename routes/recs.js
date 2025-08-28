@@ -6,7 +6,7 @@
 const express = require("express");
 const prisma = require("../src/prisma");
 const verifyFirebaseToken = require("../middleware/auth");
-const axios = require("axios");ß
+const axios = require("axios");
 const fs = require("fs");
 const fsp = fs.promises;
 const path = require("path");
@@ -34,6 +34,19 @@ console.log("[recs] BOOT", {
 });
 
 // ---------- helpers ----------
+// Google Places v1 -> our DB int (1..4)
+function mapPriceLevelEnum(v) {
+  if (v == null) return null;
+  if (typeof v === "number") return v; // in case we already normalized
+  switch (String(v)) {
+    case "PRICE_LEVEL_INEXPENSIVE": return 1;
+    case "PRICE_LEVEL_MODERATE":    return 2;
+    case "PRICE_LEVEL_EXPENSIVE":   return 3;
+    case "PRICE_LEVEL_VERY_EXPENSIVE": return 4;
+    default: return null;
+  }
+}
+
 function haversineKm(a, b) {
   const toRad = (x) => (x * Math.PI) / 180;
   const R = 6371;
