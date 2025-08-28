@@ -466,6 +466,42 @@ function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60)
 }
 
 // ---------- routes ----------
+router.get("/lookup", async (req, res) => {
+  try {
+    const idsParam = String(req.query.ids || "");
+    const ids = idsParam.split(",").map(s => s.trim()).filter(Boolean);
+    if (!ids.length) return res.json({ items: [] });
+
+    const rows = await prisma.restaurant.findMany({
+      where: { id: { in: ids } },
+      select: {
+        id: true,
+        name: true,
+        editorialSummary: true,
+        formattedAddress: true,
+        priceLevel: true,
+        photos: { take: 1 },
+      },
+    });
+
+    const items = rows.map(r => ({
+      id: r.id,
+      name: r.name,
+      editorialSummary: r.editorialSummary || null,
+      editorial_summary: r.editorialSummary || null,
+      address: r.formattedAddress,
+      priceLevel: r.priceLevel ?? null,
+      photoUrl: r.photos?.[0]?.name
+        ? `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(r.photos[0].name)}&w=1200`
+        : null,
+    }));
+
+    res.json({ items });
+  } catch (e) {
+    console.error("recs/lookup error:", e);
+    res.status(500).json({ error: "lookup failed" });
+  }
+});
 
 // Start a swipe/recs session
 router.post("/start", async (req, res) => {
@@ -689,8 +725,10 @@ router.post("/feedback", async (req, res) => {
         });
       }
     });
-    const shouldRerank = position % 5 === 0;
-    const shouldSuggestMatch = position >= 15;
+    const nextCount = (session.totalSwipes ?? session.events.length) + 1;
+
+const shouldRerank = nextCount % 5 === 0;
+const shouldSuggestMatch = nextCount >= 15;
     res.json({ ok: true, shouldRerank, shouldSuggestMatch });
   } catch (e) {
     console.error("recs/feedback error:", e);
@@ -724,29 +762,30 @@ router.post("/finalize-match", async (req, res) => {
         data: { status: "completed", endedAt: new Date() },
       });
     });
-    res.json({ ok: true });
+
     // hydrate winner for immediate UI render
-    const winner = await prisma.restaurant.findUnique({
-      where: { id: winnerRestaurantId },
-      include: { photos: { take: 1 } },
-    });
-    let winnerPhotoUrl = null;
-    const photoName = winner?.photos?.[0]?.name || null;
-    if (photoName) {
-      winnerPhotoUrl = `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(photoName)}&w=1200`;
-    }
-    const payloadWinner = winner && {
-      id: winner.id,
-      name: winner.name,
-      address: winner.formattedAddress,
-      priceLevel: winner.priceLevel ?? null,
-      primaryType: winner.primaryType,
-     types: winner.types,
-      editorialSummary: winner.editorialSummary || null,
-      editorial_summary: winner.editorialSummary || null, // alias
-      photoUrl: winnerPhotoUrl,
-    };
-    res.json({ ok: true, winner: payloadWinner });
+const winner = await prisma.restaurant.findUnique({
+  where: { id: winnerRestaurantId },
+  include: { photos: { take: 1 } },
+});
+let winnerPhotoUrl = null;
+const photoName = winner?.photos?.[0]?.name || null;
+if (photoName) {
+  winnerPhotoUrl = `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(photoName)}&w=1200`;
+}
+const payloadWinner = winner && {
+  id: winner.id,
+  name: winner.name,
+  address: winner.formattedAddress,
+  priceLevel: winner.priceLevel ?? null,
+  primaryType: winner.primaryType,
+  types: winner.types,
+  editorialSummary: winner.editorialSummary || null,
+  editorial_summary: winner.editorialSummary || null,
+  photoUrl: winnerPhotoUrl,
+};
+res.json({ ok: true, winner: payloadWinner });
+
   } catch (e) {
     console.error("recs/finalize-match error:", e);
     res.status(500).json({ error: "finalize failed" });
