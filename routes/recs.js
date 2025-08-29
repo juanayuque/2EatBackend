@@ -202,29 +202,71 @@ function generateRingCenters(lat, lng, minKm = 2, maxKm = 12, stepKm = 2) {
   return centers;
 }
 
+/**
+ * [FIXED] The original function created separate queries for each preference,
+ * leading to an "OR" search (e.g., find vegetarian OR pet-friendly places).
+ * This updated version combines preferences into a single, more specific query first
+ * (e.g., "vegetarian pet friendly restaurant") to perform an "AND"-like search,
+ * and includes broader queries as fallbacks.
+ */
 function buildBiasQueries(user) {
   const req = requirementsFromUser(user);
-  const qs = [];
-  const cuisines = Array.from(cuisineKeywordsFromUser(user)).slice(0, 3);
+  const requirementKeywords = [];
+  const queries = new Set();
 
-  if (req.petFriendly) {
-    qs.push("dog friendly restaurant");
-    qs.push("pet friendly restaurant");
+  // 1. Collect requirement keywords from user preferences
+  if (req.vegetarian) requirementKeywords.push("vegetarian");
+  if (req.petFriendly) requirementKeywords.push("pet friendly");
+  // Using "with parking" is more explicit for text searches than just "parking"
+  if (req.parking) requirementKeywords.push("with parking");
+
+  const cuisines = Array.from(cuisineKeywordsFromUser(user));
+
+  // 2. Create the most specific, combined query with all preferences
+  if (requirementKeywords.length > 0 || cuisines.length > 0) {
+    const allKeywords = [...cuisines, ...requirementKeywords, "restaurant"];
+    queries.add(allKeywords.join(" "));
   }
-  if (req.parking) {
-    qs.push("restaurant with parking");
-    qs.push("restaurant car park");
+
+  // 3. Add broader fallback queries in case the specific one yields no results
+  // Add a query for combined cuisines if more than one is selected
+  if (cuisines.length > 1) {
+    queries.add([...cuisines, "restaurant"].join(" "));
   }
-  if (req.vegetarian) {
-    qs.push("vegetarian restaurant");
+  // Add queries for each individual cuisine
+  for (const cuisine of cuisines) {
+    queries.add(`${cuisine} restaurant`);
   }
-  if (!qs.length) {
-    qs.push([...cuisines, "restaurant"].join(" ").trim() || "restaurant");
-  } else if (cuisines.length) {
-    for (const c of cuisines) qs.push(`${c} restaurant`);
+
+  // Add a query for combined requirements if more than one is selected
+  if (requirementKeywords.length > 1) {
+    queries.add([...requirementKeywords, "restaurant"].join(" "));
   }
-  return qs;
+  // Add queries for each individual requirement
+  if (req.vegetarian) queries.add("vegetarian restaurant");
+  if (req.petFriendly) queries.add("pet friendly restaurant");
+  if (req.parking) queries.add("restaurant with parking");
+
+  // 4. Add a final generic fallback if no other queries were generated
+  if (queries.size === 0) {
+    queries.add("restaurant");
+  }
+
+  // 5. Prioritize the most specific query by placing it at the front of the array
+  const queryArray = Array.from(queries);
+  if (requirementKeywords.length > 0 || cuisines.length > 0) {
+      const mostSpecificQuery = [...cuisines, ...requirementKeywords, "restaurant"].join(" ");
+      const specificIndex = queryArray.indexOf(mostSpecificQuery);
+      if (specificIndex > 0) {
+        // Move the most specific query to the beginning of the array
+        const [specific] = queryArray.splice(specificIndex, 1);
+        queryArray.unshift(specific);
+      }
+  }
+
+  return queryArray;
 }
+
 
 async function discoverAndIngestAround(
   lat,

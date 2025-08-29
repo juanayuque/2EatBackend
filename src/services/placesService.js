@@ -1,9 +1,8 @@
-// src/services/placesService.js
 const { haversineKm, asFloat } = require("../utils/geo");
 
 const fetchFn =
   (typeof fetch === "function" && fetch) ||
-  ((...args) => import("node-fetch").then((m) => m.default(...args)));
+  ((...args) => import("node-fetch").then((mod) => mod.default(args)));
 
 function bboxFromCenter(lat, lng, radiusKm) {
   const dLat = radiusKm / 111;
@@ -81,6 +80,12 @@ function createPlacesService({ prisma, googleApiKey }) {
     return withDist.map((x) => x.r).slice(0, Math.max(minCount, 1));
   }
 
+  /**
+   * [FIXED] The original function overwrote Prisma 'where' conditions when multiple
+   * requirements were selected (e.g., vegetarian AND pet-friendly).
+   * This version constructs a single `AND` array, pushing all active requirement
+   * clauses into it, ensuring all filters are applied together.
+   */
   async function ensureNearbyRestaurantsStrict(lat, lng, minCount = 100, radiusKm = 15, req = {}) {
     const box = bboxFromCenter(lat, lng, radiusKm);
 
@@ -109,38 +114,31 @@ function createPlacesService({ prisma, googleApiKey }) {
     const where = {
       latitude: { gte: box.minLat, lte: box.maxLat },
       longitude: { gte: box.minLng, lte: box.maxLng },
-      ...(req?.vegetarian
-        ? {
-            AND: [
-              {
-                OR: [
-                  { servesVegetarianFood: true },
-                  { types: { has: "vegetarian_restaurant" } },
-                  ...vegTextOR,
-                ],
-              },
-            ],
-          }
-        : {}),
-      ...(req?.petFriendly
-        ? {
-            AND: [
-              {
-                OR: [{ allowsDogs: true }, ...petTextOR],
-              },
-            ],
-          }
-        : {}),
-      ...(req?.parking
-        ? {
-            AND: [
-              {
-                OR: [{ NOT: { parkingOptions: null } }, ...parkTextOR],
-              },
-            ],
-          }
-        : {}),
+      AND: [], // Initialize a single AND array
     };
+
+    if (req?.vegetarian) {
+      where.AND.push({
+        OR: [{ servesVegetarianFood: true }, { types: { has: "vegetarian_restaurant" } }, ...vegTextOR],
+      });
+    }
+
+    if (req?.petFriendly) {
+      where.AND.push({
+        OR: [{ allowsDogs: true }, ...petTextOR],
+      });
+    }
+
+    if (req?.parking) {
+      where.AND.push({
+        OR: [{ NOT: { parkingOptions: null } }, ...parkTextOR],
+      });
+    }
+
+    // If no requirements were added, remove the empty AND clause to avoid errors.
+    if (where.AND.length === 0) {
+      delete where.AND;
+    }
 
     const rows = await prisma.restaurant.findMany({
       where,
@@ -232,6 +230,9 @@ function createPlacesService({ prisma, googleApiKey }) {
     return created;
   }
 
+  // Common fields to request from Google Places API
+  const GOOGLE_FIELD_MASK = "places.id,places.displayName,places.location,places.formattedAddress,places.primaryType,places.primaryTypeDisplayName,places.types,places.rating,places.userRatingCount,places.priceLevel,places.editorialSummary,places.servesVegetarianFood,places.allowsDogs,places.parkingOptions,places.outdoorSeating,places.dineIn,places.delivery,places.takeout,places.curbsidePickup,places.websiteUri,places.internationalPhoneNumber";
+
   async function googlePlacesSearchNearby(
     lat,
     lng,
@@ -260,8 +261,7 @@ function createPlacesService({ prisma, googleApiKey }) {
         headers: {
           "Content-Type": "application/json",
           "X-Goog-Api-Key": googleApiKey,
-          "X-Goog-FieldMask":
-            "places.id,places.displayName,places.location,places.formattedAddress,places.primaryType,places.primaryTypeDisplayName,places.types,places.rating,places.userRatingCount,places.priceLevel,places.editorialSummary,places.parkingOptions",
+          "X-Goog-FieldMask": GOOGLE_FIELD_MASK,
         },
         body: JSON.stringify(body),
       });
@@ -302,8 +302,7 @@ function createPlacesService({ prisma, googleApiKey }) {
         headers: {
           "Content-Type": "application/json",
           "X-Goog-Api-Key": googleApiKey,
-          "X-Goog-FieldMask":
-            "places.id,places.displayName,places.location,places.formattedAddress,places.primaryType,places.primaryTypeDisplayName,places.types,places.rating,places.userRatingCount,places.priceLevel,places.editorialSummary,places.parkingOptions",
+          "X-Goog-FieldMask": GOOGLE_FIELD_MASK,
         },
         body: JSON.stringify(body),
       });
