@@ -1,5 +1,5 @@
 // routes/recs.js
-// DB-first nearby -> preference/requirement filter -> (rank) -> hydrate
+// DB-first nearby -> requirement/cuisine filter -> (rank) -> hydrate
 // Guarantees: if there are nearby restaurants, /next returns at least one item.
 // Uses Places v1 resource names "places/<id>" and a safe photo proxy.
 
@@ -10,15 +10,9 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 
-// Shared helpers from the Places service
-const {
-  ensureNearbyRestaurants,
-  normalizePriceLevel,
-  haversineKm,
-  asFloat,
-  distanceBand,
-  priceBandFromBudget,
-} = require("../src/services/placesService");
+// Import only what we need from the service; keep local helpers for stability.
+const placesSvc = require("../src/services/placesService");
+const ensureNearbyRestaurants = placesSvc.ensureNearbyRestaurants;
 
 const router = express.Router();
 
@@ -42,13 +36,34 @@ console.log("[recs] BOOT", {
   PHOTO_CACHE_DIR,
 });
 
-// ---------- preference + requirement helpers ----------
+/* ─────────────────────────── Local helpers ─────────────────────────── */
 
 const norm = (s) => String(s || "").toLowerCase().replace(/[_\s-]+/g, " ").trim();
 const lc = (s) => String(s || "").toLowerCase();
+const asFloat = (v) => parseFloat(String(v));
+function haversineKm(a, b) {
+  const toRad = (x) => (x * Math.PI) / 180;
+  const R = 6371;
+  const dLat = toRad(Number(b.lat) - Number(a.lat));
+  const dLon = toRad(Number(b.lng) - Number(a.lng));
+  const sLat1 = toRad(Number(a.lat));
+  const sLat2 = toRad(Number(b.lat));
+  const x =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(sLat1) * Math.cos(sLat2) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(x));
+}
+function distanceBand(km) { if (km <= 1) return "near"; if (km <= 5) return "mid"; return "far"; }
+function priceBandFromBudget(budgetMax) {
+  if (budgetMax == null) return 0;
+  if (budgetMax <= 15) return 1;
+  if (budgetMax <= 30) return 2;
+  if (budgetMax <= 60) return 3;
+  return 4;
+}
 
 // Map of cuisine → keywords to search in primaryType / types / primaryTypeDisplayName.
-// NOTE: "Fast Food" requirement from user: only look for the single keyword "fast".
+// NOTE: “Fast Food” per your requirement: just match the keyword "fast".
 const CUISINE_KEYWORDS = {
   indian: ["indian"],
   chinese: ["chinese", "szechuan", "sichuan", "cantonese", "hunan"],
@@ -104,7 +119,7 @@ function textIncludesAny(r, needles) {
   return needles.some((n) => fields.some((f) => f.includes(n)));
 }
 
-// Requirements come from user.dietaryNeeds (renamed to “Requirements” in UI):
+// Requirements come from user.dietaryNeeds (renamed “Requirements” in UI):
 // "Vegetarian", "Pet Friendly", "Parking"
 function requirementsFromUser(user) {
   const needs = new Set((user?.dietaryNeeds || []).map((x) => norm(x)));
@@ -134,7 +149,6 @@ function restaurantMeetsRequirements(r, req) {
   }
 
   if (req.parking) {
-    // Try structured field if present; otherwise text-y guess.
     const hasStructured =
       r.parkingOptions && typeof r.parkingOptions === "object"
         ? Object.values(r.parkingOptions).some(Boolean)
@@ -191,7 +205,7 @@ function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60,
   // 3) If still short, relax requirements to avoid empty pools
   if (merged.length < desiredMin && nonReqRows.length) {
     const nonReqCuisine = byCuisine(nonReqRows).filter((r) => !merged.includes(r));
-    merged.push(...(nonReqCuisine);
+    merged.push(...nonReqCuisine); // ← fixed parenthesis
     if (merged.length < desiredMin) {
       const nonReqNearest = byNearest(nonReqRows).filter((r) => !merged.includes(r));
       merged.push(...nonReqNearest);
@@ -204,7 +218,7 @@ function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60,
   return merged.slice(0, Math.max(desiredMin, 1));
 }
 
-// ---------- routes ----------
+/* ───────────────────────────── Routes ───────────────────────────── */
 
 // Resolve restaurant names (and a few fields) for a list of IDs (POST)
 router.post("/lookup", async (req, res) => {
