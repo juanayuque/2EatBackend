@@ -127,8 +127,7 @@ function textIncludesAny(r, needles) {
   return needles.some((n) => fields.some((f) => f.includes(n)));
 }
 
-// Requirements from UI’s “dietaryNeeds” (Requirements)
-// Expected values: "Vegetarian", "Pet Friendly", "Parking"
+// Requirements from UI’s “dietaryNeeds”
 function requirementsFromUser(user) {
   const needs = new Set((user?.dietaryNeeds || []).map((x) => norm(x)));
   return {
@@ -232,7 +231,7 @@ function generateRingCenters(lat, lng, minKm = 2, maxKm = 12, stepKm = 2) {
         lon1 +
         Math.atan2(
           Math.sin(bearing) * Math.sin(angDist) * Math.cos(lat1),
-          Math.cos(angdist) - Math.sin(lat1) * Math.sin(lat2)
+          Math.cos(angDist) - Math.sin(lat1) * Math.sin(lat2) // <-- FIX: angDist
         );
       centers.push({ lat: toDeg(lat2), lng: toDeg(lon2) });
     }
@@ -240,6 +239,10 @@ function generateRingCenters(lat, lng, minKm = 2, maxKm = 12, stepKm = 2) {
   return centers;
 }
 
+/**
+ * Discovery sweep around a point. If `biasKeywords` provided, add extra passes that use
+ * Google keyword/text biasing (via places service).
+ */
 async function discoverAndIngestAround(
   lat,
   lng,
@@ -249,11 +252,13 @@ async function discoverAndIngestAround(
     includeTypes = [["restaurant"]],
     maxCenters = 18,
     delayMs = 120,
+    biasKeywords = [], // 👈 NEW
   } = {}
 ) {
   const centers = generateRingCenters(lat, lng, 2, 12, 2).slice(0, maxCenters);
   const byId = new Map();
 
+  // (A) Standard nearby passes
   for (const c of centers) {
     for (const rankPreference of rankPrefs) {
       for (const types of includeTypes) {
@@ -271,11 +276,31 @@ async function discoverAndIngestAround(
     }
   }
 
+  // (B) Biased passes (text/keyword biasing) — only if we have requirement hints
+  for (const c of centers) {
+    for (const kw of biasKeywords) {
+      // Try text-bias search via the service (falls back to keyword if supported).
+      const chunk = await places.googlePlacesSearchNearby(c.lat, c.lng, {
+        radiusMeters: cellRadiusMeters,
+        maxPages: 2,
+        rankPreference: "POPULARITY",
+        includedTypes: ["restaurant"],
+        keyword: kw, // 👈 NEW (service will route to text search if needed)
+      });
+      for (const p of chunk || []) {
+        if (p?.id && !byId.has(p.id)) byId.set(p.id, p);
+      }
+      if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+
   const discovered = Array.from(byId.values());
   if (!discovered.length) return { discovered: 0 };
 
   const created = await places.upsertPlacesBatch(discovered);
-  console.log(`[recs] discovery sweep: fetched=${discovered.length} new=${created}`);
+  console.log(
+    `[recs] discovery sweep: fetched=${discovered.length} (biased=${biasKeywords.length > 0}) new=${created}`
+  );
   return { discovered: discovered.length, created };
 }
 
@@ -285,6 +310,13 @@ async function discoverAndIngestAround(
  */
 async function ensurePreferredPool(lat, lng, user, desiredMin = 60) {
   const radiusKm = radiusFromUser(user);
+  const req = requirementsFromUser(user);
+
+  // Bias keywords derived from requirements
+  const biasKeywords = [];
+  if (req.vegetarian) biasKeywords.push("vegetarian", "vegan");
+  if (req.petFriendly) biasKeywords.push("dog friendly", "pet friendly");
+  if (req.parking) biasKeywords.push("parking");
 
   // Step 1: DB-first pool near the user
   const dbPool = await places.ensureNearbyRestaurants(
@@ -293,11 +325,12 @@ async function ensurePreferredPool(lat, lng, user, desiredMin = 60) {
   let filtered = filterAndPrioritizeByPreferences(dbPool, user, lat, lng, desiredMin, radiusKm);
   if (filtered.length >= desiredMin) return filtered;
 
-  // Step 2: Discover more around the area (restaurant-only)
+  // Step 2: Discover more around the area (restaurant-only), with bias if applicable
   await discoverAndIngestAround(lat, lng, {
     cellRadiusMeters: Math.round(radiusKm * 1000) || 3000,
     rankPrefs: ["POPULARITY", "DISTANCE"],
     includeTypes: [["restaurant"]],
+    biasKeywords, // 👈 NEW
   });
 
   // Step 3: Refresh and filter again (still STRICT)
@@ -624,7 +657,7 @@ router.post("/next", async (req, res) => {
   }
 });
 
-// Feedback / finalize / winner
+// Feedback / finalize / winner (unchanged below)
 router.post("/feedback", async (req, res) => {
   try {
     const uid = req.user.uid;

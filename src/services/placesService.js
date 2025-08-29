@@ -1,342 +1,270 @@
 // src/services/placesService.js
-// Service responsible for Places discovery/ingest and nearby pool maintenance.
-// Uses global fetch (Node 18+) or dynamically imports node-fetch in CJS.
+// Service focused on Google Places ingest and local DB helpers.
+// I keep HTTP calls, normalization, and DB upserts here so routes stay thin.
 
-const { normalizePriceLevel } = require("../utils/price");
-const { haversineKm, asFloat } = require("../utils/geo");
-
-// Use global fetch if present; otherwise dynamically import node-fetch (ESM) from CJS.
 const fetchFn =
   (typeof fetch === "function" && fetch) ||
-  ((...args) => import("node-fetch").then((mod) => mod.default(...args)));
-
-// Backfill throttle
-let _lastBackfillAt = 0;
-const BACKFILL_MIN_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
-
-const PLACES_FIELD_MASK = [
-  "places.id",
-  "places.displayName",
-  "places.primaryType",
-  "places.primaryTypeDisplayName",
-  "places.types",
-  "places.nationalPhoneNumber",
-  "places.websiteUri",
-  "places.formattedAddress",
-  "places.location",
-  "places.priceLevel",
-  "places.rating",
-  "places.userRatingCount",
-  "places.editorialSummary",
-  "places.photos.widthPx",
-  "places.photos.heightPx",
-  "places.photos.name",
-].join(",");
-
-const toPlaceName = (idOrName) =>
-  String(idOrName).startsWith("places/") ? String(idOrName) : `places/${idOrName}`;
-
-function mapPlaceToRestaurantCreate(place) {
-  const loc = place.location || {};
-  const displayName = place.displayName?.text || place.displayName || place.name || "Unknown";
-  const priceLevel = normalizePriceLevel(place.priceLevel);
-  const ptdnRaw = place.primaryTypeDisplayName;
-  const ptdn =
-    typeof ptdnRaw === "string" ? ptdnRaw : ptdnRaw && ptdnRaw.text ? ptdnRaw.text : null;
-
-  return {
-    restaurant: {
-      googlePlaceId: place.id,
-      name: displayName,
-      latitude: String(loc.latitude ?? 0),
-      longitude: String(loc.longitude ?? 0),
-      formattedAddress: place.formattedAddress || null,
-      internationalPhoneNumber: place.nationalPhoneNumber || null,
-      websiteUri: place.websiteUri || null,
-      primaryTypeDisplayName: ptdn,
-      primaryType: place.primaryType || null,
-      types: Array.isArray(place.types) ? place.types : [],
-      rating: place.rating != null ? String(place.rating) : null,
-      userRatingCount: place.userRatingCount ?? null,
-      editorialSummary: place.editorialSummary?.text || null,
-      priceLevel,
-      // Flags default; real enrichment elsewhere
-      servesVegetarian: false, // DB: serves_vegetarian
-      takeout: false,
-      dineIn: false,
-      curbsidePickup: false,
-      delivery: false,
-      outdoorSeating: false,
-      allowsDogs: false, // DB: allows_dogs
-      parkingOptions: null,
-      regularOpeningHours: null,
-    },
-    photo: place.photos?.[0]
-      ? {
-          name: place.photos[0].name,
-          widthPx: place.photos[0].widthPx || null,
-          heightPx: place.photos[0].heightPx || null,
-        }
-      : null,
-  };
-}
+  ((...args) => import("node-fetch").then((m) => m.default(...args)));
 
 function createPlacesService({ prisma, googleApiKey }) {
-  const hasKey = !!googleApiKey;
+  if (!googleApiKey) {
+    console.warn("[placesService] GOOGLE_API_KEY is missing; discovery calls will fail.");
+  }
 
+  // v1 Places field mask — only what I actually use anywhere downstream.
+  const FIELD_MASK = [
+    "places.id",
+    "places.name",
+    "places.displayName",
+    "places.primaryType",
+    "places.primaryTypeDisplayName",
+    "places.types",
+    "places.location",
+    "places.formattedAddress",
+    "places.priceLevel",
+    "places.editorialSummary",
+  ].join(",");
+
+  // v1 payloads sometimes put ID inside resource name (places/XYZ) — keep a safe fallback.
+  function idFromResourceName(name) {
+    if (!name || typeof name !== "string") return null;
+    const parts = name.split("/");
+    return parts.length >= 2 ? parts[1] : null;
+  }
+
+  // Haversine just for local sorting. I keep it here so service is self-contained.
+  function haversineKm(a, b) {
+    const R = 6371;
+    const dLat = ((b.lat - a.lat) * Math.PI) / 180;
+    const dLng = ((b.lng - a.lng) * Math.PI) / 180;
+    const sa =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos((a.lat * Math.PI) / 180) *
+        Math.cos((b.lat * Math.PI) / 180) *
+        Math.sin(dLng / 2) * Math.sin(dLng / 2);
+    const c = 2 * Math.atan2(Math.sqrt(sa), Math.sqrt(1 - sa));
+    return R * c;
+  }
+
+  // Make sure I always return the fields routes expect.
+  function normalizePlaceV1(p) {
+    const loc = p.location || {};
+    const id = p.id || idFromResourceName(p.name);
+
+    return {
+      id: id || null,
+      name: p.displayName?.text || p.displayName || p.name || null,
+      latitude: typeof loc.latitude === "number" ? loc.latitude : null,
+      longitude: typeof loc.longitude === "number" ? loc.longitude : null,
+      primaryType: p.primaryType || null,
+      primaryTypeDisplayName:
+        p.primaryTypeDisplayName?.text ||
+        p.primaryTypeDisplayName ||
+        null,
+      types: Array.isArray(p.types) ? p.types : [],
+      formattedAddress: p.formattedAddress || null,
+      editorialSummary: p.editorialSummary?.text || null,
+      priceLevel: typeof p.priceLevel === "number" ? p.priceLevel : null,
+      // These booleans rarely come from Places; leave null so downstream can infer from text if needed.
+      servesVegetarianFood: null,
+      allowsDogs: null,
+    };
+  }
+
+  // Nearby search. When keyword is present, I purposely route to Text Search for better signal.
   async function googlePlacesSearchNearby(
     lat,
     lng,
     {
-      radiusMeters = 8000,
-      maxPages = 3,
+      radiusMeters = 3000,
+      maxPages = 1,
       rankPreference = "POPULARITY",
       includedTypes = ["restaurant"],
+      keyword = null, // if present, I use text search instead
     } = {}
   ) {
-    if (!hasKey) return [];
-    const results = [];
-    let pageToken;
+    if (!googleApiKey) return [];
 
-    for (let i = 0; i < maxPages; i++) {
-      const body = {
-        includedTypes,
-        maxResultCount: 20,
-        rankPreference,
-        locationRestriction: {
-          circle: { center: { latitude: lat, longitude: lng }, radius: radiusMeters },
-        },
-        pageToken,
-      };
-
-      const r = await fetchFn("https://places.googleapis.com/v1/places:searchNearby", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Goog-Api-Key": googleApiKey,
-          "X-Goog-FieldMask": PLACES_FIELD_MASK,
-        },
-        body: JSON.stringify(body),
+    if (keyword && String(keyword).trim().length) {
+      const typeStr = Array.isArray(includedTypes)
+        ? includedTypes[0] || "restaurant"
+        : includedTypes || "restaurant";
+      return await googlePlacesSearchText(lat, lng, {
+        textQuery: `${keyword} ${typeStr}`,
+        radiusMeters,
+        maxPages,
       });
-
-      if (!r.ok) {
-        const e = await r.text().catch(() => "");
-        console.error("[placesService] searchNearby err", r.status, e.slice(0, 300));
-        break;
-      }
-      const json = await r.json();
-      results.push(...(json.places || []));
-      pageToken = json.nextPageToken;
-      if (!pageToken) break;
     }
-    return results;
-  }
 
-  // NEW: Text Search with location bias (for requirements-focused queries)
-  async function googlePlacesSearchText(
-    textQuery,
-    {
-      latitude,
-      longitude,
-      radiusMeters = 6000,
-      maxResults = 20,
-    } = {}
-  ) {
-    if (!hasKey || !textQuery) return [];
+    const url = "https://places.googleapis.com/v1/places:searchNearby";
     const body = {
-      textQuery: String(textQuery),
-      maxResultCount: Math.max(1, Math.min(20, maxResults)),
-      locationBias: {
+      includedTypes: Array.isArray(includedTypes)
+        ? includedTypes
+        : [includedTypes || "restaurant"],
+      maxResultCount: 20, // v1 Nearby caps at 20; no reliable page token in this simplified path
+      rankPreference,
+      locationRestriction: {
         circle: {
-          center: { latitude, longitude },
-          radius: Math.max(500, Math.min(20000, radiusMeters)),
+          center: { latitude: lat, longitude: lng },
+          radius: radiusMeters,
         },
       },
     };
 
-    const r = await fetchFn("https://places.googleapis.com/v1/places:searchText", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": googleApiKey,
-        "X-Goog-FieldMask": PLACES_FIELD_MASK,
-      },
-      body: JSON.stringify(body),
-    });
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": googleApiKey,
+      "X-Goog-FieldMask": FIELD_MASK,
+    };
 
-    if (!r.ok) {
-      const e = await r.text().catch(() => "");
-      console.error("[placesService] searchText err", r.status, e.slice(0, 300));
-      return [];
+    const all = [];
+    for (let page = 0; page < Math.max(1, maxPages); page++) {
+      const r = await fetchFn(url, { method: "POST", headers, body: JSON.stringify(body) });
+      if (!r.ok) break;
+      const j = await r.json();
+      const chunk = (j.places || []).map(normalizePlaceV1);
+      all.push(...chunk);
+      // No stable pagination here in my minimal usage — bail after first page.
+      break;
     }
-
-    const json = await r.json();
-    return json.places || [];
+    return all.filter((x) => x.id && x.latitude != null && x.longitude != null);
   }
 
-  async function upsertPlacesBatch(placesArr) {
-    const ids = placesArr.map((p) => p.id).filter(Boolean);
-    if (ids.length === 0) return 0;
+  // Text search with location bias. This is what I use to bias vegetarian/dog-friendly/parking discovery.
+  async function googlePlacesSearchText(
+    lat,
+    lng,
+    {
+      textQuery,
+      radiusMeters = 3000,
+      maxPages = 1,
+    } = {}
+  ) {
+    if (!googleApiKey || !textQuery) return [];
 
-    const existing = await prisma.restaurant.findMany({
-      where: { googlePlaceId: { in: ids } },
-      select: { googlePlaceId: true },
-    });
-    const existingSet = new Set(existing.map((x) => x.googlePlaceId));
+    const url = "https://places.googleapis.com/v1/places:searchText";
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": googleApiKey,
+      "X-Goog-FieldMask": FIELD_MASK,
+    };
+
+    const body = {
+      textQuery,
+      maxResultCount: 20,
+      locationBias: {
+        circle: { center: { latitude: lat, longitude: lng }, radius: radiusMeters },
+      },
+    };
+
+    const all = [];
+    for (let page = 0; page < Math.max(1, maxPages); page++) {
+      const r = await fetchFn(url, { method: "POST", headers, body: JSON.stringify(body) });
+      if (!r.ok) break;
+      const j = await r.json();
+      const chunk = (j.places || []).map(normalizePlaceV1);
+      all.push(...chunk);
+      // Similar to nearby, I’m not walking nextPage tokens in this slim flow.
+      break;
+    }
+    return all.filter((x) => x.id && x.latitude != null && x.longitude != null);
+  }
+
+  // Batch upsert to the restaurants table. I avoid throwing on duplicates.
+  async function upsertPlacesBatch(placesArr) {
+    if (!Array.isArray(placesArr) || placesArr.length === 0) return 0;
     let created = 0;
 
     for (const p of placesArr) {
-      if (!p?.id || existingSet.has(p.id)) continue;
-      const mapped = mapPlaceToRestaurantCreate(p);
-
-      const r = await prisma.restaurant.upsert({
-        where: { googlePlaceId: mapped.restaurant.googlePlaceId },
-        create: mapped.restaurant,
-        update: {
-          name: mapped.restaurant.name,
-          formattedAddress: mapped.restaurant.formattedAddress,
-          websiteUri: mapped.restaurant.websiteUri,
-          primaryTypeDisplayName: mapped.restaurant.primaryTypeDisplayName,
-          primaryType: mapped.restaurant.primaryType,
-          types: mapped.restaurant.types,
-          rating: mapped.restaurant.rating,
-          userRatingCount: mapped.restaurant.userRatingCount,
-          priceLevel: mapped.restaurant.priceLevel,
-          editorialSummary: mapped.restaurant.editorialSummary,
-        },
-      });
-      created++;
-
-      if (mapped.photo) {
-        const exists = await prisma.photo.findFirst({
-          where: { restaurantId: r.id, name: mapped.photo.name },
-          select: { id: true },
+      if (!p?.id) continue;
+      try {
+        await prisma.restaurant.upsert({
+          where: { id: p.id },
+          update: {
+            name: p.name ?? undefined,
+            latitude: p.latitude ?? undefined,
+            longitude: p.longitude ?? undefined,
+            primaryType: p.primaryType ?? undefined,
+            primaryTypeDisplayName: p.primaryTypeDisplayName ?? undefined,
+            types: Array.isArray(p.types) ? p.types : undefined,
+            formattedAddress: p.formattedAddress ?? undefined,
+            editorialSummary: p.editorialSummary ?? undefined,
+            priceLevel: typeof p.priceLevel === "number" ? p.priceLevel : undefined,
+          },
+          create: {
+            id: p.id,
+            name: p.name || "",
+            latitude: p.latitude,
+            longitude: p.longitude,
+            primaryType: p.primaryType || null,
+            primaryTypeDisplayName: p.primaryTypeDisplayName || null,
+            types: Array.isArray(p.types) ? p.types : [],
+            formattedAddress: p.formattedAddress || null,
+            editorialSummary: p.editorialSummary || null,
+            priceLevel: typeof p.priceLevel === "number" ? p.priceLevel : null,
+          },
         });
-        if (!exists) {
-          await prisma.photo.create({
-            data: {
-              restaurantId: r.id,
-              name: mapped.photo.name,
-              widthPx: mapped.photo.widthPx,
-              heightPx: mapped.photo.heightPx,
-            },
-          });
-        }
+        created++;
+      } catch {
+        // ignore constraint violations — I only need the record present/up-to-date
       }
     }
-    console.log(`[placesService] upsert new=${created} skipped=${ids.length - created}`);
+
     return created;
   }
 
-  async function backfillMissingPlaceMetadata(restaurants) {
-    if (!hasKey) return;
-    const missing = restaurants.filter(
-      (r) => !r.primaryType || !r.types || r.types.length === 0 || r.priceLevel == null
-    );
-    if (!missing.length) return;
-
-    console.log(`[placesService] backfill metadata for ${missing.length} restaurants…`);
-    for (const r of missing.slice(0, 50)) {
-      try {
-        const name = toPlaceName(r.googlePlaceId);
-        const url = `https://places.googleapis.com/v1/${name}?fields=${encodeURIComponent(
-          "id,primaryType,primaryTypeDisplayName,types,priceLevel"
-        )}`;
-        const res = await fetchFn(url, { headers: { "X-Goog-Api-Key": googleApiKey } });
-        if (!res.ok) continue;
-        const d = await res.json();
-        const ptdnRaw = d.primaryTypeDisplayName;
-        const ptdn =
-          typeof ptdnRaw === "string"
-            ? ptdnRaw
-            : ptdnRaw && ptdnRaw.text
-            ? ptdnRaw.text
-            : r.primaryTypeDisplayName || null;
-
-        await prisma.restaurant.update({
-          where: { id: r.id },
-          data: {
-            primaryType: d.primaryType || r.primaryType || null,
-            primaryTypeDisplayName: ptdn,
-            types: Array.isArray(d.types) ? d.types : r.types || [],
-            priceLevel: normalizePriceLevel(d.priceLevel ?? r.priceLevel ?? null),
-          },
-        });
-      } catch {}
-    }
-  }
-
+  // Pull a local pool near (lat,lng). I bound by a box in SQL and sort by Haversine in memory.
   async function ensureNearbyRestaurants(lat, lng, minCount = 100, radiusKm = 15) {
-    const here = { lat, lng };
+    const R = Math.max(0.5, Number(radiusKm) || 15);
+    const latDeg = R / 110.574; // ~km per degree latitude
+    const lngDeg = R / (111.320 * Math.cos((lat * Math.PI) / 180) || 1); // protect against NaN at poles
 
-    const all = await prisma.restaurant.findMany({
-      take: 2000,
-      include: { photos: { take: 1 } },
+    const minLat = lat - latDeg;
+    const maxLat = lat + latDeg;
+    const minLng = lng - lngDeg;
+    const maxLng = lng + lngDeg;
+
+    // I grab more than needed; then I sort by true distance and trim.
+    const rows = await prisma.restaurant.findMany({
+      where: {
+        latitude: { gte: minLat, lte: maxLat },
+        longitude: { gte: minLng, lte: maxLng },
+      },
+      take: Math.max(minCount * 3, 300),
+      select: {
+        id: true,
+        name: true,
+        latitude: true,
+        longitude: true,
+        primaryType: true,
+        primaryTypeDisplayName: true,
+        types: true,
+        formattedAddress: true,
+        editorialSummary: true,
+        priceLevel: true,
+        servesVegetarianFood: true,
+        allowsDogs: true,
+        parkingOptions: true,
+      },
     });
 
-    let nearby = all
+    const here = { lat, lng };
+    const withDist = rows
+      .filter((r) => typeof r.latitude === "number" && typeof r.longitude === "number")
       .map((r) => ({
-        r,
-        d: haversineKm(here, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }),
-      }))
-      .filter((x) => Number.isFinite(x.d) && x.d <= radiusKm)
-      .sort((a, b) => a.d - b.d)
-      .map((x) => x.r);
+        ...r,
+        _distKm: haversineKm(here, { lat: r.latitude, lng: r.longitude }),
+      }));
+    withDist.sort((a, b) => a._distKm - b._distKm);
 
-    if (nearby.length < minCount && hasKey) {
-      console.log(`[placesService] nearby=${nearby.length} < ${minCount} → ingesting Places…`);
-
-      const radiusMeters = Math.max(2000, Math.min(20000, Math.round(radiusKm * 1000 * 1.2)));
-
-      const popular = await googlePlacesSearchNearby(lat, lng, {
-        radiusMeters,
-        maxPages: 3,
-        rankPreference: "POPULARITY",
-      });
-      const distance = await googlePlacesSearchNearby(lat, lng, {
-        radiusMeters,
-        maxPages: 3,
-        rankPreference: "DISTANCE",
-      });
-      const uniq = new Map();
-      for (const p of [...popular, ...distance]) if (p?.id && !uniq.has(p.id)) uniq.set(p.id, p);
-      const list = Array.from(uniq.values());
-
-      console.log(`[placesService] ingested places (unique): ${list.length}`);
-      if (list.length) {
-        await upsertPlacesBatch(list);
-        const refreshed = await prisma.restaurant.findMany({
-          take: 2000,
-          include: { photos: { take: 1 } },
-        });
-        nearby = refreshed
-          .map((r) => ({
-            r,
-            d: haversineKm(here, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }),
-          }))
-          .filter((x) => Number.isFinite(x.d) && x.d <= radiusKm)
-          .sort((a, b) => a.d - b.d)
-          .map((x) => x.r);
-      }
-    }
-
-    const now = Date.now();
-    if (now - _lastBackfillAt >= BACKFILL_MIN_INTERVAL_MS) {
-      _lastBackfillAt = now;
-      backfillMissingPlaceMetadata(nearby).catch(() => {});
-    }
-
-    console.log(`[placesService] ensureNearby: ${nearby.length} within ${radiusKm}km`);
-    return nearby;
+    return withDist.slice(0, Math.max(1, minCount));
   }
 
   return {
-    ensureNearbyRestaurants,
     googlePlacesSearchNearby,
-    googlePlacesSearchText, // 👈 NEW export
+    googlePlacesSearchText,
     upsertPlacesBatch,
-    backfillMissingPlaceMetadata,
-    mapPlaceToRestaurantCreate,
+    ensureNearbyRestaurants,
   };
 }
 
