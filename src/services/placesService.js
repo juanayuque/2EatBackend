@@ -1,7 +1,14 @@
-// Explains *why*: service is a pure module with injected deps → easy to mock in tests and call from CLI jobs.
-const fetch = require("node-fetch");
+// src/services/placesService.js
+// Service responsible for Places discovery/ingest and nearby pool maintenance.
+// Uses global fetch (Node 18+) or dynamically imports node-fetch in CJS.
+
 const { normalizePriceLevel } = require("../utils/price");
 const { haversineKm, asFloat } = require("../utils/geo");
+
+// Use global fetch if present; otherwise dynamically import node-fetch (ESM) from CJS.
+const fetchFn =
+  (typeof fetch === "function" && fetch) ||
+  ( (...args) => import("node-fetch").then(mod => mod.default(...args)) );
 
 const PLACES_FIELD_MASK = [
   "places.id",
@@ -30,7 +37,12 @@ function mapPlaceToRestaurantCreate(place) {
   const displayName = place.displayName?.text || place.displayName || place.name || "Unknown";
   const priceLevel = normalizePriceLevel(place.priceLevel);
   const ptdnRaw = place.primaryTypeDisplayName;
-  const ptdn = typeof ptdnRaw === "string" ? ptdnRaw : (ptdnRaw && ptdnRaw.text) ? ptdnRaw.text : null;
+  const ptdn =
+    typeof ptdnRaw === "string"
+      ? ptdnRaw
+      : (ptdnRaw && ptdnRaw.text)
+      ? ptdnRaw.text
+      : null;
 
   return {
     restaurant: {
@@ -48,7 +60,7 @@ function mapPlaceToRestaurantCreate(place) {
       userRatingCount: place.userRatingCount ?? null,
       editorialSummary: place.editorialSummary?.text || null,
       priceLevel,
-      // Defaults remain explicit for future enrichment
+      // Defaults reserved for future enrichment flags
       servesVegetarianFood: false,
       takeout: false,
       dineIn: false,
@@ -70,22 +82,34 @@ function mapPlaceToRestaurantCreate(place) {
 }
 
 function createPlacesService({ prisma, googleApiKey }) {
-  // Explains *why*: avoid making calls if API key is missing; callers can branch on empty returns.
   const hasKey = !!googleApiKey;
 
-  async function googlePlacesSearchNearby(lat, lng, { radiusMeters = 8000, maxPages = 3, rankPreference = "POPULARITY", includedTypes = ["restaurant"] } = {}) {
+  async function googlePlacesSearchNearby(
+    lat,
+    lng,
+    {
+      radiusMeters = 8000,
+      maxPages = 3,
+      rankPreference = "POPULARITY",
+      includedTypes = ["restaurant"],
+    } = {}
+  ) {
     if (!hasKey) return [];
     const results = [];
     let pageToken;
+
     for (let i = 0; i < maxPages; i++) {
       const body = {
         includedTypes,
         maxResultCount: 20,
         rankPreference,
-        locationRestriction: { circle: { center: { latitude: lat, longitude: lng }, radius: radiusMeters } },
+        locationRestriction: {
+          circle: { center: { latitude: lat, longitude: lng }, radius: radiusMeters },
+        },
         pageToken,
       };
-      const r = await fetch("https://places.googleapis.com/v1/places:searchNearby", {
+
+      const r = await fetchFn("https://places.googleapis.com/v1/places:searchNearby", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -94,6 +118,7 @@ function createPlacesService({ prisma, googleApiKey }) {
         },
         body: JSON.stringify(body),
       });
+
       if (!r.ok) {
         const e = await r.text().catch(() => "");
         console.error("[placesService] searchNearby err", r.status, e.slice(0, 300));
@@ -108,13 +133,15 @@ function createPlacesService({ prisma, googleApiKey }) {
   }
 
   async function upsertPlacesBatch(places) {
-    // Explains *why*: pre-dedup minimizes DB churn and keeps logs meaningful.
-    const ids = places.map(p => p.id).filter(Boolean);
+    // Pre-dedupe by ID to limit DB churn
+    const ids = places.map((p) => p.id).filter(Boolean);
+    if (ids.length === 0) return 0;
+
     const existing = await prisma.restaurant.findMany({
       where: { googlePlaceId: { in: ids } },
       select: { googlePlaceId: true },
     });
-    const existingSet = new Set(existing.map(x => x.googlePlaceId));
+    const existingSet = new Set(existing.map((x) => x.googlePlaceId));
     let created = 0;
 
     for (const p of places) {
@@ -174,11 +201,16 @@ function createPlacesService({ prisma, googleApiKey }) {
         const url = `https://places.googleapis.com/v1/${name}?fields=${encodeURIComponent(
           "id,primaryType,primaryTypeDisplayName,types,priceLevel"
         )}`;
-        const res = await fetch(url, { headers: { "X-Goog-Api-Key": googleApiKey } });
+        const res = await fetchFn(url, { headers: { "X-Goog-Api-Key": googleApiKey } });
         if (!res.ok) continue;
         const d = await res.json();
         const ptdnRaw = d.primaryTypeDisplayName;
-        const ptdn = typeof ptdnRaw === "string" ? ptdnRaw : (ptdnRaw && ptdnRaw.text) ? ptdnRaw.text : r.primaryTypeDisplayName || null;
+        const ptdn =
+          typeof ptdnRaw === "string"
+            ? ptdnRaw
+            : (ptdnRaw && ptdnRaw.text)
+            ? ptdnRaw.text
+            : r.primaryTypeDisplayName || null;
 
         await prisma.restaurant.update({
           where: { id: r.id },
@@ -214,9 +246,16 @@ function createPlacesService({ prisma, googleApiKey }) {
 
     if (nearby.length < minCount && hasKey) {
       console.log(`[placesService] nearby=${nearby.length} < ${minCount} → ingesting Places…`);
-      // Explains *why*: rank diversification tends to surface long-tail venues.
-      const popular = await googlePlacesSearchNearby(lat, lng, { radiusMeters: 10000, maxPages: 3, rankPreference: "POPULARITY" });
-      const distance = await googlePlacesSearchNearby(lat, lng, { radiusMeters: 10000, maxPages: 3, rankPreference: "DISTANCE" });
+      const popular = await googlePlacesSearchNearby(lat, lng, {
+        radiusMeters: 10000,
+        maxPages: 3,
+        rankPreference: "POPULARITY",
+      });
+      const distance = await googlePlacesSearchNearby(lat, lng, {
+        radiusMeters: 10000,
+        maxPages: 3,
+        rankPreference: "DISTANCE",
+      });
       const uniq = new Map();
       for (const p of [...popular, ...distance]) if (p?.id && !uniq.has(p.id)) uniq.set(p.id, p);
       const places = Array.from(uniq.values());
@@ -239,7 +278,6 @@ function createPlacesService({ prisma, googleApiKey }) {
       }
     }
 
-    // Fire-and-forget backfill to enrich legacy rows.
     backfillMissingPlaceMetadata(nearby).catch(() => {});
     console.log(`[placesService] ensureNearby: ${nearby.length} within 15km`);
     return nearby;
@@ -247,7 +285,7 @@ function createPlacesService({ prisma, googleApiKey }) {
 
   return {
     ensureNearbyRestaurants,
-    googlePlacesSearchNearby, // exported for optional batch jobs
+    googlePlacesSearchNearby, // exposed for discovery sweeps
     upsertPlacesBatch,
     backfillMissingPlaceMetadata,
     mapPlaceToRestaurantCreate,
