@@ -1,15 +1,15 @@
 // routes/recs.js
-// DB-first nearby -> preference filter -> (rank) -> hydrate
-// Guarantees: if there are nearby restaurants, /next returns at least one item.
-// Uses Places v1 resource names "places/<id>" and a safe photo proxy.
+// Router focused on HTTP orchestration. Business logic for Places ingest/backfill
+// lives in services/placesService. Geo/price helpers live in utils so multiple modules share them.
 
 const express = require("express");
 const prisma = require("../src/prisma");
 const verifyFirebaseToken = require("../middleware/auth");
-const axios = require("axios");
-const fs = require("fs");
-const fsp = fs.promises;
-const path = require("path");
+
+const photoProxyRouter = require("./photoProxy"); // isolates photo/media concerns
+const { createPlacesService } = require("../src/services/placesService");
+const { haversineKm, distanceBand, asFloat } = require("../src/utils/geo");
+const { normalizePriceLevel, mapPriceLevelEnum } = require("../src/utils/price");
 
 const router = express.Router();
 
@@ -18,397 +18,32 @@ const router = express.Router();
 router.get("/__ping", (_req, res) => res.json({ ok: true, via: "recs", ts: Date.now() }));
 router.get("/health", (_req, res) => res.json({ ok: true }));
 
+// Configuration pulled once at boot to avoid re-reading env on every request.
 const RECS_SERVICE_URL =
   process.env.RECS_SERVICE_URL || process.env.RECS_URL || "http://127.0.0.1:8000";
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL || "https://2eatapp.com";
 
-const PHOTO_CACHE_DIR =
-  process.env.PHOTO_CACHE_DIR || path.join(process.cwd(), ".photo-cache");
-
 console.log("[recs] BOOT", {
   HAS_GOOGLE_API_KEY: !!GOOGLE_API_KEY,
   RECS_SERVICE_URL,
   BACKEND_PUBLIC_URL,
-  PHOTO_CACHE_DIR,
 });
 
-// ---------- helpers ----------
-// Google Places v1 -> our DB int (1..4)
-function mapPriceLevelEnum(v) {
-  if (v == null) return null;
-  if (typeof v === "number") return v; // in case we already normalized
-  switch (String(v)) {
-    case "PRICE_LEVEL_INEXPENSIVE": return 1;
-    case "PRICE_LEVEL_MODERATE":    return 2;
-    case "PRICE_LEVEL_EXPENSIVE":   return 3;
-    case "PRICE_LEVEL_VERY_EXPENSIVE": return 4;
-    default: return null;
-  }
+// Initializes the Places service with its dependencies. This allows swapping/mocking in tests.
+const places = createPlacesService({ prisma, googleApiKey: GOOGLE_API_KEY });
+
+// Mounts the photo proxy as part of this router so the client can call /api/recs/photo
+router.use(photoProxyRouter);
+
+// ---------- helpers kept local to this router ----------
+
+// Google Places v1 -> our DB int (1..4). Kept for legacy imports relying on this file.
+function mapPriceLevelEnumLocal(v) {
+  return mapPriceLevelEnum(v);
 }
 
-function haversineKm(a, b) {
-  const toRad = (x) => (x * Math.PI) / 180;
-  const R = 6371;
-  const dLat = toRad(Number(b.lat) - Number(a.lat));
-  const dLon = toRad(Number(b.lng) - Number(a.lng));
-  const sLat1 = toRad(Number(a.lat));
-  const sLat2 = toRad(Number(b.lat));
-  const x =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(sLat1) * Math.cos(sLat2) * Math.sin(dLon / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(x));
-}
-function distanceBand(km) { if (km <= 1) return "near"; if (km <= 5) return "mid"; return "far"; }
-function priceBandFromBudget(budgetMax) {
-  if (budgetMax == null) return 0;
-  if (budgetMax <= 15) return 1;
-  if (budgetMax <= 30) return 2;
-  if (budgetMax <= 60) return 3;
-  return 4;
-}
-const asFloat = (v) => parseFloat(String(v));
-
-/** Map Google v1 price enum -> int (or null). Prisma expects Int or Null. */
-function normalizePriceLevel(v) {
-  if (v == null) return null;
-  if (typeof v === "number") return v;
-  if (typeof v === "string") {
-    const s = v.toUpperCase();
-    switch (s) {
-      case "PRICE_LEVEL_INEXPENSIVE": return 1;
-      case "PRICE_LEVEL_MODERATE": return 2;
-      case "PRICE_LEVEL_EXPENSIVE": return 3;
-      case "PRICE_LEVEL_VERY_EXPENSIVE": return 4;
-      case "PRICE_LEVEL_UNSPECIFIED": return null;
-      default: {
-        // Some providers return just "INEXPENSIVE"/"MODERATE"/...; handle loosely.
-        if (s.includes("VERY") && s.includes("EXPENSIVE")) return 4;
-        if (s.includes("EXPENSIVE")) return 3;
-        if (s.includes("MODERATE")) return 2;
-        if (s.includes("INEXPENSIVE") || s.includes("CHEAP")) return 1;
-        const num = s.match(/\d+/);
-        return num ? Number(num[0]) : null;
-      }
-    }
-  }
-  return null;
-}
-
-// ---------- Places ingest / backfill ----------
-const PLACES_FIELD_MASK = [
-  "places.id",
-  "places.displayName",
-  "places.primaryType",
-  "places.primaryTypeDisplayName",
-  "places.types",
-  "places.nationalPhoneNumber",
-  "places.websiteUri",
-  "places.formattedAddress",
-  "places.location",
-  "places.priceLevel",
-  "places.rating",
-  "places.userRatingCount",
-  "places.editorialSummary",
-  "places.photos.widthPx",
-  "places.photos.heightPx",
-  "places.photos.name",
-].join(",");
-
-const toPlaceName = (idOrName) =>
-  String(idOrName).startsWith("places/") ? String(idOrName) : `places/${idOrName}`;
-
-// Nearby search around (lat,lng). Uses v1 "locationRestriction".
-async function googlePlacesSearchNearby(lat, lng, radiusMeters = 8000, maxPages = 3) {
-  if (!GOOGLE_API_KEY) return [];
-  const results = [];
-  let pageToken;
-  for (let i = 0; i < maxPages; i++) {
-    const body = {
-      includedTypes: ["restaurant"],
-      maxResultCount: 20,
-      locationRestriction: {
-        circle: {
-          center: { latitude: lat, longitude: lng },
-          radius: radiusMeters,
-        },
-      },
-      pageToken,
-    };
-    const r = await fetch("https://places.googleapis.com/v1/places:searchNearby", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": GOOGLE_API_KEY,
-        "X-Goog-FieldMask": PLACES_FIELD_MASK,
-      },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) {
-      try {
-        const e = await r.text();
-        console.error("[recs] searchNearby upstream err", r.status, e.slice(0, 300));
-      } catch {}
-      break;
-    }
-    const json = await r.json();
-    const places = json.places || [];
-    results.push(...places);
-    pageToken = json.nextPageToken;
-    if (!pageToken) break;
-  }
-  return results;
-}
-
-function mapPlaceToRestaurantCreate(place) {
-  const loc = place.location || {};
-  const displayName = place.displayName?.text || place.displayName || place.name || "Unknown";
-  const ptdnRaw = place.primaryTypeDisplayName;
-  const ptdn = typeof ptdnRaw === "string" ? ptdnRaw : (ptdnRaw && ptdnRaw.text) ? ptdnRaw.text : null;
-  const priceLevel = normalizePriceLevel(place.priceLevel);
-
-  return {
-    restaurant: {
-      googlePlaceId: place.id,
-      name: displayName,
-      latitude: String(loc.latitude ?? 0),
-      longitude: String(loc.longitude ?? 0),
-      formattedAddress: place.formattedAddress || null,
-      internationalPhoneNumber: place.nationalPhoneNumber || null,
-      websiteUri: place.websiteUri || null,
-      primaryTypeDisplayName: place.primaryTypeDisplayName?.text || null,
-      primaryType: place.primaryType || null,
-      types: Array.isArray(place.types) ? place.types : [],
-      rating: place.rating != null ? String(place.rating) : null,
-      userRatingCount: place.userRatingCount ?? null,
-      editorialSummary: place.editorialSummary?.text || null,
-      priceLevel, // <-- INT or null
-      servesVegetarianFood: false,
-      takeout: false,
-      dineIn: false,
-      curbsidePickup: false,
-      delivery: false,
-      outdoorSeating: false,
-      allowsDogs: false,
-      parkingOptions: null,
-      regularOpeningHours: null,
-    },
-    photo: place.photos?.[0]
-      ? {
-          name: place.photos[0].name, // "places/<id>/photos/<photoId>"
-          widthPx: place.photos[0].widthPx || null,
-          heightPx: place.photos[0].heightPx || null,
-        }
-      : null,
-  };
-}
-
-async function upsertPlacesBatch(places) {
-  for (const p of places) {
-    const mapped = mapPlaceToRestaurantCreate(p);
-    const r = await prisma.restaurant.upsert({
-      where: { googlePlaceId: mapped.restaurant.googlePlaceId },
-      create: mapped.restaurant,
-      update: {
-        name: mapped.restaurant.name,
-        formattedAddress: mapped.restaurant.formattedAddress,
-        websiteUri: mapped.restaurant.websiteUri,
-        primaryTypeDisplayName: mapped.restaurant.primaryTypeDisplayName,
-        primaryType: mapped.restaurant.primaryType,
-        types: mapped.restaurant.types,
-        rating: mapped.restaurant.rating,
-        userRatingCount: mapped.restaurant.userRatingCount,
-        priceLevel: mapped.restaurant.priceLevel, 
-        editorialSummary: mapped.restaurant.editorialSummary,
-      },
-    });
-    if (mapped.photo) {
-      const exists = await prisma.photo.findFirst({
-        where: { restaurantId: r.id, name: mapped.photo.name },
-        select: { id: true },
-      });
-      if (!exists) {
-        await prisma.photo.create({
-          data: {
-            restaurantId: r.id,
-            name: mapped.photo.name,
-            widthPx: mapped.photo.widthPx,
-            heightPx: mapped.photo.heightPx,
-          },
-        });
-      }
-    }
-  }
-}
-
-// Backfill any missing type metadata (and priceLevel) for legacy rows
-async function backfillMissingPlaceMetadata(restaurants) {
-  if (!GOOGLE_API_KEY) return;
-  const missing = restaurants.filter(
-    (r) => !r.primaryType || !r.types || r.types.length === 0 || r.priceLevel == null
-  );
-  if (!missing.length) return;
-  console.log(`[recs] backfill metadata for ${missing.length} restaurants…`);
-  for (const r of missing.slice(0, 50)) {
-    try {
-      const name = toPlaceName(r.googlePlaceId);
-      const url = `https://places.googleapis.com/v1/${name}?fields=${encodeURIComponent(
-        "id,primaryType,primaryTypeDisplayName,types,priceLevel"
-      )}`;
-      const res = await fetch(url, { headers: { "X-Goog-Api-Key": GOOGLE_API_KEY } });
-      if (!res.ok) continue;
-      const d = await res.json();
-      const ptdnRaw = d.primaryTypeDisplayName;
-      const ptdn = typeof ptdnRaw === "string" ? ptdnRaw : (ptdnRaw && ptdnRaw.text) ? ptdnRaw.text : r.primaryTypeDisplayName || null;
-      await prisma.restaurant.update({
-        where: { id: r.id },
-        data: {
-          primaryType: d.primaryType || r.primaryType || null,
-          primaryTypeDisplayName: ptdn,
-          types: Array.isArray(d.types) ? d.types : r.types || [],
-          priceLevel: normalizePriceLevel(d.priceLevel ?? r.priceLevel ?? null),
-        },
-      });
-    } catch {
-      // best-effort
-    }
-  }
-}
-
-// Build/refresh nearby pool; ingest from Places if thin; always log the count
-async function ensureNearbyRestaurants(lat, lng, minCount = 100) {
-  const here = { lat, lng };
-
-  const all = await prisma.restaurant.findMany({
-    take: 2000,
-    include: { photos: { take: 1 } },
-  });
-
-  let nearby = all
-    .map((r) => ({
-      r,
-      d: haversineKm(here, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }),
-    }))
-    .filter((x) => Number.isFinite(x.d) && x.d <= 15)
-    .sort((a, b) => a.d - b.d)
-    .map((x) => x.r);
-
-  if (nearby.length < minCount && GOOGLE_API_KEY) {
-    console.log(`[recs] nearby=${nearby.length} < ${minCount} → ingesting Places…`);
-    const places = await googlePlacesSearchNearby(lat, lng, 10000, 3);
-    console.log(`[recs] ingested places: ${places.length}`);
-    if (places.length) {
-      await upsertPlacesBatch(places);
-      const refreshed = await prisma.restaurant.findMany({
-        take: 2000,
-        include: { photos: { take: 1 } },
-      });
-      nearby = refreshed
-        .map((r) => ({
-          r,
-          d: haversineKm(here, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }),
-        }))
-        .filter((x) => Number.isFinite(x.d) && x.d <= 15)
-        .sort((a, b) => a.d - b.d)
-        .map((x) => x.r);
-    }
-  }
-
-  backfillMissingPlaceMetadata(nearby).catch(() => {});
-  console.log(`[recs] ensureNearby: ${nearby.length} within 15km`);
-  return nearby;
-}
-
-
-// ----------------------- photo proxy (no auth) ----------------------
-router.get("/photo", async (req, res) => {
-  try {
-    const apiKey = process.env.GOOGLE_API_KEY;
-    if (!apiKey) return res.status(503).send("photo proxy disabled");
-
-    const raw = String(req.query.name || "");
-    const name = decodeURIComponent(raw);
-
-    // Strictly allow only "places/<id>/photos/<photo_id>"
-    const m = /^places\/([^/]+)\/photos\/([^/]+)$/.exec(name);
-    if (!m) return res.status(400).send("bad name");
-    const placeId = m[1];
-
-    // width/height: support both ?w/h and ?maxWidthPx/maxHeightPx
-    const w = req.query.w || req.query.maxWidthPx;
-    const h = req.query.h || req.query.maxHeightPx;
-
-    const buildMediaUrl = (photoName) => {
-      const params = new URLSearchParams();
-      if (w) params.set("maxWidthPx", String(w));
-      if (h) params.set("maxHeightPx", String(h));
-      params.set("key", apiKey); // use query param per Places v1 examples
-      return `https://places.googleapis.com/v1/${photoName}/media?${params.toString()}`;
-    };
-
-    async function streamMedia(photoName) {
-      const mediaUrl = buildMediaUrl(photoName);
-
-      // First request without following redirects (expect 302)
-      const head = await axios.get(mediaUrl, {
-        responseType: "stream",
-        maxRedirects: 0,
-        validateStatus: (s) => s >= 200 && s < 400, // accept 302
-      });
-
-      const finalUrl = head.status === 302 && head.headers.location
-        ? head.headers.location
-        : mediaUrl;
-
-      const img = await axios.get(finalUrl, { responseType: "stream" });
-
-      res.setHeader("Content-Type", img.headers["content-type"] || "image/jpeg");
-      res.setHeader("Cache-Control", "public, max-age=86400, s-maxage=86400");
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      img.data.pipe(res);
-    }
-
-    try {
-      // Try with the stored photo name first
-      return await streamMedia(name);
-    } catch (err) {
-      const status = err?.response?.status;
-      console.error("[recs/photo] media upstream", status || "", err?.message || "");
-
-      // If Google says the resource is invalid/stale, refresh photos for the place and retry once
-      if (status === 400 || status === 404) {
-        try {
-          const det = await axios.get(
-            `https://places.googleapis.com/v1/places/${placeId}?fields=photos.name&key=${apiKey}`
-          );
-          const newName = det?.data?.photos?.[0]?.name;
-          if (newName && newName !== name) {
-            // best-effort DB update so we stop requesting the stale token
-            try {
-              await prisma.photo.updateMany({ where: { name }, data: { name: newName } });
-            } catch (_) {}
-            return await streamMedia(newName);
-          }
-        } catch (e2) {
-          console.error("[recs/photo] details fetch failed", e2?.response?.status || "", e2?.message || "");
-        }
-      }
-
-      // Graceful no-content so the UI can show its fallback image
-      return res.status(204).end();
-    }
-  } catch (e) {
-    console.error("photo proxy error", e);
-    return res.status(204).end();
-  }
-});
-
-
-
-/* ───────────────────────── Everything below needs auth ───────────────────── */
-router.use(verifyFirebaseToken);
-
-// ---------- preference filter ----------
+// Cuisine preference matching is kept here since it is app-specific (not Places-specific).
 const CUISINE_KEYWORDS = {
   indian: ["indian"],
   chinese: ["chinese", "szechuan", "sichuan", "cantonese", "hunan"],
@@ -428,8 +63,11 @@ const CUISINE_KEYWORDS = {
   lebanese: ["lebanese"],
   persian: ["persian", "iranian"],
 };
+
 const norm = (s) => String(s || "").toLowerCase().replace(/[_\s-]+/g, " ").trim();
+
 function cuisineKeywordsFromUser(user) {
+  // Builds a normalized set of keywords to avoid repeated lookups and ensure case-insensitive matching.
   const out = new Set();
   for (const p of user?.preferredCuisines || []) {
     const key = norm(p);
@@ -437,11 +75,15 @@ function cuisineKeywordsFromUser(user) {
   }
   return out;
 }
+
 function restaurantMatchesCuisine(r, keywordSet) {
+  // Early return improves performance when no preferences were set.
   if (!keywordSet || !keywordSet.size) return true;
+
   const primary = (r.primaryType || "").toLowerCase();
   const types = Array.isArray(r.types) ? r.types.map((t) => String(t).toLowerCase()) : [];
   const display = (r.primaryTypeDisplayName || r.name || "").toLowerCase();
+
   for (const k of keywordSet) {
     const needle = k.replace(/\s+/g, "_");
     if (primary.includes(needle)) return true;
@@ -450,22 +92,188 @@ function restaurantMatchesCuisine(r, keywordSet) {
   }
   return false;
 }
+
+function priceBandFromBudget(budgetMax) {
+  // Maps user budget to coarse price tiers that the ranker understands.
+  if (budgetMax == null) return 0;
+  if (budgetMax <= 15) return 1;
+  if (budgetMax <= 30) return 2;
+  if (budgetMax <= 60) return 3;
+  return 4;
+}
+
+/**
+ * Original preference filter: returns nearest matches, then pads with nearest non-matches
+ * until desiredMin is reached. If still short, the caller may choose to discover more.
+ */
 function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60) {
   const keys = cuisineKeywordsFromUser(user);
   const here = { lat, lng };
+
   const withDist = pool.map((r) => ({
     r,
     d: haversineKm(here, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }),
   }));
-  const matches = withDist.filter(({ r }) => restaurantMatchesCuisine(r, keys)).sort((a, b) => a.d - b.d);
+
+  const matches = withDist
+    .filter(({ r }) => restaurantMatchesCuisine(r, keys))
+    .sort((a, b) => a.d - b.d);
+
   if (matches.length >= desiredMin) return matches.map((x) => x.r);
-  const non = withDist.filter(({ r }) => !restaurantMatchesCuisine(r, keys)).sort((a, b) => a.d - b.d);
+
+  // If not enough matches, fills with nearest non-matching options to satisfy pool size.
+  const non = withDist
+    .filter(({ r }) => !restaurantMatchesCuisine(r, keys))
+    .sort((a, b) => a.d - b.d);
+
   const merged = [...matches.map((x) => x.r)];
-  for (const n of non) { if (merged.length >= desiredMin) break; merged.push(n.r); }
+  for (const n of non) {
+    if (merged.length >= desiredMin) break;
+    merged.push(n.r);
+  }
   return merged.length ? merged : pool;
 }
 
+// ---- discovery helpers (router-level, integrates with places service) ----
+function generateRingCenters(lat, lng, minKm = 2, maxKm = 12, stepKm = 2) {
+  // Generates a ring of centers every "stepKm" from minKm up to maxKm
+  const centers = [];
+  const toRad = (d) => (d * Math.PI) / 180;
+  const toDeg = (r) => (r * 180) / Math.PI;
+  const earthKm = 6371;
+  const lat1 = toRad(lat);
+  const lon1 = toRad(lng);
+
+  for (let r = minKm; r <= maxKm; r += stepKm) {
+    const circumference = 2 * Math.PI * r;
+    const points = Math.max(6, Math.round(circumference / stepKm)); // roughly hex-like density
+    const angDist = r / earthKm;
+
+    for (let i = 0; i < points; i++) {
+      const bearing = (2 * Math.PI * i) / points;
+      const lat2 = Math.asin(
+        Math.sin(lat1) * Math.cos(angDist) +
+          Math.cos(lat1) * Math.sin(angDist) * Math.cos(bearing)
+      );
+      const lon2 =
+        lon1 +
+        Math.atan2(
+          Math.sin(bearing) * Math.sin(angDist) * Math.cos(lat1),
+          Math.cos(angDist) - Math.sin(lat1) * Math.sin(lat2)
+        );
+      centers.push({ lat: toDeg(lat2), lng: toDeg(lon2) });
+    }
+  }
+  return centers;
+}
+
+async function discoverAndIngestAround(
+  lat,
+  lng,
+  {
+    cellRadiusMeters = 3000,
+    rankPrefs = ["POPULARITY", "DISTANCE"],
+    includeTypes = [["restaurant"]],
+    maxCenters = 18, // safety to avoid quota spikes
+    delayMs = 120, // polite pause between calls
+  } = {}
+) {
+  // Sweeps a ring of centers, queries Places with multiple rank preferences and types,
+  // dedupes by id, and upserts only new places.
+  const centers = generateRingCenters(lat, lng, 2, 12, 2).slice(0, maxCenters);
+  const byId = new Map();
+
+  for (const c of centers) {
+    for (const rankPreference of rankPrefs) {
+      for (const types of includeTypes) {
+        const chunk = await places.googlePlacesSearchNearby(c.lat, c.lng, {
+          radiusMeters: cellRadiusMeters,
+          maxPages: 3,
+          rankPreference,
+          includedTypes: types,
+        });
+        for (const p of chunk || []) {
+          if (p?.id && !byId.has(p.id)) byId.set(p.id, p);
+        }
+        if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+  }
+
+  const discovered = Array.from(byId.values());
+  if (!discovered.length) return { discovered: 0 };
+
+  const created = await places.upsertPlacesBatch(discovered);
+  console.log(`[recs] discovery sweep: fetched=${discovered.length} new=${created}`);
+  return { discovered: discovered.length, created };
+}
+
+/**
+ * Ensures a preference-matched pool of size >= desiredMin.
+ * If local DB doesn't have enough matches, performs a discovery sweep then refreshes.
+ */
+async function ensurePreferredPool(lat, lng, user, desiredMin = 60) {
+  // Step 1: DB-first pool near the user
+  const dbPool = await places.ensureNearbyRestaurants(
+    lat,
+    lng,
+    Math.max(desiredMin, 100)
+  );
+  let filtered = filterAndPrioritizeByPreferences(
+    dbPool,
+    user,
+    lat,
+    lng,
+    desiredMin
+  );
+
+  if (filtered.length >= desiredMin) return filtered;
+
+  // Step 2: Discover more around the area (POPULARITY + DISTANCE; restaurant-only)
+  await discoverAndIngestAround(lat, lng, {
+    cellRadiusMeters: 3000,
+    rankPrefs: ["POPULARITY", "DISTANCE"],
+    includeTypes: [["restaurant"]],
+  });
+
+  // Step 3: Refresh pool and re-filter
+  const refreshed = await places.ensureNearbyRestaurants(
+    lat,
+    lng,
+    Math.max(desiredMin, 100)
+  );
+  filtered = filterAndPrioritizeByPreferences(
+    refreshed,
+    user,
+    lat,
+    lng,
+    desiredMin
+  );
+  if (filtered.length >= desiredMin) return filtered;
+
+  // Step 4 (optional): try adjacent food types to widen the net a bit
+  await discoverAndIngestAround(lat, lng, {
+    cellRadiusMeters: 3000,
+    rankPrefs: ["POPULARITY"],
+    includeTypes: [
+      ["cafe"],
+      ["meal_takeaway"],
+      ["meal_delivery"],
+      ["bar"],
+      ["food_court"],
+    ],
+  });
+
+  const finalPool = await places.ensureNearbyRestaurants(
+    lat,
+    lng,
+    Math.max(desiredMin, 120)
+  );
+  return filterAndPrioritizeByPreferences(finalPool, user, lat, lng, desiredMin);
+}
+
 // ---------- routes ----------
+
 // Resolve restaurant names (and a few fields) for a list of IDs (POST)
 router.post("/lookup", async (req, res) => {
   try {
@@ -489,11 +297,13 @@ router.post("/lookup", async (req, res) => {
       id: r.id,
       name: r.name,
       editorialSummary: r.editorialSummary || null,
-      editorial_summary: r.editorialSummary || null,
+      editorial_summary: r.editorialSummary || null, // legacy alias retained for client compatibility
       address: r.formattedAddress,
       priceLevel: r.priceLevel ?? null,
       photoUrl: r.photos?.[0]?.name
-        ? `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(r.photos[0].name)}&w=1200`
+        ? `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(
+            r.photos[0].name
+          )}&w=1200`
         : null,
     }));
 
@@ -504,6 +314,8 @@ router.post("/lookup", async (req, res) => {
   }
 });
 
+/* ───────────────────────── Everything below needs auth ───────────────────── */
+router.use(verifyFirebaseToken);
 
 // Start a swipe/recs session
 router.post("/start", async (req, res) => {
@@ -513,26 +325,35 @@ router.post("/start", async (req, res) => {
     if (typeof lat !== "number" || typeof lng !== "number") {
       return res.status(400).json({ error: "lat/lng required" });
     }
+
     const user = await prisma.user.findUnique({ where: { firebaseUid: uid } });
     if (!user) return res.status(404).json({ error: "User not found. Sync profile first." });
 
+    // Reuses the latest active session to preserve interaction context across calls.
     let session = await prisma.swipeSession.findFirst({
-  where: { userId: user.id, status: "active" },
-  orderBy: { startedAt: "desc" }, // use existing field
-  include: { events: true },
-});
+      where: { userId: user.id, status: "active" },
+      orderBy: { startedAt: "desc" },
+      include: { events: true },
+    });
     if (!session) {
       session = await prisma.swipeSession.create({ data: { userId: user.id } });
     }
 
-    const pool = await ensureNearbyRestaurants(lat, lng, minPool);
-    const filteredPool = filterAndPrioritizeByPreferences(pool, user, lat, lng, Math.max(60, minPool));
-    console.log(`[recs/start] user=${user.id} pool=${pool.length} prefPool=${filteredPool.length}`);
+    // Ensure we have enough preference-matched items; this will trigger discovery if needed.
+    const filteredPool = await ensurePreferredPool(lat, lng, user, Math.max(60, minPool));
+    const pool = filteredPool; // for logging parity below
 
-    // Warm the ranker (best-effort)
+    console.log(
+      `[recs/start] user=${user.id} pool=${pool.length} prefPool=${filteredPool.length}`
+    );
+
+    // Warms the ranker with a batch of items. Failures are ignored to keep the endpoint responsive.
     try {
       const items = filteredPool.slice(0, 200).map((r) => {
-        const dist = haversineKm({ lat, lng }, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) });
+        const dist = haversineKm(
+          { lat, lng },
+          { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }
+        );
         return {
           id: r.id,
           priceLevel: r.priceLevel ?? null,
@@ -553,9 +374,15 @@ router.post("/start", async (req, res) => {
       fetch(`${RECS_SERVICE_URL}/rank`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user: { id: user.id, features: userFeatures }, items, interactions: [] }),
+        body: JSON.stringify({
+          user: { id: user.id, features: userFeatures },
+          items,
+          interactions: [],
+        }),
       }).catch(() => {});
-    } catch {}
+    } catch {
+      // best-effort
+    }
 
     res.json({ sessionId: session.id });
   } catch (e) {
@@ -584,9 +411,12 @@ router.post("/next", async (req, res) => {
       return res.status(400).json({ error: "Invalid session" });
     }
 
+    // Ensure we have enough preference-matched candidates; triggers discovery if needed.
+    const prefPool = await ensurePreferredPool(lat, lng, user, 100);
+    // (Optional) raw pool for logging only
+    const pool = await places.ensureNearbyRestaurants(lat, lng, 100);
+
     const swipedIds = new Set(session.events.map((e) => e.restaurantId));
-    const pool = await ensureNearbyRestaurants(lat, lng, 100);
-    const prefPool = filterAndPrioritizeByPreferences(pool, user, lat, lng, 100);
     const candidates = prefPool.filter((r) => !swipedIds.has(r.id));
 
     const finalPool = candidates.length ? candidates : pool.filter((r) => !swipedIds.has(r.id));
@@ -596,7 +426,10 @@ router.post("/next", async (req, res) => {
     }
 
     const items = finalPool.map((r) => {
-      const dist = haversineKm({ lat, lng }, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) });
+      const dist = haversineKm(
+        { lat, lng },
+        { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }
+      );
       return {
         id: r.id,
         priceLevel: r.priceLevel ?? null,
@@ -640,7 +473,9 @@ router.post("/next", async (req, res) => {
         const safe = (ranked.rankings || []).filter((id) => candidateSet.has(id));
         wantIds = (safe.length ? safe : wantIds).slice(0, Math.max(1, Number(limit)));
       }
-    } catch {}
+    } catch {
+      // best-effort
+    }
 
     let full = await prisma.restaurant.findMany({
       where: { id: { in: wantIds } },
@@ -667,7 +502,10 @@ router.post("/next", async (req, res) => {
       const photoUrl = photoName
         ? `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(photoName)}&w=1200`
         : null;
-      const dist = haversineKm({ lat, lng }, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) });
+      const dist = haversineKm(
+        { lat, lng },
+        { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }
+      );
       return {
         id: r.id,
         name: r.name,
@@ -678,7 +516,7 @@ router.post("/next", async (req, res) => {
         primaryType: r.primaryType,
         types: r.types,
         editorialSummary: r.editorialSummary || null,
-        editorial_summary: r.editorialSummary || null,
+        editorial_summary: r.editorialSummary || null, // alias for older clients
       };
     });
 
@@ -693,7 +531,7 @@ router.post("/next", async (req, res) => {
   }
 });
 
-// Feedback / finalize / winner (unchanged)
+// Feedback / finalize / winner
 router.post("/feedback", async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -701,8 +539,10 @@ router.post("/feedback", async (req, res) => {
     if (!sessionId || !restaurantId || !["LIKE", "PASS", "SUPERSTAR"].includes(action)) {
       return res.status(400).json({ error: "sessionId, restaurantId, action required" });
     }
+
     const user = await prisma.user.findUnique({ where: { firebaseUid: uid } });
     if (!user) return res.status(404).json({ error: "User not found" });
+
     const session = await prisma.swipeSession.findUnique({
       where: { id: sessionId },
       include: { events: true },
@@ -710,7 +550,9 @@ router.post("/feedback", async (req, res) => {
     if (!session || session.userId !== user.id || session.status !== "active") {
       return res.status(400).json({ error: "Invalid session" });
     }
+
     const position = session.events.length + 1;
+
     await prisma.$transaction(async (tx) => {
       await tx.swipeEvent.create({
         data: { sessionId, userId: user.id, restaurantId, action, position },
@@ -727,10 +569,11 @@ router.post("/feedback", async (req, res) => {
         });
       }
     });
-    const nextCount = (session.totalSwipes ?? session.events.length) + 1;
 
-const shouldRerank = nextCount % 5 === 0;
-const shouldSuggestMatch = nextCount >= 15;
+    const nextCount = (session.totalSwipes ?? session.events.length) + 1;
+    const shouldRerank = nextCount % 5 === 0;
+    const shouldSuggestMatch = nextCount >= 15;
+
     res.json({ ok: true, shouldRerank, shouldSuggestMatch });
   } catch (e) {
     console.error("recs/feedback error:", e);
@@ -745,8 +588,10 @@ router.post("/finalize-match", async (req, res) => {
     if (!sessionId || !winnerRestaurantId || !Array.isArray(top3) || top3.length === 0) {
       return res.status(400).json({ error: "sessionId, winnerRestaurantId, top3 required" });
     }
+
     const user = await prisma.user.findUnique({ where: { firebaseUid: uid } });
     if (!user) return res.status(404).json({ error: "User not found" });
+
     await prisma.$transaction(async (tx) => {
       await tx.match.create({
         data: {
@@ -765,29 +610,34 @@ router.post("/finalize-match", async (req, res) => {
       });
     });
 
-    // hydrate winner for immediate UI render
-const winner = await prisma.restaurant.findUnique({
-  where: { id: winnerRestaurantId },
-  include: { photos: { take: 1 } },
-});
-let winnerPhotoUrl = null;
-const photoName = winner?.photos?.[0]?.name || null;
-if (photoName) {
-  winnerPhotoUrl = `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(photoName)}&w=1200`;
-}
-const payloadWinner = winner && {
-  id: winner.id,
-  name: winner.name,
-  address: winner.formattedAddress,
-  priceLevel: winner.priceLevel ?? null,
-  primaryType: winner.primaryType,
-  types: winner.types,
-  editorialSummary: winner.editorialSummary || null,
-  editorial_summary: winner.editorialSummary || null,
-  photoUrl: winnerPhotoUrl,
-};
-res.json({ ok: true, winner: payloadWinner });
+    // Hydrates the winner so the client can render without a second network call.
+    const winner = await prisma.restaurant.findUnique({
+      where: { id: winnerRestaurantId },
+      include: { photos: { take: 1 } },
+    });
 
+    let winnerPhotoUrl = null;
+    const photoName = winner?.photos?.[0]?.name || null;
+    if (photoName) {
+      winnerPhotoUrl = `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(
+        photoName
+      )}&w=1200`;
+    }
+
+    const payloadWinner =
+      winner && {
+        id: winner.id,
+        name: winner.name,
+        address: winner.formattedAddress,
+        priceLevel: winner.priceLevel ?? null,
+        primaryType: winner.primaryType,
+        types: winner.types,
+        editorialSummary: winner.editorialSummary || null,
+        editorial_summary: winner.editorialSummary || null,
+        photoUrl: winnerPhotoUrl,
+      };
+
+    res.json({ ok: true, winner: payloadWinner });
   } catch (e) {
     console.error("recs/finalize-match error:", e);
     res.status(500).json({ error: "finalize failed" });
@@ -799,31 +649,36 @@ router.get("/winner", async (req, res) => {
     const uid = req.user.uid;
     const user = await prisma.user.findUnique({ where: { firebaseUid: uid } });
     if (!user) return res.status(404).json({ error: "User not found" });
+
     const m = await prisma.match.findFirst({
       where: { userId: user.id },
       orderBy: { createdAt: "desc" },
     });
     if (!m) return res.json({ winner: null });
+
     const r = await prisma.restaurant.findUnique({
       where: { id: m.winnerRestaurantId },
       include: { photos: { take: 1 } },
     });
+
     const photoName = r?.photos?.[0]?.name || null;
     const photoUrl = photoName
       ? `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(photoName)}&w=1200`
       : null;
+
     res.json({
-      winner: r && {
-        id: r.id,
-        name: r.name,
-        address: r.formattedAddress,
-        priceLevel: r.priceLevel ?? null,
-        primaryType: r.primaryType,
-        types: r.types,
-        editorialSummary: r.editorialSummary || null,
-        editorial_summary: r.editorialSummary || null, // alias
-        photoUrl,
-      },
+      winner:
+        r && {
+          id: r.id,
+          name: r.name,
+          address: r.formattedAddress,
+          priceLevel: r.priceLevel ?? null,
+          primaryType: r.primaryType,
+          types: r.types,
+          editorialSummary: r.editorialSummary || null,
+          editorial_summary: r.editorialSummary || null, // alias
+          photoUrl,
+        },
     });
   } catch (e) {
     console.error("recs/winner error:", e);
