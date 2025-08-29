@@ -10,8 +10,8 @@ const fetchFn =
   (typeof fetch === "function" && fetch) ||
   ((...args) => import("node-fetch").then((mod) => mod.default(...args)));
 
-// Backfill throttle (reduce log spam and upstream requests)
-let _lastBackfillAt = 0; // process-level throttle
+// Backfill throttle
+let _lastBackfillAt = 0;
 const BACKFILL_MIN_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 
 const PLACES_FIELD_MASK = [
@@ -60,14 +60,14 @@ function mapPlaceToRestaurantCreate(place) {
       userRatingCount: place.userRatingCount ?? null,
       editorialSummary: place.editorialSummary?.text || null,
       priceLevel,
-      // Defaults reserved for future enrichment flags
-      servesVegetarianFood: false,
+      // Flags default; real enrichment elsewhere
+      servesVegetarian: false, // DB: serves_vegetarian
       takeout: false,
       dineIn: false,
       curbsidePickup: false,
       delivery: false,
       outdoorSeating: false,
-      allowsDogs: false,
+      allowsDogs: false, // DB: allows_dogs
       parkingOptions: null,
       regularOpeningHours: null,
     },
@@ -132,9 +132,50 @@ function createPlacesService({ prisma, googleApiKey }) {
     return results;
   }
 
-  async function upsertPlacesBatch(places) {
-    // Pre-dedupe by ID to limit DB churn
-    const ids = places.map((p) => p.id).filter(Boolean);
+  // NEW: Text Search with location bias (for requirements-focused queries)
+  async function googlePlacesSearchText(
+    textQuery,
+    {
+      latitude,
+      longitude,
+      radiusMeters = 6000,
+      maxResults = 20,
+    } = {}
+  ) {
+    if (!hasKey || !textQuery) return [];
+    const body = {
+      textQuery: String(textQuery),
+      maxResultCount: Math.max(1, Math.min(20, maxResults)),
+      locationBias: {
+        circle: {
+          center: { latitude, longitude },
+          radius: Math.max(500, Math.min(20000, radiusMeters)),
+        },
+      },
+    };
+
+    const r = await fetchFn("https://places.googleapis.com/v1/places:searchText", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": googleApiKey,
+        "X-Goog-FieldMask": PLACES_FIELD_MASK,
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!r.ok) {
+      const e = await r.text().catch(() => "");
+      console.error("[placesService] searchText err", r.status, e.slice(0, 300));
+      return [];
+    }
+
+    const json = await r.json();
+    return json.places || [];
+  }
+
+  async function upsertPlacesBatch(placesArr) {
+    const ids = placesArr.map((p) => p.id).filter(Boolean);
     if (ids.length === 0) return 0;
 
     const existing = await prisma.restaurant.findMany({
@@ -144,7 +185,7 @@ function createPlacesService({ prisma, googleApiKey }) {
     const existingSet = new Set(existing.map((x) => x.googlePlaceId));
     let created = 0;
 
-    for (const p of places) {
+    for (const p of placesArr) {
       if (!p?.id || existingSet.has(p.id)) continue;
       const mapped = mapPlaceToRestaurantCreate(p);
 
@@ -221,9 +262,7 @@ function createPlacesService({ prisma, googleApiKey }) {
             priceLevel: normalizePriceLevel(d.priceLevel ?? r.priceLevel ?? null),
           },
         });
-      } catch {
-        // best-effort
-      }
+      } catch {}
     }
   }
 
@@ -247,7 +286,6 @@ function createPlacesService({ prisma, googleApiKey }) {
     if (nearby.length < minCount && hasKey) {
       console.log(`[placesService] nearby=${nearby.length} < ${minCount} → ingesting Places…`);
 
-      // scale API radius to roughly the user radius (with a small buffer)
       const radiusMeters = Math.max(2000, Math.min(20000, Math.round(radiusKm * 1000 * 1.2)));
 
       const popular = await googlePlacesSearchNearby(lat, lng, {
@@ -262,11 +300,11 @@ function createPlacesService({ prisma, googleApiKey }) {
       });
       const uniq = new Map();
       for (const p of [...popular, ...distance]) if (p?.id && !uniq.has(p.id)) uniq.set(p.id, p);
-      const places = Array.from(uniq.values());
+      const list = Array.from(uniq.values());
 
-      console.log(`[placesService] ingested places (unique): ${places.length}`);
-      if (places.length) {
-        await upsertPlacesBatch(places);
+      console.log(`[placesService] ingested places (unique): ${list.length}`);
+      if (list.length) {
+        await upsertPlacesBatch(list);
         const refreshed = await prisma.restaurant.findMany({
           take: 2000,
           include: { photos: { take: 1 } },
@@ -282,7 +320,6 @@ function createPlacesService({ prisma, googleApiKey }) {
       }
     }
 
-    // throttle backfill to reduce spam/work
     const now = Date.now();
     if (now - _lastBackfillAt >= BACKFILL_MIN_INTERVAL_MS) {
       _lastBackfillAt = now;
@@ -295,7 +332,8 @@ function createPlacesService({ prisma, googleApiKey }) {
 
   return {
     ensureNearbyRestaurants,
-    googlePlacesSearchNearby, // exposed for discovery sweeps
+    googlePlacesSearchNearby,
+    googlePlacesSearchText, // 👈 NEW export
     upsertPlacesBatch,
     backfillMissingPlaceMetadata,
     mapPlaceToRestaurantCreate,
