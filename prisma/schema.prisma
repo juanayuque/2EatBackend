@@ -28,6 +28,42 @@ enum SwipeAction {
   SUPERSTAR
 }
 
+enum FriendRequestStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  CANCELED
+}
+
+model FriendRequest {
+  id          String               @id @default(uuid())
+  fromUserId  String
+  toUserId    String
+  status      FriendRequestStatus  @default(PENDING)
+  createdAt   DateTime             @default(now())
+  updatedAt   DateTime             @updatedAt
+
+  fromUser    User                 @relation("FriendRequestsSent", fields: [fromUserId], references: [id])
+  toUser      User                 @relation("FriendRequestsReceived", fields: [toUserId], references: [id])
+
+  @@unique([fromUserId, toUserId])     // enables where: { fromUserId_toUserId: {...} }
+  @@index([toUserId, status])
+}
+
+model Friend {
+  id        String   @id @default(uuid())
+  userId    String
+  friendId  String
+  createdAt DateTime @default(now())
+
+  user      User     @relation("FriendsOwner", fields: [userId], references: [id])
+  friend    User     @relation("FriendsFriend", fields: [friendId], references: [id])
+
+  @@unique([userId, friendId])         // enables where: { userId_friendId: {...} }
+  @@index([friendId])
+}
+
+
 model SwipeSession {
   id           String     @id @default(cuid())
   userId       String
@@ -98,21 +134,32 @@ model User {
   id                String   @id @default(cuid())
   firebaseUid       String   @unique
   email             String?  @unique
-  age               Int? // Optional, if user provides it
-  gender            Gender? // Optional, using the Gender enum
-  searchDistance    Int?     @map("search_distance") // Distance in km
+  username          String?  @unique            
+  displayName       String?
+  photoUrl          String?
+
+  age               Int?
+  gender            Gender?
+  searchDistance    Int?     @map("search_distance")
   budgetMax         Int?     @map("budget_max")
-  dietaryNeeds      String[] @map("dietary_needs") // Array of strings (e.g., "Vegetarian", "Gluten-Free")
-  preferredCuisines String[] @map("preferred_cuisines") // Array of strings
-  displayName       String? // username ?
-  photoUrl          String? // avatar url
-  sessions    SwipeSession[]
-  events      SwipeEvent[]
-  superstars  Superstar[]
-  matches     Match[]
-  emailVerified     Boolean?      @default(false)
-  createdAt         DateTime      @default(now()) @map("created_at")
-  updatedAt         DateTime      @updatedAt @map("updated_at")
+  dietaryNeeds      String[] @map("dietary_needs")
+  preferredCuisines String[] @map("preferred_cuisines")
+
+  // existing relations
+  sessions          SwipeSession[]
+  events            SwipeEvent[]
+  superstars        Superstar[]
+  matches           Match[]
+
+  // NEW opposite relation fields
+  friendRequestsSent     FriendRequest[] @relation("FriendRequestsSent")
+  friendRequestsReceived FriendRequest[] @relation("FriendRequestsReceived")
+  friendsOwner           Friend[]        @relation("FriendsOwner")
+  friendsFriend          Friend[]        @relation("FriendsFriend")
+
+  emailVerified     Boolean? @default(false)
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt      @map("updated_at")
 
   @@map("users")
 }
@@ -184,3 +231,4 @@ model Photo {
 
   @@map("photos")
 }
+
