@@ -48,7 +48,6 @@ router.use(photoProxyRouter);
 
 // ---------- helpers kept local to this router ----------
 
-// Cuisine preference matching is kept here since it is app-specific (not Places-specific).
 const CUISINE_KEYWORDS = {
   indian: ["indian"],
   chinese: ["chinese", "szechuan", "sichuan", "cantonese", "hunan"],
@@ -67,6 +66,7 @@ const CUISINE_KEYWORDS = {
   turkish: ["turkish"],
   lebanese: ["lebanese"],
   persian: ["persian", "iranian"],
+  fastfood: ["fast"ß]
 };
 
 const norm = (s) => String(s || "").toLowerCase().replace(/[_\s-]+/g, " ").trim();
@@ -146,7 +146,6 @@ function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60,
 
 // ---- discovery helpers (router-level, integrates with places service) ----
 function generateRingCenters(lat, lng, minKm = 2, maxKm = 12, stepKm = 2) {
-  // Generates a ring of centers every "stepKm" from minKm up to maxKm
   const centers = [];
   const toRad = (d) => (d * Math.PI) / 180;
   const toDeg = (r) => (r * 180) / Math.PI;
@@ -404,7 +403,7 @@ router.post("/start", async (req, res) => {
 router.post("/next", async (req, res) => {
   try {
     const uid = req.user.uid;
-    const { sessionId, lat, lng, limit = 1 } = req.body || {};
+    const { sessionId, lat, lng, limit = 1, excludeIds = [] } = req.body || {};
     if (!sessionId || typeof lat !== "number" || typeof lng !== "number") {
       return res.status(400).json({ error: "sessionId, lat, lng required" });
     }
@@ -440,9 +439,12 @@ router.post("/next", async (req, res) => {
     const pool = await places.ensureNearbyRestaurants(lat, lng, 100, radiusKm);
 
     const swipedIds = new Set(session.events.map((e) => e.restaurantId));
-    const candidates = prefPool.filter((r) => !swipedIds.has(r.id));
+    const exclude = new Set(Array.isArray(excludeIds) ? excludeIds.filter(Boolean) : []);
 
-    const finalPool = candidates.length ? candidates : pool.filter((r) => !swipedIds.has(r.id));
+    const candidates = prefPool.filter((r) => !swipedIds.has(r.id) && !exclude.has(r.id));
+    const fallback = pool.filter((r) => !swipedIds.has(r.id) && !exclude.has(r.id));
+    const finalPool = candidates.length ? candidates : fallback;
+
     if (!finalPool.length) {
       console.log(`[recs/next] user=${user.id} cand=0 → returning empty`);
       return res.json({ items: [] });
@@ -544,7 +546,7 @@ router.post("/next", async (req, res) => {
     });
 
     console.log(
-      `[recs/next] user=${user.id} nearby=${pool.length} pref=${prefPool.length} cand=${candidates.length} returned=${clientItems.length}`
+      `[recs/next] user=${user.id} nearby=${pool.length} pref=${prefPool.length} cand=${candidates.length} excl=${exclude.size} returned=${clientItems.length}`
     );
 
     res.json({ items: clientItems });
@@ -558,7 +560,10 @@ router.post("/next", async (req, res) => {
 router.post("/feedback", async (req, res) => {
   try {
     const uid = req.user.uid;
-    const { sessionId, restaurantId, action } = req.body || {};
+    let { sessionId, restaurantId, action } = req.body || {};
+
+    // Normalize action so "pass"/"like" still work
+    action = String(action || "").toUpperCase();
     if (!sessionId || !restaurantId || !["LIKE", "PASS", "SUPERSTAR"].includes(action)) {
       return res.status(400).json({ error: "sessionId, restaurantId, action required" });
     }
