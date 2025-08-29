@@ -51,7 +51,7 @@ router.use(photoProxyRouter);
 const norm = (s) => String(s || "").toLowerCase().replace(/[_\s-]+/g, " ").trim();
 const lc = (s) => String(s || "").toLowerCase();
 
-// Cuisine keyword map (primaryType, types, and display name are checked)
+// Cuisine keyword map (primaryType, types, and display name/name are checked)
 const CUISINE_KEYWORDS = {
   indian: ["indian"],
   chinese: ["chinese", "szechuan", "sichuan", "cantonese", "hunan"],
@@ -70,7 +70,7 @@ const CUISINE_KEYWORDS = {
   turkish: ["turkish"],
   lebanese: ["lebanese"],
   persian: ["persian", "iranian"],
-  // Fast Food — match the word "fast" anywhere across primary/type/display.
+  // Fast Food — match the word "fast" anywhere across primary/type/display/name.
   "fast food": ["fast"],
   fastfood: ["fast"], // tolerate legacy key formatting
 };
@@ -84,18 +84,21 @@ function cuisineKeywordsFromUser(user) {
   return out;
 }
 
+// NOW explicitly checks: primaryType, types[], primaryTypeDisplayName, AND name
 function restaurantMatchesCuisine(r, keywordSet) {
   if (!keywordSet || !keywordSet.size) return true;
 
-  const primary = (r.primaryType || "").toLowerCase();
-  const types = Array.isArray(r.types) ? r.types.map((t) => String(t).toLowerCase()) : [];
-  const display = (r.primaryTypeDisplayName || r.name || "").toLowerCase();
+  const primary = lc(r.primaryType);
+  const types = Array.isArray(r.types) ? r.types.map((t) => lc(String(t))) : [];
+  const display = lc(r.primaryTypeDisplayName);
+  const name = lc(r.name);
 
   for (const k of keywordSet) {
     const needle = k.replace(/\s+/g, "_"); // e.g., "middle eastern" -> "middle_eastern"
     if (primary.includes(needle)) return true;
     if (types.some((t) => t.includes(needle))) return true;
-    if (display.includes(k)) return true; // keep space form for display text
+    if (display.includes(k)) return true;
+    if (name.includes(k)) return true; // 👈 explicit name scan
   }
   return false;
 }
@@ -117,8 +120,7 @@ function radiusFromUser(user) {
 
 // Lightweight text helper for requirement inference fallback
 function textIncludesAny(r, needles) {
-  const fields = [lc(r.name), lc(r.primaryTypeDisplayName), lc(r.editorialSummary)]
-    .filter(Boolean);
+  const fields = [lc(r.name), lc(r.primaryTypeDisplayName), lc(r.editorialSummary)].filter(Boolean);
   return needles.some((n) => fields.some((f) => f.includes(n)));
 }
 
@@ -138,14 +140,14 @@ function restaurantMeetsRequirements(r, req) {
   let ok = true;
 
   if (req.vegetarian) {
-    const hasField = r.servesVegetarianFood === true;
+    const hasField = r.servesVegetarian === true; // prisma maps serves_vegetarian -> servesVegetarian
     const hasType = Array.isArray(r.types) && r.types.map(lc).includes("vegetarian_restaurant");
     const hasText = textIncludesAny(r, ["vegetarian", "vegan"]);
     ok = ok && (hasField || hasType || hasText);
   }
 
   if (req.petFriendly) {
-    const hasField = r.allowsDogs === true;
+    const hasField = r.allowsDogs === true; // allows_dogs -> allowsDogs
     const hasText = textIncludesAny(r, ["dog friendly", "pet friendly", "dogs welcome"]);
     ok = ok && (hasField || hasText);
   }
@@ -197,7 +199,7 @@ function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60,
 
   let merged = [];
 
-  // Fill from requirement-compliant rows first
+  // Fill from requirement-compliant rows first (cuisine-pref)
   const reqCuisine = byCuisine(reqRows);
   merged.push(...reqCuisine);
 
@@ -206,7 +208,7 @@ function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60,
     merged.push(...reqNearest);
   }
 
-  // Relax requirements if still short
+  // Relax requirements if still short (cuisine first, then nearest)
   if (merged.length < desiredMin && nonReqRows.length) {
     const nonReqCuisine = byCuisine(nonReqRows).filter((r) => !merged.includes(r));
     merged.push(...nonReqCuisine);
@@ -358,6 +360,30 @@ async function ensurePreferredPool(lat, lng, user, desiredMin = 60) {
   return filterAndPrioritizeByPreferences(finalPool, user, lat, lng, desiredMin, radiusKm);
 }
 
+/* ──────────────── Small utilities to vary order between sessions ─────────────── */
+
+function hash32(str) {
+  // FNV-1a 32-bit
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+function seededScore(id, sessionId) {
+  return hash32(String(id) + "|" + String(sessionId)) / 0x100000000; // 0..1
+}
+function reorderWithSessionSeed(ids, sessionId, prevSeenSet) {
+  const rows = ids.map((id) => ({
+    id,
+    seen: prevSeenSet?.has(id) ? 1 : 0, // unseen first
+    rnd: seededScore(id, sessionId),
+  }));
+  rows.sort((a, b) => (a.seen - b.seen) || (a.rnd - b.rnd));
+  return rows.map((r) => r.id);
+}
+
 /* ───────────────────────────── Routes ───────────────────────────── */
 
 // Resolve restaurant names (and a few fields) for a list of IDs (POST)
@@ -387,9 +413,7 @@ router.post("/lookup", async (req, res) => {
       address: r.formattedAddress,
       priceLevel: r.priceLevel ?? null,
       photoUrl: r.photos?.[0]?.name
-        ? `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(
-            r.photos[0].name
-          )}&w=1200`
+        ? `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(r.photos[0].name)}&w=1200`
         : null,
     }));
 
@@ -456,6 +480,7 @@ router.post("/start", async (req, res) => {
         `uband:${priceBandFromBudget(user.budgetMax ?? null)}`,
         ...(user.preferredCuisines || []).map((c) => `ucuisine:${c}`),
         ...(user.dietaryNeeds || []).map((d) => `ureq:${d}`), // requirements as features
+        `sess:${session.id}`, // hint to ranker to allow session-based variety
       ];
       fetchFn(`${RECS_SERVICE_URL}/rank`, {
         method: "POST",
@@ -477,7 +502,7 @@ router.post("/start", async (req, res) => {
   }
 });
 
-// Next cards – ranker optional, robust fallback
+// Next cards – ranker optional, robust fallback, session-seeded reordering
 router.post("/next", async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -509,6 +534,16 @@ router.post("/next", async (req, res) => {
       }
       return res.json({ items: [], sessionCompleted: true });
     }
+
+    // Previous session: collect its swiped IDs to demote them (not exclude)
+    const prevSession = await prisma.swipeSession.findFirst({
+      where: { userId: user.id, id: { not: sessionId }, endedAt: { not: null } },
+      orderBy: { startedAt: "desc" },
+      include: { events: { select: { restaurantId: true } } },
+    });
+    const prevSeenSet = new Set(
+      (prevSession?.events || []).map((e) => e.restaurantId)
+    );
 
     // Ensure we have enough preference-matched candidates; triggers discovery if needed.
     const prefPool = await ensurePreferredPool(lat, lng, user, 100);
@@ -552,7 +587,14 @@ router.post("/next", async (req, res) => {
       action: e.action,
     }));
 
-    let wantIds = items.slice(0, Math.max(1, Number(limit))).map((x) => x.id);
+    // Start from a session-seeded order to avoid identical orderings across sessions
+    let wantIds = reorderWithSessionSeed(
+      items.slice(0, Math.max(1, Number(limit * 4))).map((x) => x.id),
+      sessionId,
+      prevSeenSet
+    ).slice(0, Math.max(1, Number(limit)));
+
+    // Try ranker – then apply our session-seeded demotion to break tie patterns & push prev-seen to end
     try {
       const r = await fetchFn(`${RECS_SERVICE_URL}/rank`, {
         method: "POST",
@@ -564,6 +606,7 @@ router.post("/next", async (req, res) => {
               `uband:${priceBandFromBudget(user.budgetMax ?? null)}`,
               ...(user.preferredCuisines || []).map((c) => `ucuisine:${c}`),
               ...(user.dietaryNeeds || []).map((d) => `ureq:${d}`),
+              `sess:${sessionId}`,
             ],
           },
           items,
@@ -574,12 +617,18 @@ router.post("/next", async (req, res) => {
         const ranked = await r.json();
         const candidateSet = new Set(finalPool.map((x) => x.id));
         const safe = (ranked.rankings || []).filter((id) => candidateSet.has(id));
-        wantIds = (safe.length ? safe : wantIds).slice(0, Math.max(1, Number(limit)));
+        // Apply session-seeded reordering + demotion of prev-seen on top of ranker output
+        wantIds = reorderWithSessionSeed(
+          (safe.length ? safe : wantIds).slice(0, Math.max(1, Number(limit * 4))),
+          sessionId,
+          prevSeenSet
+        ).slice(0, Math.max(1, Number(limit)));
       }
     } catch {
       // best-effort
     }
 
+    // Load full rows (maintaining wantIds order)
     let full = await prisma.restaurant.findMany({
       where: { id: { in: wantIds } },
       include: { photos: { take: 1 } },
@@ -621,13 +670,13 @@ router.post("/next", async (req, res) => {
         editorialSummary: r.editorialSummary || null,
         editorial_summary: r.editorialSummary || null, // alias for older clients
         // expose booleans for client badges (pet/veg)
-        servesVegetarianFood: r.servesVegetarianFood ?? null,
-        allowsDogs: r.allowsDogs ?? null,
+        servesVegetarian: r.servesVegetarian ?? null, // <- aligns with DB serves_vegetarian
+        allowsDogs: r.allowsDogs ?? null,            // <- aligns with DB allows_dogs
       };
     });
 
     console.log(
-      `[recs/next] user=${user.id} nearby=${pool.length} pref=${prefPool.length} cand=${candidates.length} excl=${exclude.size} returned=${clientItems.length}`
+      `[recs/next] user=${user.id} nearby=${pool.length} pref=${prefPool.length} cand=${candidates.length} prevSeen=${prevSeenSet.size} returned=${clientItems.length}`
     );
 
     res.json({ items: clientItems });
