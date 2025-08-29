@@ -1,6 +1,6 @@
 // routes/recs.js
-// Router focused on HTTP orchestration. Business logic for Places ingest/backfill
-// lives in services/placesService. Geo/price helpers live in utils so multiple modules share them.
+// HTTP orchestration for recs. Places ingest/backfill in services/placesService.
+// Geo/price helpers live in utils.
 
 const express = require("express");
 const prisma = require("../src/prisma");
@@ -23,7 +23,7 @@ const router = express.Router();
 router.get("/__ping", (_req, res) => res.json({ ok: true, via: "recs", ts: Date.now() }));
 router.get("/health", (_req, res) => res.json({ ok: true }));
 
-// Configuration pulled once at boot to avoid re-reading env on every request.
+// Configuration pulled once at boot
 const RECS_SERVICE_URL =
   process.env.RECS_SERVICE_URL || process.env.RECS_URL || "http://127.0.0.1:8000";
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
@@ -40,10 +40,9 @@ console.log("[recs] BOOT", {
   EARLY_END_ON_SUPERSTAR,
 });
 
-// Initializes the Places service with its dependencies. This allows swapping/mocking in tests.
 const places = createPlacesService({ prisma, googleApiKey: GOOGLE_API_KEY });
 
-// Mount photo proxy
+// Mount the photo proxy: client calls /api/recs/photo
 router.use(photoProxyRouter);
 
 /* ───────────────────────── Router-local helpers ───────────────────────── */
@@ -51,6 +50,7 @@ router.use(photoProxyRouter);
 const norm = (s) => String(s || "").toLowerCase().replace(/[_\s-]+/g, " ").trim();
 const lc = (s) => String(s || "").toLowerCase();
 
+// Cuisine keyword map (primaryType, types, display name, and name are checked)
 const CUISINE_KEYWORDS = {
   indian: ["indian"],
   chinese: ["chinese", "szechuan", "sichuan", "cantonese", "hunan"],
@@ -69,8 +69,9 @@ const CUISINE_KEYWORDS = {
   turkish: ["turkish"],
   lebanese: ["lebanese"],
   persian: ["persian", "iranian"],
+  // Fast Food — match the word "fast" anywhere across primary/type/display/name.
   "fast food": ["fast"],
-  fastfood: ["fast"],
+  fastfood: ["fast"], // tolerate legacy key
 };
 
 function cuisineKeywordsFromUser(user) {
@@ -82,20 +83,21 @@ function cuisineKeywordsFromUser(user) {
   return out;
 }
 
-// NOW also scans the restaurant name explicitly
+// Explicitly checks primaryType, types[], primaryTypeDisplayName, AND name
 function restaurantMatchesCuisine(r, keywordSet) {
   if (!keywordSet || !keywordSet.size) return true;
+
   const primary = lc(r.primaryType);
   const types = Array.isArray(r.types) ? r.types.map((t) => lc(String(t))) : [];
   const display = lc(r.primaryTypeDisplayName);
   const name = lc(r.name);
 
   for (const k of keywordSet) {
-    const needle = k.replace(/\s+/g, "_");
+    const needle = k.replace(/\s+/g, "_"); // e.g., "middle eastern" -> "middle_eastern"
     if (primary.includes(needle)) return true;
     if (types.some((t) => t.includes(needle))) return true;
     if (display.includes(k)) return true;
-    if (name.includes(k)) return true; // 👈 explicit name scan
+    if (name.includes(k)) return true; // 👈 name scan
   }
   return false;
 }
@@ -109,16 +111,24 @@ function priceBandFromBudget(budgetMax) {
 }
 
 function radiusFromUser(user) {
-  if (user?.searchDistance === null) return 50;
+  if (user?.searchDistance === null) return 50; // “Unlimited” → reasonable cap
   if (typeof user?.searchDistance === "number" && user.searchDistance > 0) return user.searchDistance;
-  return 15;
+  return 15; // default
 }
 
 function textIncludesAny(r, needles) {
-  const fields = [lc(r.name), lc(r.primaryTypeDisplayName), lc(r.editorialSummary)].filter(Boolean);
+  const fields = [
+    lc(r.name),
+    lc(r.primaryTypeDisplayName),
+    lc(r.editorialSummary),
+    lc(r.editorial_summary),
+    ...(Array.isArray(r.types) ? r.types.map(lc) : []),
+  ].filter(Boolean);
   return needles.some((n) => fields.some((f) => f.includes(n)));
 }
 
+// Requirements from UI’s “dietaryNeeds” (Requirements)
+// Expected values: "Vegetarian", "Pet Friendly", "Parking"
 function requirementsFromUser(user) {
   const needs = new Set((user?.dietaryNeeds || []).map((x) => norm(x)));
   return {
@@ -128,45 +138,47 @@ function requirementsFromUser(user) {
   };
 }
 
+// Strict requirement checks (NEVER relaxed)
 function restaurantMeetsRequirements(r, req) {
-  let ok = true;
-
+  // Vegetarian
   if (req.vegetarian) {
-    const hasField = r.servesVegetarian === true; // DB serves_vegetarian -> prisma servesVegetarian
+    const hasField =
+      r.servesVegetarian === true || r.servesVegetarianFood === true || r.serves_vegetarian === true;
     const hasType = Array.isArray(r.types) && r.types.map(lc).includes("vegetarian_restaurant");
     const hasText = textIncludesAny(r, ["vegetarian", "vegan"]);
-    ok = ok && (hasField || hasType || hasText);
+    if (!(hasField || hasType || hasText)) return false;
   }
 
+  // Pet friendly
   if (req.petFriendly) {
-    const hasField = r.allowsDogs === true; // DB allows_dogs -> prisma allowsDogs
+    const hasField = r.allowsDogs === true || r.allows_dogs === true;
     const hasText = textIncludesAny(r, ["dog friendly", "pet friendly", "dogs welcome"]);
-    ok = ok && (hasField || hasText);
+    if (!(hasField || hasText)) return false;
   }
 
+  // Parking
   if (req.parking) {
     const hasStructured =
       r.parkingOptions && typeof r.parkingOptions === "object"
         ? Object.values(r.parkingOptions).some(Boolean)
-        : !!r.parkingOptions;
+        : !!r.parkingOptions || r.hasParking === true;
     const hasText = textIncludesAny(r, ["parking", "car park", "parking lot"]);
-    ok = ok && (hasStructured || hasText);
+    if (!(hasStructured || hasText)) return false;
   }
 
-  return ok;
+  return true;
 }
 
 /**
- * Preference filter:
- * 1) Enforce requirements first (hard filter).
- * 2) Within those, prefer cuisine matches by distance; then nearest non-cuisine (still meeting requirements).
- * 3) If still short, relax requirements (cuisine first, then nearest).
- * Always respects the user's radius (km).
+ * STRICT Preference filter:
+ * 1) Hard filter by REQUIREMENTS (if any).
+ * 2) Within those, list CUISINE matches by distance first.
+ * 3) Then fill with the nearest (still meeting requirements).
+ * Never returns items that violate requirements.
  */
 function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60, radiusKm = 15) {
   const keys = cuisineKeywordsFromUser(user);
   const req = requirementsFromUser(user);
-  const hasAnyReq = req.vegetarian || req.petFriendly || req.parking;
 
   const here = { lat, lng };
   const withDist = pool.map((r) => ({
@@ -174,112 +186,25 @@ function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60,
     d: haversineKm(here, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }),
   }));
 
+  // Respect radius
   const within = Number.isFinite(radiusKm) ? withDist.filter((x) => x.d <= radiusKm) : withDist;
 
-  const byCuisine = (rows) =>
-    rows
-      .filter(({ r }) => restaurantMatchesCuisine(r, keys))
-      .sort((a, b) => a.d - b.d)
-      .map((x) => x.r);
+  // STRICT: filter by requirements (or pass-through if none selected)
+  const reqRows = (req.vegetarian || req.petFriendly || req.parking)
+    ? within.filter(({ r }) => restaurantMeetsRequirements(r, req))
+    : within;
 
-  const byNearest = (rows) => rows.sort((a, b) => a.d - b.d).map((x) => x.r);
+  // Prefer cuisine matches
+  const cuisineRows = reqRows.filter(({ r }) => restaurantMatchesCuisine(r, keys));
+  const nonCuisineRows = reqRows.filter(({ r }) => !restaurantMatchesCuisine(r, keys));
 
-  const reqRows = hasAnyReq ? within.filter(({ r }) => restaurantMeetsRequirements(r, req)) : within;
-  const nonReqRows = hasAnyReq ? within.filter(({ r }) => !restaurantMeetsRequirements(r, req)) : [];
+  const sortedCuisine = cuisineRows.sort((a, b) => a.d - b.d).map((x) => x.r);
+  const sortedNearest = nonCuisineRows.sort((a, b) => a.d - b.d).map((x) => x.r);
 
-  let merged = [];
+  const merged = [...sortedCuisine, ...sortedNearest];
 
-  // Fill from requirement-compliant rows first (cuisine-pref)
-  const reqCuisine = byCuisine(reqRows);
-  merged.push(...reqCuisine);
-
-  if (merged.length < desiredMin) {
-    const reqNearest = byNearest(reqRows).filter((r) => !merged.includes(r));
-    merged.push(...reqNearest);
-  }
-
-  // Relax requirements if still short (cuisine first, then nearest)
-  if (merged.length < desiredMin && nonReqRows.length) {
-    const nonReqCuisine = byCuisine(nonReqRows).filter((r) => !merged.includes(r));
-    merged.push(...nonReqCuisine);
-    if (merged.length < desiredMin) {
-      const nonReqNearest = byNearest(nonReqRows).filter((r) => !merged.includes(r));
-      merged.push(...nonReqNearest);
-    }
-  }
-
-  if (!merged.length) merged = byNearest(within);
-
-  return merged.slice(0, Math.max(desiredMin, 1));
-}
-
-/* ─────────── Targeted discovery when requirement-matches are scarce ─────────── */
-
-function cuisineQueriesFromUser(user) {
-  const keys = Array.from(cuisineKeywordsFromUser(user));
-  // Turn needles into “X restaurant” queries
-  const labels = [];
-  for (const k of keys) {
-    if (k === "fast") {
-      labels.push("fast food restaurant");
-    } else {
-      labels.push(`${k} restaurant`);
-    }
-  }
-  return labels;
-}
-
-// This uses places.googlePlacesSearchText (added in placesService) to fetch
-// extra candidates specifically for Requirements/cuisines, then upserts them.
-async function targetedRequirementDiscovery(lat, lng, user, radiusKm) {
-  const req = requirementsFromUser(user);
-  const queries = new Set();
-
-  // Cuisine-specific
-  for (const q of cuisineQueriesFromUser(user)) queries.add(q);
-
-  // Requirements-specific
-  if (req.vegetarian) {
-    queries.add("vegetarian restaurant");
-    queries.add("vegan restaurant");
-  }
-  if (req.petFriendly) {
-    queries.add("dog friendly restaurant");
-    queries.add("pet friendly restaurant");
-  }
-  if (req.parking) {
-    queries.add("restaurant parking");
-    queries.add("car park restaurant");
-  }
-
-  if (queries.size === 0) return { discovered: 0, created: 0 };
-
-  // Bias radius to user radius (cap 20km for sanity)
-  const radiusMeters = Math.max(1500, Math.min(20000, Math.round((radiusKm || 8) * 1000)));
-
-  const batches = [];
-  for (const textQuery of queries) {
-    // limit the number of queries to avoid quota burn
-    if (batches.length >= 12) break;
-    batches.push(places.googlePlacesSearchText(textQuery, {
-      latitude: lat,
-      longitude: lng,
-      radiusMeters,
-      maxResults: 20,
-    }));
-  }
-
-  const results = (await Promise.allSettled(batches))
-    .flatMap((p) => (p.status === "fulfilled" ? p.value || [] : []));
-  const byId = new Map();
-  for (const p of results) if (p?.id && !byId.has(p.id)) byId.set(p.id, p);
-
-  const unique = Array.from(byId.values());
-  if (!unique.length) return { discovered: 0, created: 0 };
-
-  const created = await places.upsertPlacesBatch(unique);
-  console.log(`[recs] targeted discovery: queries=${queries.size} fetched=${unique.length} new=${created}`);
-  return { discovered: unique.length, created };
+  // Return ONLY requirement-compliant items; no relaxation.
+  return merged.slice(0, Math.max(1, desiredMin));
 }
 
 /* ─────────── Discovery helpers (router-level, integrate with places service) ─────────── */
@@ -307,7 +232,7 @@ function generateRingCenters(lat, lng, minKm = 2, maxKm = 12, stepKm = 2) {
         lon1 +
         Math.atan2(
           Math.sin(bearing) * Math.sin(angDist) * Math.cos(lat1),
-          Math.cos(angDist) - Math.sin(lat1) * Math.sin(lat2)
+          Math.cos(angdist) - Math.sin(lat1) * Math.sin(lat2)
         );
       centers.push({ lat: toDeg(lat2), lng: toDeg(lon2) });
     }
@@ -355,82 +280,40 @@ async function discoverAndIngestAround(
 }
 
 /**
- * Ensures a preference-matched pool of size >= desiredMin.
- * If local DB doesn't have enough matches, performs discovery (generic + targeted for requirements),
- * then refreshes and re-filters.
+ * Ensures a preference-matched pool (STRICT requirements).
+ * We may do discovery to enlarge the pool, but we still hard-filter by requirements afterwards.
  */
 async function ensurePreferredPool(lat, lng, user, desiredMin = 60) {
   const radiusKm = radiusFromUser(user);
-  const req = requirementsFromUser(user);
 
   // Step 1: DB-first pool near the user
   const dbPool = await places.ensureNearbyRestaurants(
-    lat,
-    lng,
-    Math.max(desiredMin, 100),
-    radiusKm
+    lat, lng, Math.max(desiredMin, 120), radiusKm
   );
-  let filtered = filterAndPrioritizeByPreferences(
-    dbPool,
-    user,
-    lat,
-    lng,
-    desiredMin,
-    radiusKm
-  );
-
-  // If we already have enough, done.
+  let filtered = filterAndPrioritizeByPreferences(dbPool, user, lat, lng, desiredMin, radiusKm);
   if (filtered.length >= desiredMin) return filtered;
 
-  // Step 2a: If requirements were set and compliant rows are scarce, try targeted text discovery first.
-  const hasAnyReq = req.vegetarian || req.petFriendly || req.parking;
-  if (hasAnyReq) {
-    await targetedRequirementDiscovery(lat, lng, user, radiusKm);
-  }
-
-  // Step 2b: Generic discovery around the area (POPULARITY + DISTANCE; restaurant-only)
+  // Step 2: Discover more around the area (restaurant-only)
   await discoverAndIngestAround(lat, lng, {
     cellRadiusMeters: Math.round(radiusKm * 1000) || 3000,
     rankPrefs: ["POPULARITY", "DISTANCE"],
     includeTypes: [["restaurant"]],
   });
 
-  // Step 3: Refresh pool and re-filter
+  // Step 3: Refresh and filter again (still STRICT)
   const refreshed = await places.ensureNearbyRestaurants(
-    lat,
-    lng,
-    Math.max(desiredMin, 120),
-    radiusKm
+    lat, lng, Math.max(desiredMin, 150), radiusKm
   );
-  filtered = filterAndPrioritizeByPreferences(
-    refreshed,
-    user,
-    lat,
-    lng,
-    desiredMin,
-    radiusKm
-  );
-  if (filtered.length >= desiredMin) return filtered;
+  filtered = filterAndPrioritizeByPreferences(refreshed, user, lat, lng, desiredMin, radiusKm);
 
-  // Step 4 (optional): widen the net a bit
-  await discoverAndIngestAround(lat, lng, {
-    cellRadiusMeters: Math.round(radiusKm * 1000) || 3000,
-    rankPrefs: ["POPULARITY"],
-    includeTypes: [["cafe"], ["meal_takeaway"], ["meal_delivery"], ["bar"], ["food_court"]],
-  });
-
-  const finalPool = await places.ensureNearbyRestaurants(
-    lat,
-    lng,
-    Math.max(desiredMin, 140),
-    radiusKm
-  );
-  return filterAndPrioritizeByPreferences(finalPool, user, lat, lng, desiredMin, radiusKm);
+  // No relaxing of requirements—return whatever we have (may be < desiredMin).
+  return filtered;
 }
 
-/* ─────────────── Utilities to vary order across sessions ─────────────── */
+/* ─────────────── Session variety helpers ─────────────── */
 
 function hash32(str) {
+  // FNV-1a 32-bit
   let h = 0x811c9dc5;
   for (let i = 0; i < str.length; i++) {
     h ^= str.charCodeAt(i);
@@ -439,12 +322,12 @@ function hash32(str) {
   return h >>> 0;
 }
 function seededScore(id, sessionId) {
-  return hash32(String(id) + "|" + String(sessionId)) / 0x100000000;
+  return hash32(String(id) + "|" + String(sessionId)) / 0x100000000; // 0..1
 }
 function reorderWithSessionSeed(ids, sessionId, prevSeenSet) {
   const rows = ids.map((id) => ({
     id,
-    seen: prevSeenSet?.has(id) ? 1 : 0,
+    seen: prevSeenSet?.has(id) ? 1 : 0, // unseen first
     rnd: seededScore(id, sessionId),
   }));
   rows.sort((a, b) => (a.seen - b.seen) || (a.rnd - b.rnd));
@@ -453,7 +336,7 @@ function reorderWithSessionSeed(ids, sessionId, prevSeenSet) {
 
 /* ───────────────────────────── Routes ───────────────────────────── */
 
-// Resolve restaurant names (and a few fields) for a list of IDs
+// Resolve restaurant names (and a few fields) for a list of IDs (POST)
 router.post("/lookup", async (req, res) => {
   try {
     const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
@@ -476,7 +359,7 @@ router.post("/lookup", async (req, res) => {
       id: r.id,
       name: r.name,
       editorialSummary: r.editorialSummary || null,
-      editorial_summary: r.editorialSummary || null,
+      editorial_summary: r.editorialSummary || null, // legacy alias for clients
       address: r.formattedAddress,
       priceLevel: r.priceLevel ?? null,
       photoUrl: r.photos?.[0]?.name
@@ -491,9 +374,10 @@ router.post("/lookup", async (req, res) => {
   }
 });
 
+/* ───────────────────────── Everything below needs auth ───────────────────── */
 router.use(verifyFirebaseToken);
 
-// Start session
+// Start a swipe/recs session
 router.post("/start", async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -505,6 +389,7 @@ router.post("/start", async (req, res) => {
     const user = await prisma.user.findUnique({ where: { firebaseUid: uid } });
     if (!user) return res.status(404).json({ error: "User not found. Sync profile first." });
 
+    // Reuse the latest active session to preserve interaction context.
     let session = await prisma.swipeSession.findFirst({
       where: { userId: user.id, status: "active" },
       orderBy: { startedAt: "desc" },
@@ -514,12 +399,13 @@ router.post("/start", async (req, res) => {
       session = await prisma.swipeSession.create({ data: { userId: user.id } });
     }
 
+    // Ensure enough STRICT requirement-compliant items (discovery may run inside)
     const filteredPool = await ensurePreferredPool(lat, lng, user, Math.max(60, minPool));
     const pool = filteredPool;
 
-    console.log(`[recs/start] user=${user.id} pool=${pool.length} prefPool=${filteredPool.length}`);
+    console.log(`[recs/start] user=${user.id} pool=${pool.length} strictPool=${filteredPool.length}`);
 
-    // Warm ranker (best-effort)
+    // Warm the ranker (best-effort)
     try {
       const items = filteredPool.slice(0, 200).map((r) => {
         const dist = haversineKm(
@@ -541,7 +427,7 @@ router.post("/start", async (req, res) => {
       const userFeatures = [
         `uband:${priceBandFromBudget(user.budgetMax ?? null)}`,
         ...(user.preferredCuisines || []).map((c) => `ucuisine:${c}`),
-        ...(user.dietaryNeeds || []).map((d) => `ureq:${d}`),
+        ...(user.dietaryNeeds || []).map((d) => `ureq:${d}`), // strict requirements as features
         `sess:${session.id}`,
       ];
       fetchFn(`${RECS_SERVICE_URL}/rank`, {
@@ -562,7 +448,7 @@ router.post("/start", async (req, res) => {
   }
 });
 
-// Next cards – seeded reordering & prev-session demotion
+// Next cards – ranker optional, session-seeded order, prev-session demotion, STRICT requirements
 router.post("/next", async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -582,6 +468,7 @@ router.post("/next", async (req, res) => {
       return res.status(400).json({ error: "Invalid session" });
     }
 
+    // If session already completed, don't serve more items
     const currentSwipes = session.totalSwipes ?? session.events.length;
     if (session.status !== "active" || currentSwipes >= MAX_SWIPES_PER_SESSION) {
       if (session.status === "active" && currentSwipes >= MAX_SWIPES_PER_SESSION) {
@@ -593,7 +480,7 @@ router.post("/next", async (req, res) => {
       return res.json({ items: [], sessionCompleted: true });
     }
 
-    // Previous session -> demote previously seen (keep available)
+    // Previous session → demote its items to the end (not exclude)
     const prevSession = await prisma.swipeSession.findFirst({
       where: { userId: user.id, id: { not: sessionId }, endedAt: { not: null } },
       orderBy: { startedAt: "desc" },
@@ -601,19 +488,19 @@ router.post("/next", async (req, res) => {
     });
     const prevSeenSet = new Set((prevSession?.events || []).map((e) => e.restaurantId));
 
+    // STRICT requirement-compliant pool
     const prefPool = await ensurePreferredPool(lat, lng, user, 100);
+
+    // Raw pool (respect radius) only for logging/fallback if something goes wrong upstream
     const radiusKm = radiusFromUser(user);
     const pool = await places.ensureNearbyRestaurants(lat, lng, 100, radiusKm);
 
     const swipedIds = new Set(session.events.map((e) => e.restaurantId));
     const exclude = new Set(Array.isArray(excludeIds) ? excludeIds.filter(Boolean) : []);
 
-    const candidates = prefPool.filter((r) => !swipedIds.has(r.id) && !exclude.has(r.id));
-    const fallback = pool.filter((r) => !swipedIds.has(r.id) && !exclude.has(r.id));
-    const finalPool = candidates.length ? candidates : fallback;
-
+    const finalPool = prefPool.filter((r) => !swipedIds.has(r.id) && !exclude.has(r.id));
     if (!finalPool.length) {
-      console.log(`[recs/next] user=${user.id} cand=0 → returning empty`);
+      console.log(`[recs/next] user=${user.id} cand=0 (strict) → returning empty`);
       return res.json({ items: [] });
     }
 
@@ -641,14 +528,14 @@ router.post("/next", async (req, res) => {
       action: e.action,
     }));
 
-    // Session-seeded ordering (also demote prev-seen)
+    // Start from a session-seeded order (and demote prev-seen)
     let wantIds = reorderWithSessionSeed(
-      items.slice(0, Math.max(1, Number(limit * 4))).map((x) => x.id),
+      items.slice(0, Math.max(1, Number(limit) * 4)).map((x) => x.id),
       sessionId,
       prevSeenSet
     ).slice(0, Math.max(1, Number(limit)));
 
-    // Ranker (optional) + apply seeded reorder again for variety
+    // Try ranker; then re-apply session variety + demotion
     try {
       const r = await fetchFn(`${RECS_SERVICE_URL}/rank`, {
         method: "POST",
@@ -672,14 +559,14 @@ router.post("/next", async (req, res) => {
         const candidateSet = new Set(finalPool.map((x) => x.id));
         const safe = (ranked.rankings || []).filter((id) => candidateSet.has(id));
         wantIds = reorderWithSessionSeed(
-          (safe.length ? safe : wantIds).slice(0, Math.max(1, Number(limit * 4))),
+          (safe.length ? safe : wantIds).slice(0, Math.max(1, Number(limit) * 4)),
           sessionId,
           prevSeenSet
         ).slice(0, Math.max(1, Number(limit)));
       }
     } catch {}
 
-    // Hydrate to client shape
+    // Load rows (keep order)
     let full = await prisma.restaurant.findMany({
       where: { id: { in: wantIds } },
       include: { photos: { take: 1 } },
@@ -719,14 +606,15 @@ router.post("/next", async (req, res) => {
         primaryType: r.primaryType,
         types: r.types,
         editorialSummary: r.editorialSummary || null,
-        editorial_summary: r.editorialSummary || null,
-        servesVegetarian: r.servesVegetarian ?? null,
-        allowsDogs: r.allowsDogs ?? null,
+        editorial_summary: r.editorialSummary || null, // alias for older clients
+        // expose booleans for client badges
+        servesVegetarian: (r.servesVegetarian ?? r.servesVegetarianFood ?? r.serves_vegetarian) ?? null,
+        allowsDogs: (r.allowsDogs ?? r.allows_dogs) ?? null,
       };
     });
 
     console.log(
-      `[recs/next] user=${user.id} nearby=${pool.length} pref=${prefPool.length} returned=${clientItems.length}`
+      `[recs/next] user=${user.id} nearby=${pool.length} strictPref=${prefPool.length} cand=${finalPool.length} prevSeen=${prevSeenSet.size} returned=${clientItems.length}`
     );
 
     res.json({ items: clientItems });
@@ -736,12 +624,12 @@ router.post("/next", async (req, res) => {
   }
 });
 
-// Feedback / finalize / winner unchanged…
-
+// Feedback / finalize / winner
 router.post("/feedback", async (req, res) => {
   try {
     const uid = req.user.uid;
     let { sessionId, restaurantId, action } = req.body || {};
+
     action = String(action || "").toUpperCase();
     if (!sessionId || !restaurantId || !["LIKE", "PASS", "SUPERSTAR"].includes(action)) {
       return res.status(400).json({ error: "sessionId, restaurantId, action required" });
