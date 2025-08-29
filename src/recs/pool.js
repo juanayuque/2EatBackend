@@ -1,6 +1,7 @@
 // src/recs/pool.js
 const {
   filterAndPrioritizeByPreferences,
+  filterCuisineOnly,                 // <-- NEW import
   requirementsFromUser,
   radiusFromUser,
   cuisineKeywordsFromUser,
@@ -10,21 +11,22 @@ const { discoverAndIngestAround, buildBiasQueries } = require("./discovery");
 const { haversineKm, asFloat } = require("../utils/geo");
 
 // Only pass TRUE requirements to the DB layer.
-// If a requirement is false, we omit it so the DB doesn't filter on it.
 function activeDbReq(user) {
   const r = requirementsFromUser(user);
   const dbReq = {};
-  if (r.vegetarian) dbReq.vegetarian = true;
+  if (r.vegetarian)  dbReq.vegetarian  = true;
   if (r.petFriendly) dbReq.petFriendly = true;
-  if (r.parking) dbReq.parking = true;
+  if (r.parking)     dbReq.parking     = true;
   return Object.keys(dbReq).length ? dbReq : undefined;
 }
 
 // Ensures a preference-filtered pool of at least `desiredMin` items.
-// Expands radius progressively and triggers discovery when needed.
+// Strategy:
+//   1) STRICT pass (cuisine-only) over expansion radii (+ discovery as needed)
+//   2) If still short → FLEXIBLE pass (matches first, then nearest fill)
+//   3) Final wide pass (flexible) if still short
 async function ensurePreferredPool({ places, lat, lng, user, desiredMin = 60 }) {
   const baseRadius = radiusFromUser(user);
-  // Keep first pass at the user's chosen radius, then widen out.
   const expansion = Array.from(new Set([baseRadius, Math.max(baseRadius, 5), 10, 15, 20, 30, 50]));
 
   const reqRaw = requirementsFromUser(user);
@@ -46,121 +48,119 @@ async function ensurePreferredPool({ places, lat, lng, user, desiredMin = 60 }) 
   const acc = new Map();
   const kwSet = new Set(expandedCuisineKeywords);
 
+  // ─────────────────────── 1) STRICT PASS (cuisine-only) ───────────────────────
   for (const radiusKm of expansion) {
-    console.log(`\n[pool] ---- pass radiusKm=${radiusKm}km ----`);
-
-    // Pull a generous slice from DB (prefiltered only by TRUE requirements)
+    console.log(`\n[pool] (STRICT) ---- radiusKm=${radiusKm}km ----`);
     const dbPool = await places.ensureNearbyRestaurantsStrict(
-      lat,
-      lng,
-      Math.max(desiredMin, 200),
-      radiusKm,
-      reqDB
+      lat, lng, Math.max(desiredMin, 200), radiusKm, reqDB
     );
-    console.log(`[pool] radius=${radiusKm}km dbPool size=${dbPool.length}`);
+    console.log(`[pool] (STRICT) radius=${radiusKm}km dbPool size=${dbPool.length}`);
 
-    // Apply full preference filtering + prioritization (cuisine-first, then nearest)
-    const filtered = filterAndPrioritizeByPreferences(dbPool, user, lat, lng, desiredMin, radiusKm);
-    console.log(
-      `[pool] radius=${radiusKm}km filtered size=${filtered.length} (acc before=${acc.size})`
-    );
+    const want = Math.max(0, desiredMin - acc.size);
+    const strict = filterCuisineOnly(dbPool, user, lat, lng, want, radiusKm);
+    console.log(`[pool] (STRICT) radius=${radiusKm}km cuisineOnly size=${strict.length} (acc before=${acc.size})`);
 
-    // Log cuisine match details (sample up to 10) with distance
-    const hitRows = [];
-    for (const r of filtered) {
+    // Log match details (sample 10)
+    const hits = [];
+    for (const r of strict) {
       const d = findCuisineMatchDetail(r, kwSet);
       if (d) {
-        const km = haversineKm(
-          { lat, lng },
-          { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }
-        );
-        hitRows.push({
-          id: r.id,
-          name: r.name,
-          km: Number.isFinite(km) ? +km.toFixed(1) : null,
-          keyword: d.keyword,
-          where: d.where, // "primaryType" | "types" | "text"
-        });
+        const km = haversineKm({ lat, lng }, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) });
+        hits.push({ id: r.id, name: r.name, km: Number.isFinite(km) ? +km.toFixed(1) : null, keyword: d.keyword, where: d.where });
       }
     }
-    console.log(
-      `[pool] radius=${radiusKm}km cuisine hits ${hitRows.length}/${filtered.length} (sample 10):`,
-      hitRows.slice(0, 10)
-    );
+    console.log(`[pool] (STRICT) radius=${radiusKm}km cuisine hits ${hits.length}/${strict.length} (sample 10):`, hits.slice(0,10));
 
-    // De-dup across passes
-    for (const r of filtered) if (!acc.has(r.id)) acc.set(r.id, r);
-    console.log(`[pool] radius=${radiusKm}km acc after=${acc.size}`);
+    for (const r of strict) if (!acc.has(r.id)) acc.set(r.id, r);
+    console.log(`[pool] (STRICT) radius=${radiusKm}km acc after=${acc.size}`);
 
     if (acc.size >= desiredMin) {
-      console.log(
-        `[pool] ✅ target satisfied: desiredMin=${desiredMin} at radius=${radiusKm}km`
-      );
+      console.log(`[pool] ✅ satisfied via STRICT at radius=${radiusKm}km`);
       break;
     }
 
-    // Try discovery to enrich DB for next iterations (biased by prefs)
+    // Still short → try to enrich DB before next strict radius
     const discoveryRes = await discoverAndIngestAround(places, lat, lng, {
       cellRadiusMeters: Math.round(radiusKm * 1000) || 3000,
       rankPrefs: ["POPULARITY", "DISTANCE"],
       includeTypes: [["restaurant"]],
       biasQueries,
     });
-    console.log(`[pool] discovery at radius=${radiusKm}km →`, discoveryRes);
+    console.log(`[pool] (STRICT) discovery at radius=${radiusKm}km →`, discoveryRes);
   }
 
-  // Final wide pass if still short
+  if (acc.size >= desiredMin) {
+    const out = Array.from(acc.values()).slice(0, desiredMin);
+    console.log(`[pool] returning (STRICT-only) size=${out.length} (acc=${acc.size})\n`);
+    return out;
+  }
+
+  // ─────────────────────── 2) FLEXIBLE PASS (fallback) ───────────────────────
+  for (const radiusKm of expansion) {
+    console.log(`\n[pool] (FLEX) ---- radiusKm=${radiusKm}km ----`);
+    const dbPool = await places.ensureNearbyRestaurantsStrict(
+      lat, lng, Math.max(desiredMin, 200), radiusKm, reqDB
+    );
+    console.log(`[pool] (FLEX) radius=${radiusKm}km dbPool size=${dbPool.length}`);
+
+    const filtered = filterAndPrioritizeByPreferences(dbPool, user, lat, lng, desiredMin, radiusKm);
+    // Only take new items not already in acc
+    const newOnes = [];
+    for (const r of filtered) if (!acc.has(r.id)) newOnes.push(r);
+
+    console.log(`[pool] (FLEX) radius=${radiusKm}km candidates (new)=${newOnes.length} (acc before=${acc.size})`);
+
+    // Log: how many of these fallback items are cuisine matches
+    const hits = [];
+    for (const r of newOnes) {
+      const d = findCuisineMatchDetail(r, kwSet);
+      if (d) {
+        const km = haversineKm({ lat, lng }, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) });
+        hits.push({ id: r.id, name: r.name, km: Number.isFinite(km) ? +km.toFixed(1) : null, keyword: d.keyword, where: d.where });
+      }
+    }
+    console.log(`[pool] (FLEX) radius=${radiusKm}km cuisine matches among fallback ${hits.length}/${newOnes.length} (sample 10):`, hits.slice(0,10));
+
+    for (const r of newOnes) {
+      if (acc.size >= desiredMin) break;
+      acc.set(r.id, r);
+    }
+    console.log(`[pool] (FLEX) radius=${radiusKm}km acc after=${acc.size}`);
+
+    if (acc.size >= desiredMin) {
+      console.log(`[pool] ✅ satisfied via FLEX at radius=${radiusKm}km`);
+      break;
+    }
+  }
+
+  // ─────────────────────── 3) Final wide pass (flexible) ───────────────────────
   if (acc.size < desiredMin) {
     const lastRadius = expansion[expansion.length - 1];
-    console.log(
-      `\n[pool] final wide pass: radius=${lastRadius}km (acc=${acc.size} < desiredMin=${desiredMin})`
-    );
+    console.log(`\n[pool] final wide pass: radius=${lastRadius}km (acc=${acc.size} < desiredMin=${desiredMin})`);
 
     const finalPool = await places.ensureNearbyRestaurantsStrict(
-      lat,
-      lng,
-      Math.max(desiredMin, 240),
-      lastRadius,
-      reqDB
+      lat, lng, Math.max(desiredMin, 240), lastRadius, reqDB
     );
     console.log(`[pool] final pass dbPool size=${finalPool.length}`);
 
-    const filtered = filterAndPrioritizeByPreferences(
-      finalPool,
-      user,
-      lat,
-      lng,
-      desiredMin,
-      lastRadius
-    );
-    console.log(
-      `[pool] final pass filtered size=${filtered.length} (acc before=${acc.size})`
-    );
+    const filtered = filterAndPrioritizeByPreferences(finalPool, user, lat, lng, desiredMin, lastRadius);
+    const newOnes = filtered.filter((r) => !acc.has(r.id));
+    console.log(`[pool] final pass new candidates=${newOnes.length} (acc before=${acc.size})`);
 
-    // Log cuisine match details on final pass too (sample up to 10)
-    const hitRows = [];
-    for (const r of filtered) {
+    const hits = [];
+    for (const r of newOnes) {
       const d = findCuisineMatchDetail(r, kwSet);
       if (d) {
-        const km = haversineKm(
-          { lat, lng },
-          { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }
-        );
-        hitRows.push({
-          id: r.id,
-          name: r.name,
-          km: Number.isFinite(km) ? +km.toFixed(1) : null,
-          keyword: d.keyword,
-          where: d.where,
-        });
+        const km = haversineKm({ lat, lng }, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) });
+        hits.push({ id: r.id, name: r.name, km: Number.isFinite(km) ? +km.toFixed(1) : null, keyword: d.keyword, where: d.where });
       }
     }
-    console.log(
-      `[pool] final pass cuisine hits ${hitRows.length}/${filtered.length} (sample 10):`,
-      hitRows.slice(0, 10)
-    );
+    console.log(`[pool] final pass cuisine matches among fallback ${hits.length}/${newOnes.length} (sample 10):`, hits.slice(0,10));
 
-    for (const r of filtered) if (!acc.has(r.id)) acc.set(r.id, r);
+    for (const r of newOnes) {
+      if (acc.size >= desiredMin) break;
+      acc.set(r.id, r);
+    }
     console.log(`[pool] final pass acc after=${acc.size}`);
   }
 

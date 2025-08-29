@@ -1,5 +1,5 @@
 // src/recs/filters.js
-const { haversineKm, distanceBand, asFloat } = require("../utils/geo");
+const { haversineKm, asFloat } = require("../utils/geo");
 
 // --- Normalizers -------------------------------------------------
 
@@ -48,6 +48,35 @@ function cuisineKeywordsFromUser(user) {
     (CUISINE_KEYWORDS[key] || [key]).forEach((k) => out.add(k));
   }
   return out;
+}
+/**
+ * STRICT cuisine-only filter:
+ * - applies requirements
+ * - keeps ONLY restaurants that match user's cuisine keywords
+ * - sorts by distance
+ * - returns up to desiredMin
+ */
+function filterCuisineOnly(pool, user, lat, lng, desiredMin = 60, radiusKm = 15) {
+  const keys = cuisineKeywordsFromUser(user); // Set
+  if (!keys || keys.size === 0) return []; // no cuisines selected → no strict results
+
+  const req = requirementsFromUser(user);
+  const here = { lat, lng };
+
+  const withDist = pool.map((r) => ({
+    r,
+    d: haversineKm(here, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }),
+  }));
+
+  const within = Number.isFinite(radiusKm) ? withDist.filter((x) => x.d <= radiusKm) : withDist;
+
+  const reqOk = within.filter(({ r }) => restaurantMeetsRequirements(r, req));
+  const cuisineOnly = reqOk
+    .filter(({ r }) => restaurantMatchesCuisine(r, keys))
+    .sort((a, b) => a.d - b.d)
+    .map((x) => x.r);
+
+  return cuisineOnly.slice(0, Math.max(1, desiredMin));
 }
 
 function requirementsFromUser(user) {
@@ -200,4 +229,5 @@ module.exports = {
   filterAndPrioritizeByPreferences,
   findCuisineMatchDetail,
   restaurantMatchesCuisine,
+  filterCuisineOnly, 
 };
