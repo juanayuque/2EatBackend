@@ -8,7 +8,11 @@ const { haversineKm, asFloat } = require("../utils/geo");
 // Use global fetch if present; otherwise dynamically import node-fetch (ESM) from CJS.
 const fetchFn =
   (typeof fetch === "function" && fetch) ||
-  ( (...args) => import("node-fetch").then(mod => mod.default(...args)) );
+  ((...args) => import("node-fetch").then((mod) => mod.default(...args)));
+
+// Backfill throttle (reduce log spam and upstream requests)
+let _lastBackfillAt = 0; // process-level throttle
+const BACKFILL_MIN_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 
 const PLACES_FIELD_MASK = [
   "places.id",
@@ -38,11 +42,7 @@ function mapPlaceToRestaurantCreate(place) {
   const priceLevel = normalizePriceLevel(place.priceLevel);
   const ptdnRaw = place.primaryTypeDisplayName;
   const ptdn =
-    typeof ptdnRaw === "string"
-      ? ptdnRaw
-      : (ptdnRaw && ptdnRaw.text)
-      ? ptdnRaw.text
-      : null;
+    typeof ptdnRaw === "string" ? ptdnRaw : ptdnRaw && ptdnRaw.text ? ptdnRaw.text : null;
 
   return {
     restaurant: {
@@ -208,7 +208,7 @@ function createPlacesService({ prisma, googleApiKey }) {
         const ptdn =
           typeof ptdnRaw === "string"
             ? ptdnRaw
-            : (ptdnRaw && ptdnRaw.text)
+            : ptdnRaw && ptdnRaw.text
             ? ptdnRaw.text
             : r.primaryTypeDisplayName || null;
 
@@ -227,7 +227,7 @@ function createPlacesService({ prisma, googleApiKey }) {
     }
   }
 
-  async function ensureNearbyRestaurants(lat, lng, minCount = 100) {
+  async function ensureNearbyRestaurants(lat, lng, minCount = 100, radiusKm = 15) {
     const here = { lat, lng };
 
     const all = await prisma.restaurant.findMany({
@@ -240,19 +240,23 @@ function createPlacesService({ prisma, googleApiKey }) {
         r,
         d: haversineKm(here, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }),
       }))
-      .filter((x) => Number.isFinite(x.d) && x.d <= 15)
+      .filter((x) => Number.isFinite(x.d) && x.d <= radiusKm)
       .sort((a, b) => a.d - b.d)
       .map((x) => x.r);
 
     if (nearby.length < minCount && hasKey) {
       console.log(`[placesService] nearby=${nearby.length} < ${minCount} → ingesting Places…`);
+
+      // scale API radius to roughly the user radius (with a small buffer)
+      const radiusMeters = Math.max(2000, Math.min(20000, Math.round(radiusKm * 1000 * 1.2)));
+
       const popular = await googlePlacesSearchNearby(lat, lng, {
-        radiusMeters: 10000,
+        radiusMeters,
         maxPages: 3,
         rankPreference: "POPULARITY",
       });
       const distance = await googlePlacesSearchNearby(lat, lng, {
-        radiusMeters: 10000,
+        radiusMeters,
         maxPages: 3,
         rankPreference: "DISTANCE",
       });
@@ -272,14 +276,20 @@ function createPlacesService({ prisma, googleApiKey }) {
             r,
             d: haversineKm(here, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }),
           }))
-          .filter((x) => Number.isFinite(x.d) && x.d <= 15)
+          .filter((x) => Number.isFinite(x.d) && x.d <= radiusKm)
           .sort((a, b) => a.d - b.d)
           .map((x) => x.r);
       }
     }
 
-    backfillMissingPlaceMetadata(nearby).catch(() => {});
-    console.log(`[placesService] ensureNearby: ${nearby.length} within 15km`);
+    // throttle backfill to reduce spam/work
+    const now = Date.now();
+    if (now - _lastBackfillAt >= BACKFILL_MIN_INTERVAL_MS) {
+      _lastBackfillAt = now;
+      backfillMissingPlaceMetadata(nearby).catch(() => {});
+    }
+
+    console.log(`[placesService] ensureNearby: ${nearby.length} within ${radiusKm}km`);
     return nearby;
   }
 

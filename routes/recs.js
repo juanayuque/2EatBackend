@@ -11,6 +11,11 @@ const { createPlacesService } = require("../src/services/placesService");
 const { haversineKm, distanceBand, asFloat } = require("../src/utils/geo");
 const { normalizePriceLevel, mapPriceLevelEnum } = require("../src/utils/price");
 
+// Use global fetch if present; otherwise dynamically import node-fetch (ESM) from CJS for ranker calls.
+const fetchFn =
+  (typeof fetch === "function" && fetch) ||
+  ((...args) => import("node-fetch").then((mod) => mod.default(...args)));
+
 const router = express.Router();
 
 /* ───────────────────────── Public routes (no auth) ───────────────────────── */
@@ -24,10 +29,15 @@ const RECS_SERVICE_URL =
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL || "https://2eatapp.com";
 
+const MAX_SWIPES_PER_SESSION = Number(process.env.MAX_SWIPES_PER_SESSION || 15);
+const EARLY_END_ON_SUPERSTAR = process.env.END_ON_SUPERSTAR === "1";
+
 console.log("[recs] BOOT", {
   HAS_GOOGLE_API_KEY: !!GOOGLE_API_KEY,
   RECS_SERVICE_URL,
   BACKEND_PUBLIC_URL,
+  MAX_SWIPES_PER_SESSION,
+  EARLY_END_ON_SUPERSTAR,
 });
 
 // Initializes the Places service with its dependencies. This allows swapping/mocking in tests.
@@ -37,11 +47,6 @@ const places = createPlacesService({ prisma, googleApiKey: GOOGLE_API_KEY });
 router.use(photoProxyRouter);
 
 // ---------- helpers kept local to this router ----------
-
-// Google Places v1 -> our DB int (1..4). Kept for legacy imports relying on this file.
-function mapPriceLevelEnumLocal(v) {
-  return mapPriceLevelEnum(v);
-}
 
 // Cuisine preference matching is kept here since it is app-specific (not Places-specific).
 const CUISINE_KEYWORDS = {
@@ -67,7 +72,6 @@ const CUISINE_KEYWORDS = {
 const norm = (s) => String(s || "").toLowerCase().replace(/[_\s-]+/g, " ").trim();
 
 function cuisineKeywordsFromUser(user) {
-  // Builds a normalized set of keywords to avoid repeated lookups and ensure case-insensitive matching.
   const out = new Set();
   for (const p of user?.preferredCuisines || []) {
     const key = norm(p);
@@ -77,7 +81,6 @@ function cuisineKeywordsFromUser(user) {
 }
 
 function restaurantMatchesCuisine(r, keywordSet) {
-  // Early return improves performance when no preferences were set.
   if (!keywordSet || !keywordSet.size) return true;
 
   const primary = (r.primaryType || "").toLowerCase();
@@ -94,7 +97,6 @@ function restaurantMatchesCuisine(r, keywordSet) {
 }
 
 function priceBandFromBudget(budgetMax) {
-  // Maps user budget to coarse price tiers that the ranker understands.
   if (budgetMax == null) return 0;
   if (budgetMax <= 15) return 1;
   if (budgetMax <= 30) return 2;
@@ -102,11 +104,17 @@ function priceBandFromBudget(budgetMax) {
   return 4;
 }
 
+function radiusFromUser(user) {
+  if (user?.searchDistance === null) return 50; // “Unlimited” → cap reasonably
+  if (typeof user?.searchDistance === "number" && user.searchDistance > 0) return user.searchDistance;
+  return 15; // default
+}
+
 /**
- * Original preference filter: returns nearest matches, then pads with nearest non-matches
- * until desiredMin is reached. If still short, the caller may choose to discover more.
+ * Preference filter: returns nearest matches within radius, then pads with nearest non-matches
+ * until desiredMin is reached.
  */
-function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60) {
+function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60, radiusKm = 15) {
   const keys = cuisineKeywordsFromUser(user);
   const here = { lat, lng };
 
@@ -115,14 +123,16 @@ function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60)
     d: haversineKm(here, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }),
   }));
 
-  const matches = withDist
+  // Respect user radius
+  const within = Number.isFinite(radiusKm) ? withDist.filter((x) => x.d <= radiusKm) : withDist;
+
+  const matches = within
     .filter(({ r }) => restaurantMatchesCuisine(r, keys))
     .sort((a, b) => a.d - b.d);
 
   if (matches.length >= desiredMin) return matches.map((x) => x.r);
 
-  // If not enough matches, fills with nearest non-matching options to satisfy pool size.
-  const non = withDist
+  const non = within
     .filter(({ r }) => !restaurantMatchesCuisine(r, keys))
     .sort((a, b) => a.d - b.d);
 
@@ -131,7 +141,7 @@ function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60)
     if (merged.length >= desiredMin) break;
     merged.push(n.r);
   }
-  return merged.length ? merged : pool;
+  return merged.length ? merged : within.map((x) => x.r);
 }
 
 // ---- discovery helpers (router-level, integrates with places service) ----
@@ -178,8 +188,6 @@ async function discoverAndIngestAround(
     delayMs = 120, // polite pause between calls
   } = {}
 ) {
-  // Sweeps a ring of centers, queries Places with multiple rank preferences and types,
-  // dedupes by id, and upserts only new places.
   const centers = generateRingCenters(lat, lng, 2, 12, 2).slice(0, maxCenters);
   const byId = new Map();
 
@@ -213,25 +221,29 @@ async function discoverAndIngestAround(
  * If local DB doesn't have enough matches, performs a discovery sweep then refreshes.
  */
 async function ensurePreferredPool(lat, lng, user, desiredMin = 60) {
+  const radiusKm = radiusFromUser(user);
+
   // Step 1: DB-first pool near the user
   const dbPool = await places.ensureNearbyRestaurants(
     lat,
     lng,
-    Math.max(desiredMin, 100)
+    Math.max(desiredMin, 100),
+    radiusKm
   );
   let filtered = filterAndPrioritizeByPreferences(
     dbPool,
     user,
     lat,
     lng,
-    desiredMin
+    desiredMin,
+    radiusKm
   );
 
   if (filtered.length >= desiredMin) return filtered;
 
   // Step 2: Discover more around the area (POPULARITY + DISTANCE; restaurant-only)
   await discoverAndIngestAround(lat, lng, {
-    cellRadiusMeters: 3000,
+    cellRadiusMeters: Math.round(radiusKm * 1000) || 3000,
     rankPrefs: ["POPULARITY", "DISTANCE"],
     includeTypes: [["restaurant"]],
   });
@@ -240,36 +252,33 @@ async function ensurePreferredPool(lat, lng, user, desiredMin = 60) {
   const refreshed = await places.ensureNearbyRestaurants(
     lat,
     lng,
-    Math.max(desiredMin, 100)
+    Math.max(desiredMin, 100),
+    radiusKm
   );
   filtered = filterAndPrioritizeByPreferences(
     refreshed,
     user,
     lat,
     lng,
-    desiredMin
+    desiredMin,
+    radiusKm
   );
   if (filtered.length >= desiredMin) return filtered;
 
   // Step 4 (optional): try adjacent food types to widen the net a bit
   await discoverAndIngestAround(lat, lng, {
-    cellRadiusMeters: 3000,
+    cellRadiusMeters: Math.round(radiusKm * 1000) || 3000,
     rankPrefs: ["POPULARITY"],
-    includeTypes: [
-      ["cafe"],
-      ["meal_takeaway"],
-      ["meal_delivery"],
-      ["bar"],
-      ["food_court"],
-    ],
+    includeTypes: [["cafe"], ["meal_takeaway"], ["meal_delivery"], ["bar"], ["food_court"]],
   });
 
   const finalPool = await places.ensureNearbyRestaurants(
     lat,
     lng,
-    Math.max(desiredMin, 120)
+    Math.max(desiredMin, 120),
+    radiusKm
   );
-  return filterAndPrioritizeByPreferences(finalPool, user, lat, lng, desiredMin);
+  return filterAndPrioritizeByPreferences(finalPool, user, lat, lng, desiredMin, radiusKm);
 }
 
 // ---------- routes ----------
@@ -329,7 +338,7 @@ router.post("/start", async (req, res) => {
     const user = await prisma.user.findUnique({ where: { firebaseUid: uid } });
     if (!user) return res.status(404).json({ error: "User not found. Sync profile first." });
 
-    // Reuses the latest active session to preserve interaction context across calls.
+    // Reuse the latest active session to preserve interaction context.
     let session = await prisma.swipeSession.findFirst({
       where: { userId: user.id, status: "active" },
       orderBy: { startedAt: "desc" },
@@ -339,7 +348,7 @@ router.post("/start", async (req, res) => {
       session = await prisma.swipeSession.create({ data: { userId: user.id } });
     }
 
-    // Ensure we have enough preference-matched items; this will trigger discovery if needed.
+    // Ensure enough preference-matched items; this will trigger discovery if needed.
     const filteredPool = await ensurePreferredPool(lat, lng, user, Math.max(60, minPool));
     const pool = filteredPool; // for logging parity below
 
@@ -347,7 +356,7 @@ router.post("/start", async (req, res) => {
       `[recs/start] user=${user.id} pool=${pool.length} prefPool=${filteredPool.length}`
     );
 
-    // Warms the ranker with a batch of items. Failures are ignored to keep the endpoint responsive.
+    // Warm the ranker (best-effort)
     try {
       const items = filteredPool.slice(0, 200).map((r) => {
         const dist = haversineKm(
@@ -371,7 +380,7 @@ router.post("/start", async (req, res) => {
         ...(user.preferredCuisines || []).map((c) => `ucuisine:${c}`),
         ...(user.dietaryNeeds || []).map((d) => `udiet:${d}`),
       ];
-      fetch(`${RECS_SERVICE_URL}/rank`, {
+      fetchFn(`${RECS_SERVICE_URL}/rank`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -403,18 +412,32 @@ router.post("/next", async (req, res) => {
     const user = await prisma.user.findUnique({ where: { firebaseUid: uid } });
     if (!user) return res.status(404).json({ error: "User not found" });
 
-    const session = await prisma.swipeSession.findUnique({
+    let session = await prisma.swipeSession.findUnique({
       where: { id: sessionId },
       include: { events: true },
     });
-    if (!session || session.userId !== user.id || session.status !== "active") {
+
+    if (!session || session.userId !== user.id) {
       return res.status(400).json({ error: "Invalid session" });
+    }
+
+    // If session already completed, don't serve more items
+    const currentSwipes = session.totalSwipes ?? session.events.length;
+    if (session.status !== "active" || currentSwipes >= MAX_SWIPES_PER_SESSION) {
+      if (session.status === "active" && currentSwipes >= MAX_SWIPES_PER_SESSION) {
+        await prisma.swipeSession.update({
+          where: { id: sessionId },
+          data: { status: "completed", endedAt: new Date() },
+        });
+      }
+      return res.json({ items: [], sessionCompleted: true });
     }
 
     // Ensure we have enough preference-matched candidates; triggers discovery if needed.
     const prefPool = await ensurePreferredPool(lat, lng, user, 100);
-    // (Optional) raw pool for logging only
-    const pool = await places.ensureNearbyRestaurants(lat, lng, 100);
+    // (Optional) raw pool for logging only (respect radius)
+    const radiusKm = radiusFromUser(user);
+    const pool = await places.ensureNearbyRestaurants(lat, lng, 100, radiusKm);
 
     const swipedIds = new Set(session.events.map((e) => e.restaurantId));
     const candidates = prefPool.filter((r) => !swipedIds.has(r.id));
@@ -451,7 +474,7 @@ router.post("/next", async (req, res) => {
 
     let wantIds = items.slice(0, Math.max(1, Number(limit))).map((x) => x.id);
     try {
-      const r = await fetch(`${RECS_SERVICE_URL}/rank`, {
+      const r = await fetchFn(`${RECS_SERVICE_URL}/rank`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -552,29 +575,35 @@ router.post("/feedback", async (req, res) => {
     }
 
     const position = session.events.length + 1;
+    let sessionCompleted = false;
 
     await prisma.$transaction(async (tx) => {
       await tx.swipeEvent.create({
         data: { sessionId, userId: user.id, restaurantId, action, position },
       });
-      await tx.swipeSession.update({
+      const updated = await tx.swipeSession.update({
         where: { id: sessionId },
         data: { totalSwipes: { increment: 1 } },
+        select: { totalSwipes: true },
       });
-      if (action === "SUPERSTAR") {
-        await tx.superstar.upsert({
-          where: { userId_restaurantId: { userId: user.id, restaurantId } },
-          update: {},
-          create: { userId: user.id, restaurantId, sessionId },
+
+      const reachedCap = (updated.totalSwipes ?? position) >= MAX_SWIPES_PER_SESSION;
+      const endNow = reachedCap || (EARLY_END_ON_SUPERSTAR && action === "SUPERSTAR");
+
+      if (endNow) {
+        await tx.swipeSession.update({
+          where: { id: sessionId },
+          data: { status: "completed", endedAt: new Date() },
         });
+        sessionCompleted = true;
       }
     });
 
     const nextCount = (session.totalSwipes ?? session.events.length) + 1;
     const shouldRerank = nextCount % 5 === 0;
-    const shouldSuggestMatch = nextCount >= 15;
+    const shouldSuggestMatch = sessionCompleted || nextCount >= 15;
 
-    res.json({ ok: true, shouldRerank, shouldSuggestMatch });
+    res.json({ ok: true, shouldRerank, shouldSuggestMatch, sessionCompleted });
   } catch (e) {
     console.error("recs/feedback error:", e);
     res.status(500).json({ error: "feedback failed" });
