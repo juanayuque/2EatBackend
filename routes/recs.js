@@ -124,9 +124,8 @@ function restaurantMeetsRequirements(r, req) {
       r.parkingOptions && typeof r.parkingOptions === "object"
         ? Object.values(r.parkingOptions).some(Boolean)
         : false;
-    const hasBool = r.hasParking === true;
     const hasText = textIncludesAny(r, ["parking", "car park", "parking lot"]);
-    ok = ok && (hasStructured || hasBool || hasText);
+    ok = ok && (hasStructured || hasText);
   }
 
   return ok;
@@ -149,7 +148,6 @@ function radiusFromUser(user) {
 function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60, radiusKm = 15) {
   const keys = cuisineKeywordsFromUser(user);
   const req = requirementsFromUser(user);
-  const hasAnyReq = req.vegetarian || req.petFriendly || req.parking;
 
   const here = { lat, lng };
   const withDist = pool.map((r) => ({
@@ -158,7 +156,7 @@ function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60,
   }));
   const within = Number.isFinite(radiusKm) ? withDist.filter((x) => x.d <= radiusKm) : withDist;
 
-  const baseRows = hasAnyReq ? within.filter(({ r }) => restaurantMeetsRequirements(r, req)) : within;
+  const baseRows = within.filter(({ r }) => restaurantMeetsRequirements(r, req));
 
   const cuisineFirst = baseRows
     .filter(({ r }) => restaurantMatchesCuisine(r, keys))
@@ -269,20 +267,26 @@ async function discoverAndIngestAround(
   return { discovered: discovered.length, created };
 }
 
+/* pool builder */
+
 async function ensurePreferredPool(lat, lng, user, desiredMin = 60) {
   const baseRadius = radiusFromUser(user);
   const expansion = [baseRadius, Math.max(baseRadius, 5), 10, 15, 20, 30, 50];
   const biasQuery = buildBiasQuery(user);
+  const req = requirementsFromUser(user);
+
+  const acc = new Map();
 
   for (const radiusKm of expansion) {
-    const dbPool = await places.ensureNearbyRestaurants(
+    const dbPool = await places.ensureNearbyRestaurantsStrict(
       lat,
       lng,
-      Math.max(desiredMin, 120),
-      radiusKm
+      Math.max(desiredMin, 200),
+      radiusKm,
+      req
     );
 
-    let filtered = filterAndPrioritizeByPreferences(
+    const filtered = filterAndPrioritizeByPreferences(
       dbPool,
       user,
       lat,
@@ -291,7 +295,10 @@ async function ensurePreferredPool(lat, lng, user, desiredMin = 60) {
       radiusKm
     );
 
-    if (filtered.length >= desiredMin || filtered.length > 0) return filtered;
+    for (const r of filtered) {
+      if (!acc.has(r.id)) acc.set(r.id, r);
+    }
+    if (acc.size >= desiredMin) break;
 
     await discoverAndIngestAround(lat, lng, {
       cellRadiusMeters: Math.round(radiusKm * 1000) || 3000,
@@ -299,32 +306,40 @@ async function ensurePreferredPool(lat, lng, user, desiredMin = 60) {
       includeTypes: [["restaurant"]],
       biasQuery,
     });
+  }
 
-    const refreshed = await places.ensureNearbyRestaurants(
+  if (acc.size < desiredMin) {
+    const lastRadius = expansion[expansion.length - 1];
+    const finalPool = await places.ensureNearbyRestaurantsStrict(
       lat,
       lng,
-      Math.max(desiredMin, 120),
-      radiusKm
+      Math.max(desiredMin, 240),
+      lastRadius,
+      req
     );
-    filtered = filterAndPrioritizeByPreferences(
-      refreshed,
+    const filtered = filterAndPrioritizeByPreferences(
+      finalPool,
       user,
       lat,
       lng,
       desiredMin,
-      radiusKm
+      lastRadius
     );
-    if (filtered.length >= desiredMin || filtered.length > 0) return filtered;
+    for (const r of filtered) if (!acc.has(r.id)) acc.set(r.id, r);
   }
 
-  const lastRadius = expansion[expansion.length - 1];
-  const finalPool = await places.ensureNearbyRestaurants(
-    lat,
-    lng,
-    Math.max(desiredMin, 120),
-    lastRadius
-  );
-  return filterAndPrioritizeByPreferences(finalPool, user, lat, lng, desiredMin, lastRadius);
+  return Array.from(acc.values()).slice(0, desiredMin);
+}
+
+/* stable shuffle */
+
+function hashStr(s) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h >>> 0;
 }
 
 /* routes */
@@ -362,7 +377,7 @@ router.post("/lookup", async (req, res) => {
     }));
 
     res.json({ items });
-  } catch (e) {
+  } catch {
     res.status(500).json({ error: "lookup failed" });
   }
 });
@@ -429,7 +444,7 @@ router.post("/start", async (req, res) => {
     } catch {}
 
     res.json({ sessionId: session.id });
-  } catch (e) {
+  } catch {
     res.status(500).json({ error: "start failed" });
   }
 });
@@ -449,7 +464,6 @@ router.post("/next", async (req, res) => {
       where: { id: sessionId },
       include: { events: true },
     });
-
     if (!session || session.userId !== user.id) {
       return res.status(400).json({ error: "Invalid session" });
     }
@@ -465,15 +479,21 @@ router.post("/next", async (req, res) => {
       return res.json({ items: [], sessionCompleted: true });
     }
 
-    const prefPool = await ensurePreferredPool(lat, lng, user, 100);
+    const prefPool = await ensurePreferredPool(lat, lng, user, 120);
     const radiusKm = radiusFromUser(user);
-    const pool = await places.ensureNearbyRestaurants(lat, lng, 100, radiusKm);
-
     const swipedIds = new Set(session.events.map((e) => e.restaurantId));
     const exclude = new Set(Array.isArray(excludeIds) ? excludeIds.filter(Boolean) : []);
 
-    const candidates = prefPool.filter((r) => !swipedIds.has(r.id) && !exclude.has(r.id));
-    const finalPool = candidates;
+    const basePool = prefPool.filter((r) => !swipedIds.has(r.id) && !exclude.has(r.id));
+
+    const shuffledPool = basePool
+      .slice()
+      .sort(
+        (a, b) =>
+          (hashStr(sessionId + ":" + a.id) % 100000) - (hashStr(sessionId + ":" + b.id) % 100000)
+      );
+
+    const finalPool = shuffledPool;
 
     if (!finalPool.length) {
       console.log(`[recs/next] user=${user.id} cand=0 (strict) → returning empty`);
@@ -573,19 +593,18 @@ router.post("/next", async (req, res) => {
         servesVegetarianFood: r.servesVegetarianFood ?? null,
         allowsDogs: r.allowsDogs ?? null,
         hasParking:
-          (r.hasParking === true) ||
-          (r.parkingOptions && typeof r.parkingOptions === "object"
+          r.parkingOptions && typeof r.parkingOptions === "object"
             ? Object.values(r.parkingOptions).some(Boolean)
-            : false),
+            : false,
       };
     });
 
     console.log(
-      `[recs/next] user=${user.id} nearby=${pool.length} pref=${prefPool.length} cand=${candidates.length} returned=${clientItems.length}`
+      `[recs/next] user=${user.id} pref=${prefPool.length} cand=${basePool.length} returned=${clientItems.length}`
     );
 
     res.json({ items: clientItems });
-  } catch (e) {
+  } catch {
     res.status(500).json({ error: "next failed" });
   }
 });
@@ -640,7 +659,7 @@ router.post("/feedback", async (req, res) => {
     const shouldSuggestMatch = sessionCompleted || nextCount >= 15;
 
     res.json({ ok: true, shouldRerank, shouldSuggestMatch, sessionCompleted });
-  } catch (e) {
+  } catch {
     res.status(500).json({ error: "feedback failed" });
   }
 });
@@ -701,7 +720,7 @@ router.post("/finalize-match", async (req, res) => {
       };
 
     res.json({ ok: true, winner: payloadWinner });
-  } catch (e) {
+  } catch {
     res.status(500).json({ error: "finalize failed" });
   }
 });
@@ -742,7 +761,7 @@ router.get("/winner", async (req, res) => {
           photoUrl,
         },
     });
-  } catch (e) {
+  } catch {
     res.status(500).json({ error: "winner failed" });
   }
 });

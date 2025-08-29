@@ -1,5 +1,5 @@
 // src/services/placesService.js
-// Encapsulates Google Places fetch, parsing, and DB upsert. Also exposes DB-first nearby fetch.
+// Encapsulates Google Places fetch, parsing, DB upsert, and DB-first nearby fetch.
 
 const { haversineKm, asFloat } = require("../utils/geo");
 
@@ -34,7 +34,7 @@ function parseGooglePlace(p) {
     formattedAddress: p.formattedAddress || p.vicinity || p.formatted_address || null,
     primaryTypeDisplayName:
       p.primaryTypeDisplayName?.text || p.primaryTypeDisplayName || null,
-    primaryType: p.primaryType || p.types?.[0] || null,
+    primaryType: p.primaryType || (Array.isArray(p.types) ? p.types[0] : null),
     types: Array.isArray(p.types) ? p.types : [],
     rating: p.rating ?? null,
     userRatingCount: p.userRatingCount ?? p.user_ratings_total ?? null,
@@ -72,6 +72,33 @@ function createPlacesService({ prisma, googleApiKey }) {
     }));
     withDist.sort((a, b) => a.d - b.d);
     return withDist.map((x) => x.r).slice(0, Math.max(minCount, 1));
+  }
+
+  async function ensureNearbyRestaurantsStrict(lat, lng, minCount = 100, radiusKm = 15, req = {}) {
+    const box = bboxFromCenter(lat, lng, radiusKm);
+
+    const where = {
+      latitude: { gte: box.minLat, lte: box.maxLat },
+      longitude: { gte: box.minLng, lte: box.maxLng },
+      ...(req?.vegetarian
+        ? { OR: [{ servesVegetarianFood: true }, { types: { has: "vegetarian_restaurant" } }] }
+        : {}),
+      ...(req?.petFriendly ? { allowsDogs: true } : {}),
+      ...(req?.parking ? { NOT: { parkingOptions: null } } : {}),
+    };
+
+    const rows = await prisma.restaurant.findMany({
+      where,
+      take: Math.max(minCount * 5, 500),
+    });
+
+    const here = { lat, lng };
+    const withDist = rows.map((r) => ({
+      r,
+      d: haversineKm(here, { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }),
+    }));
+    withDist.sort((a, b) => a.d - b.d);
+    return withDist.map((x) => x.r);
   }
 
   async function upsertPlacesBatch(placesArr) {
@@ -235,6 +262,7 @@ function createPlacesService({ prisma, googleApiKey }) {
 
   return {
     ensureNearbyRestaurants,
+    ensureNearbyRestaurantsStrict,
     upsertPlacesBatch,
     googlePlacesSearchNearby,
     googlePlacesSearchText,
