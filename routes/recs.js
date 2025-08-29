@@ -65,19 +65,16 @@ function cuisineKeywordsFromUser(user) {
   return out;
 }
 
-
 function restaurantMatchesCuisine(r, keywordSet) {
   if (!keywordSet || !keywordSet.size) return true;
   const primary = (r.primaryType || "").toLowerCase();
   const types = Array.isArray(r.types) ? r.types.map((t) => String(t).toLowerCase()) : [];
-  // Combine all relevant text fields into one searchable string.
   const searchableText = [r.name, r.primaryTypeDisplayName, r.editorialSummary].filter(Boolean).join(" ").toLowerCase();
 
   for (const k of keywordSet) {
-    const needle = k.replace(/\s+/g, "_"); // For matching against Google's type format (e.g., "italian_restaurant")
+    const needle = k.replace(/\s+/g, "_");
     if (primary.includes(needle)) return true;
     if (types.some((t) => t.includes(needle))) return true;
-    // Check the original keyword against the combined free-text fields.
     if (searchableText.includes(k)) return true;
   }
   return false;
@@ -218,8 +215,9 @@ function buildBiasQueries(user) {
 
   const cuisines = Array.from(cuisineKeywordsFromUser(user));
 
+  // [FIX] Corrected a typo here: `cuines` is now `cuisines`.
   if (requirementKeywords.length > 0 || cuisines.length > 0) {
-    const allKeywords = [...cuines, ...requirementKeywords, "restaurant"];
+    const allKeywords = [...cuisines, ...requirementKeywords, "restaurant"];
     queries.add(allKeywords.join(" "));
   }
 
@@ -420,7 +418,8 @@ router.post("/lookup", async (req, res) => {
     }));
 
     res.json({ items });
-  } catch {
+  } catch (err) { // [FIX] Improved error logging
+    console.error("[recs/lookup] error:", err);
     res.status(500).json({ error: "lookup failed" });
   }
 });
@@ -489,7 +488,8 @@ router.post("/start", async (req, res) => {
     } catch {}
 
     res.json({ sessionId: session.id });
-  } catch {
+  } catch (err) { // [FIX] Improved error logging
+    console.error("[recs/start] error:", err);
     res.status(500).json({ error: "start failed" });
   }
 });
@@ -647,7 +647,8 @@ router.post("/next", async (req, res) => {
     );
 
     res.json({ items: clientItems });
-  } catch {
+  } catch (err) { // [FIX] Improved error logging
+    console.error("[recs/next] error:", err);
     res.status(500).json({ error: "next failed" });
   }
 });
@@ -702,7 +703,8 @@ router.post("/feedback", async (req, res) => {
     const shouldSuggestMatch = sessionCompleted || nextCount >= 15;
 
     res.json({ ok: true, shouldRerank, shouldSuggestMatch, sessionCompleted });
-  } catch {
+  } catch (err) { // [FIX] Improved error logging
+    console.error("[recs/feedback] error:", err);
     res.status(500).json({ error: "feedback failed" });
   }
 });
@@ -763,7 +765,8 @@ router.post("/finalize-match", async (req, res) => {
       };
 
     res.json({ ok: true, winner: payloadWinner });
-  } catch {
+  } catch (err) { // [FIX] Improved error logging
+    console.error("[recs/finalize-match] error:", err);
     res.status(500).json({ error: "finalize failed" });
   }
 });
@@ -804,7 +807,8 @@ router.get("/winner", async (req, res) => {
           photoUrl,
         },
     });
-  } catch {
+  } catch (err) { // [FIX] Improved error logging
+    console.error("[recs/winner] error:", err);
     res.status(500).json({ error: "winner failed" });
   }
 });
