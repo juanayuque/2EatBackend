@@ -36,7 +36,7 @@ model SwipeSession {
   startedAt    DateTime   @default(now())
   endedAt      DateTime?
   totalSwipes  Int        @default(0)
-
+  context      Json?
   events       SwipeEvent[]
   match        Match?
 
