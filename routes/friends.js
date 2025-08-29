@@ -89,6 +89,78 @@ router.get("/incoming", async (req, res) => {
   }
 });
 
+/** NEW: GET /api/friends/outgoing → { requests: { id, toUserId, toName, toUsername }[] } */
+router.get("/outgoing", async (req, res) => {
+  try {
+    const me = await getAuthedUserOr404(req.user.uid, res);
+    if (!me) return;
+
+    const rows = await prisma.friendRequest.findMany({
+      where: { fromUserId: me.id, status: "PENDING" },
+      orderBy: { createdAt: "desc" },
+      include: {
+        toUser: { select: { id: true, displayName: true, email: true, username: true } },
+      },
+    });
+
+    const requests = rows.map((r) => ({
+      id: r.id,
+      toUserId: r.toUserId,
+      toName: labelOfUser(r.toUser),
+      toUsername: usernameOfUser(r.toUser),
+    }));
+
+    res.json({ requests });
+  } catch (err) {
+    console.error("[friends/outgoing] error:", err);
+    res.status(500).json({ error: "failed to load requests" });
+  }
+});
+
+/** NEW: GET /api/friends/requests → { incoming: [...], outgoing: [...] } */
+router.get("/requests", async (req, res) => {
+  try {
+    const me = await getAuthedUserOr404(req.user.uid, res);
+    if (!me) return;
+
+    const [incomingRows, outgoingRows] = await Promise.all([
+      prisma.friendRequest.findMany({
+        where: { toUserId: me.id, status: "PENDING" },
+        orderBy: { createdAt: "desc" },
+        include: {
+          fromUser: { select: { id: true, displayName: true, email: true, username: true } },
+        },
+      }),
+      prisma.friendRequest.findMany({
+        where: { fromUserId: me.id, status: "PENDING" },
+        orderBy: { createdAt: "desc" },
+        include: {
+          toUser: { select: { id: true, displayName: true, email: true, username: true } },
+        },
+      }),
+    ]);
+
+    const incoming = incomingRows.map((r) => ({
+      id: r.id,
+      fromUserId: r.fromUserId,
+      fromName: labelOfUser(r.fromUser),
+      fromUsername: usernameOfUser(r.fromUser),
+    }));
+
+    const outgoing = outgoingRows.map((r) => ({
+      id: r.id,
+      toUserId: r.toUserId,
+      toName: labelOfUser(r.toUser),
+      toUsername: usernameOfUser(r.toUser),
+    }));
+
+    res.json({ incoming, outgoing });
+  } catch (err) {
+    console.error("[friends/requests] error:", err);
+    res.status(500).json({ error: "failed to load requests" });
+  }
+});
+
 /** GET /api/friends/list → { friends: { id, name, username? }[] } */
 router.get("/list", async (req, res) => {
   try {
