@@ -19,7 +19,6 @@ async function getAuthedUserOr404(firebaseUid, res) {
 }
 
 function labelOfUser(u) {
-  // Prefer displayName > username > email local-part > generic
   const dn = u?.displayName?.trim();
   if (dn) return dn;
   const un = u?.username?.trim();
@@ -33,39 +32,36 @@ function usernameOfUser(u) {
   return u?.username || null;
 }
 
+/**
+ * Case-insensitive search by @username or email.
+ * - "@foo"  -> username "foo" (insensitive)
+ * - "foo"   -> username "foo" (insensitive)
+ * - "a@b.c" -> email (insensitive)
+ */
 async function findTargetUserByQuery(query) {
   const q = String(query || "").trim();
   if (!q) return null;
 
-  // @username → username
-  if (q.startsWith("@")) {
-    const un = q.slice(1).trim().toLowerCase();
-    if (!un) return null;
-    return prisma.user.findFirst({
-      where: { username: un },
-      select: { id: true, displayName: true, email: true, username: true },
-    });
-  }
-
-  // email?
+  // email
   if (q.includes("@")) {
     return prisma.user.findFirst({
-      where: { email: q.toLowerCase() },
+      where: { email: { equals: q.toLowerCase(), mode: "insensitive" } },
       select: { id: true, displayName: true, email: true, username: true },
     });
   }
 
-  // fallback → username
+  // username (with or without leading "@")
+  const un = q.startsWith("@") ? q.slice(1) : q;
+  const norm = un.trim();
+  if (!norm) return null;
+
   return prisma.user.findFirst({
-    where: { username: q.toLowerCase() },
+    where: { username: { equals: norm, mode: "insensitive" } },
     select: { id: true, displayName: true, email: true, username: true },
   });
 }
 
-/** GET /api/friends/incoming → { requests: FriendRequest[] }
- *  Shape (per your UI):
- *  { id, fromUserId, fromName, fromUsername }
- */
+/** GET /api/friends/incoming → { requests: { id, fromUserId, fromName, fromUsername }[] } */
 router.get("/incoming", async (req, res) => {
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
@@ -74,7 +70,9 @@ router.get("/incoming", async (req, res) => {
     const rows = await prisma.friendRequest.findMany({
       where: { toUserId: me.id, status: "PENDING" },
       orderBy: { createdAt: "desc" },
-      include: { fromUser: { select: { id: true, displayName: true, email: true, username: true } } },
+      include: {
+        fromUser: { select: { id: true, displayName: true, email: true, username: true } },
+      },
     });
 
     const requests = rows.map((r) => ({
@@ -91,10 +89,7 @@ router.get("/incoming", async (req, res) => {
   }
 });
 
-/** GET /api/friends/list → { friends: Friend[] }
- *  Shape (per your UI): { id, name, username? }
- *  We return the OTHER user (not the row id).
- */
+/** GET /api/friends/list → { friends: { id, name, username? }[] } */
 router.get("/list", async (req, res) => {
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
@@ -103,7 +98,9 @@ router.get("/list", async (req, res) => {
     const rows = await prisma.friend.findMany({
       where: { userId: me.id },
       orderBy: { createdAt: "desc" },
-      include: { friend: { select: { id: true, displayName: true, email: true, username: true } } },
+      include: {
+        friend: { select: { id: true, displayName: true, email: true, username: true } },
+      },
     });
 
     const friends = rows.map((row) => ({
@@ -141,7 +138,7 @@ router.post("/request", async (req, res) => {
     });
     if (existingFriend) return res.status(200).json({ ok: true, alreadyFriends: true });
 
-    // Existing pending between either direction?
+    // Pending either direction?
     const pending = await prisma.friendRequest.findFirst({
       where: {
         status: "PENDING",
@@ -150,13 +147,11 @@ router.post("/request", async (req, res) => {
           { fromUserId: target.id, toUserId: me.id },
         ],
       },
-      select: { id: true, fromUserId: true, toUserId: true },
+      select: { id: true },
     });
-    if (pending) {
-      return res.status(200).json({ ok: true, pendingRequestId: pending.id });
-    }
+    if (pending) return res.status(200).json({ ok: true, pendingRequestId: pending.id });
 
-    // Create (or revive) request
+    // Create (or revive) request for this direction
     let fr;
     try {
       fr = await prisma.friendRequest.create({
@@ -164,7 +159,7 @@ router.post("/request", async (req, res) => {
         select: { id: true },
       });
     } catch (e) {
-      // If unique constraint hit (pair already exists but declined/accepted), reset to PENDING
+      // If unique constraint hit (pair exists but not pending), flip it back to pending
       const existing = await prisma.friendRequest.findUnique({
         where: { fromUserId_toUserId: { fromUserId: me.id, toUserId: target.id } },
         select: { id: true, status: true },
@@ -205,7 +200,7 @@ router.post("/accept", async (req, res) => {
     if (fr.status !== "PENDING") return res.status(400).json({ error: "Request is not pending" });
 
     await prisma.$transaction(async (tx) => {
-      // Create friendship both directions (idempotent via unique constraint)
+      // Friendship both directions (idempotent via upsert + unique)
       await tx.friend.upsert({
         where: { userId_friendId: { userId: me.id, friendId: fr.fromUserId } },
         update: {},
@@ -217,13 +212,12 @@ router.post("/accept", async (req, res) => {
         create: { userId: fr.fromUserId, friendId: me.id },
       });
 
-      // Mark accepted
       await tx.friendRequest.update({
         where: { id: fr.id },
         data: { status: "ACCEPTED" },
       });
 
-      // Close any opposite pending request between the same pair
+      // Close any opposite PENDING between same pair
       await tx.friendRequest.updateMany({
         where: {
           status: "PENDING",
