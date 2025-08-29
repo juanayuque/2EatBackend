@@ -22,7 +22,7 @@ const {
 } = require("../src/recs/pagination");
 const { ensurePreferredPool } = require("../src/recs/pool");
 const { discoverAndIngestAround } = require("../src/recs/discovery");
-const { warmupRankAsync, rankIdsWithinPage, buildUserFeatures, buildItemFeatures } = require("../src/recs/rank");
+const { rankIdsWithinPage, buildUserFeatures, buildItemFeatures } = require("../src/recs/rank");
 
 // Fallback fetch (Node 18+ has global fetch; this keeps older envs working)
 const fetchFn =
@@ -99,10 +99,12 @@ router.use(verifyFirebaseToken);
 
 // Start: creates/fetches active session and stores context (lat,lng,seed,radius)
 // routes/recs.js (/start with first page)
+// Start: creates/fetches active session and stores context (lat,lng,seed,radius)
+// No filtering, no discovery, no rank warmup here.
 router.post("/start", async (req, res) => {
   try {
     const uid = req.user.uid;
-    const { lat, lng, firstLimit = 8 } = req.body || {};
+    const { lat, lng } = req.body || {};
     if (typeof lat !== "number" || typeof lng !== "number") {
       return res.status(400).json({ error: "lat/lng required" });
     }
@@ -127,61 +129,13 @@ router.post("/start", async (req, res) => {
       data: { context: { lat, lng, radiusKm, seed } },
     });
 
-    // Build pool once to serve the initial page immediately
-    const prefPool = await ensurePreferredPool({ places, lat, lng, user, desiredMin: 120 });
-
-    // Remove already swiped in this session (safety)
-    const swipedIds = new Set(session.events.map((e) => e.restaurantId));
-    const basePool = prefPool.filter((r) => !swipedIds.has(r.id));
-
-    // Deterministic order; slice first page; compute next cursor
-    const ordered = orderPoolDeterministic(basePool, session.id, seed);
-    const page = ordered.slice(0, Math.max(1, Number(firstLimit)));
-    const nextCursor = encodeCursor({ idx: page.length, seed, lat, lng });
-
-    // Hydrate to client fields while preserving order
-    const ids = page.map((x) => x.id);
-    let full = await prisma.restaurant.findMany({
-      where: { id: { in: ids } },
-      include: { photos: { take: 1 } },
-    });
-    const orderMap = new Map(ids.map((id, i) => [id, i]));
-    full.sort((a, b) => (orderMap.get(a.id) ?? 9999) - (orderMap.get(b.id) ?? 9999));
-
-    const items = full.map((r) => {
-      const photoName = r.photos?.[0]?.name || null;
-      return {
-        id: r.id,
-        name: r.name,
-        address: r.formattedAddress,
-        priceLevel: r.priceLevel ?? null,
-        distance: require("../src/utils/geo").haversineKm(
-          { lat, lng },
-          { lat: require("../src/utils/geo").asFloat(r.latitude), lng: require("../src/utils/geo").asFloat(r.longitude) }
-        ),
-        photoUrl: photoName
-          ? `${process.env.BACKEND_PUBLIC_URL || "https://2eatapp.com"}/api/recs/photo?name=${encodeURIComponent(photoName)}&w=1200`
-          : null,
-        primaryType: r.primaryType,
-        types: r.types,
-        editorialSummary: r.editorialSummary || null,
-        editorial_summary: r.editorialSummary || null,
-        servesVegetarianFood: r.servesVegetarianFood ?? null,
-        allowsDogs: r.allowsDogs ?? null,
-        hasParking:
-          r.parkingOptions && typeof r.parkingOptions === "object"
-            ? Object.values(r.parkingOptions).some(Boolean)
-            : false,
-      };
-    });
-
-
-    res.json({ sessionId: session.id, items, cursor: nextCursor });
+    res.json({ sessionId: session.id });
   } catch (err) {
     console.error("[recs/start] error:", err);
     res.status(500).json({ error: "start failed" });
   }
 });
+
 
 
 // Next: returns a page of items using an opaque cursor. First call after /start

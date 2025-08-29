@@ -127,6 +127,30 @@ function restaurantMatchesCuisine(r, keywordSet) {
   return false;
 }
 
+function findCuisineMatchDetail(r, keywordSet) {
+  if (!keywordSet || !keywordSet.size) return null;
+
+  const primary = String(r.primaryType || "").toLowerCase();
+  const types = Array.isArray(r.types) ? r.types.map((t) => String(t).toLowerCase()) : [];
+  const searchableText = [r.name, r.primaryTypeDisplayName, r.editorialSummary]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  for (const k of keywordSet) {
+    const underscore = k.replace(/\s+/g, "_");
+    if (primary.includes(underscore)) return { keyword: k, where: "primaryType" };
+    if (types.some((t) => t.includes(underscore))) return { keyword: k, where: "types" };
+    if (searchableText.includes(k)) return { keyword: k, where: "text" };
+  }
+  return null;
+}
+
+function restaurantMatchesCuisine(r, keywordSet) {
+  if (!keywordSet || !keywordSet.size) return true;
+  return !!findCuisineMatchDetail(r, keywordSet);
+}
+
 // --- Main filter+prioritize --------------------------------------
 
 function filterAndPrioritizeByPreferences(pool, user, lat, lng, desiredMin = 60, radiusKm = 15) {
@@ -174,4 +198,6 @@ module.exports = {
   restaurantMatchesCuisine,
 
   filterAndPrioritizeByPreferences,
+  findCuisineMatchDetail,
+  restaurantMatchesCuisine,
 };
