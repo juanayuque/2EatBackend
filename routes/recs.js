@@ -66,7 +66,7 @@ const CUISINE_KEYWORDS = {
   turkish: ["turkish"],
   lebanese: ["lebanese"],
   persian: ["persian", "iranian"],
-  fastfood: ["fast"ß]
+  fastfood: ["fast"],
 };
 
 const norm = (s) => String(s || "").toLowerCase().replace(/[_\s-]+/g, " ").trim();
