@@ -139,7 +139,6 @@ router.post("/start", async (req, res) => {
 
 // Next: returns a page of items using an opaque cursor. First call after /start
 // can omit lat/lng because they are stored in session.context.
-// routes/recs.js (/next)
 router.post("/next", async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -157,16 +156,31 @@ router.post("/next", async (req, res) => {
       return res.status(400).json({ error: "Invalid session" });
     }
 
+    // If session is not active, tell the client to stop immediately.
+    if (session.status !== "active") {
+      return res.status(410).json({
+        items: [],
+        cursor: null,
+        exhausted: true,
+        sessionCompleted: true,
+        sessionStatus: session.status,
+      });
+    }
+
     // Enforce cap / completion
     const currentSwipes = session.totalSwipes ?? session.events.length;
-    if (session.status !== "active" || currentSwipes >= MAX_SWIPES_PER_SESSION) {
-      if (session.status === "active" && currentSwipes >= MAX_SWIPES_PER_SESSION) {
-        await prisma.swipeSession.update({
-          where: { id: sessionId },
-          data: { status: "completed", endedAt: new Date() },
-        });
-      }
-      return res.json({ items: [], cursor: null, exhausted: true, sessionCompleted: true });
+    if (currentSwipes >= MAX_SWIPES_PER_SESSION) {
+      await prisma.swipeSession.update({
+        where: { id: sessionId },
+        data: { status: "completed", endedAt: new Date() },
+      });
+      return res.status(410).json({
+        items: [],
+        cursor: null,
+        exhausted: true,
+        sessionCompleted: true,
+        sessionStatus: "completed",
+      });
     }
 
     // Decode cursor or initialize from session context
@@ -183,7 +197,6 @@ router.post("/next", async (req, res) => {
       return res.status(400).json({ error: "lat/lng missing; call /start first" });
     }
 
-    // Backfill context if session lacked it (older sessions)
     if (!ctx?.lat || !ctx?.lng) {
       await prisma.swipeSession.update({
         where: { id: sessionId },
@@ -192,7 +205,7 @@ router.post("/next", async (req, res) => {
     }
 
     // Build pool and remove already-swiped (DB-only, no discovery)
-    const DESIRED_MIN_POOL = 32; // comfy cushion for ~15 swipes
+    const DESIRED_MIN_POOL = 20;
     const prefPool = await ensurePreferredPool({
       places,
       lat: useLat,
@@ -209,17 +222,19 @@ router.post("/next", async (req, res) => {
     );
 
     if (!basePool.length) {
-      // Still give prompt context even if empty
+      // No more items – treat as exhausted for this session
       const likes = session.events.filter((e) => e.action === "LIKE").map((e) => e.restaurantId);
       const top3CandidateIds = likes.slice(-3).reverse();
       const superStarRestaurantId =
         [...session.events].reverse().find((e) => e.action === "SUPERSTAR")?.restaurantId || null;
       const shouldSuggestMatch = (session.totalSwipes ?? session.events.length) >= 15 || false;
 
-      return res.json({
+      return res.status(410).json({
         items: [],
         cursor: null,
         exhausted: true,
+        sessionCompleted: false,
+        sessionStatus: session.status,
         shouldMatchPrompt: shouldSuggestMatch,
         top3CandidateIds,
         superStarRestaurantId,
@@ -240,10 +255,12 @@ router.post("/next", async (req, res) => {
         [...session.events].reverse().find((e) => e.action === "SUPERSTAR")?.restaurantId || null;
       const shouldSuggestMatch = (session.totalSwipes ?? session.events.length) >= 15 || false;
 
-      return res.json({
+      return res.status(410).json({
         items: [],
         cursor: null,
         exhausted: true,
+        sessionCompleted: false,
+        sessionStatus: session.status,
         shouldMatchPrompt: shouldSuggestMatch,
         top3CandidateIds,
         superStarRestaurantId,
@@ -321,6 +338,7 @@ router.post("/next", async (req, res) => {
     const atEnd = nextIdx >= ordered.length;
     const nextCursor = atEnd ? null : encodeCursor({ idx: nextIdx, seed, lat: useLat, lng: useLng });
 
+    res.set("Cache-Control", "no-store");
     res.json({
       items: clientItems,
       cursor: nextCursor,
@@ -351,10 +369,25 @@ router.post("/feedback", async (req, res) => {
 
     const session = await prisma.swipeSession.findUnique({
       where: { id: sessionId },
-      include: { events: true },
+      include: { events: { orderBy: { createdAt: "asc" } } },
     });
-    if (!session || session.userId !== user.id || session.status !== "active") {
+    if (!session || session.userId !== user.id) {
       return res.status(400).json({ error: "Invalid session" });
+    }
+    if (session.status !== "active") {
+      return res.status(410).json({ ok: false, sessionCompleted: true });
+    }
+
+    // Idempotency: if the last recorded event matches this exact restaurant+action, no-op.
+    const last = session.events[session.events.length - 1];
+    if (last && last.restaurantId === restaurantId && last.action === action) {
+      return res.json({ ok: true, duplicate: true, shouldRerank: false, shouldSuggestMatch: false, sessionCompleted: false });
+    }
+
+    // Optional stronger idempotency: if an event for this restaurant already exists with same action, skip.
+    const already = session.events.find(e => e.restaurantId === restaurantId && e.action === action);
+    if (already) {
+      return res.json({ ok: true, duplicate: true, shouldRerank: false, shouldSuggestMatch: false, sessionCompleted: false });
     }
 
     const position = session.events.length + 1;
@@ -392,6 +425,7 @@ router.post("/feedback", async (req, res) => {
     res.status(500).json({ error: "feedback failed" });
   }
 });
+
 
 // Finalize: saves match and completes session
 router.post("/finalize-match", async (req, res) => {

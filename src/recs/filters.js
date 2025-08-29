@@ -21,7 +21,7 @@ function textIncludesAny(r, needles) {
 
 const CUISINE_KEYWORDS = {
   indian: ["indian"],
-  chinese: ["chinese", "szechuan", "sichuan", "cantonese", "hunan"],
+  chinese: ["chinese", "szechuan", "sichuan", "cantonese", "hunan", "hotpot", "noodle",],
   italian: ["italian", "pizza", "pasta", "sicilian", "tuscan"],
   japanese: ["japanese", "sushi", "ramen", "izakaya"],
   thai: ["thai"],
