@@ -175,17 +175,6 @@ router.post("/start", async (req, res) => {
       };
     });
 
-    
-     if (process.env.RANK_WARMUP !== "0") {
-       const { buildUserFeatures, warmupRankAsync } = require("../src/recs/rank");
-       await warmupRankAsync({
-         rankUrl: process.env.RECS_SERVICE_URL || process.env.RECS_URL || "http://127.0.0.1:8000",
-         userId: user.id,
-         userFeatures: buildUserFeatures(user),
-         items: page,
-         lat, lng
-       });
-     }
 
     res.json({ sessionId: session.id, items, cursor: nextCursor });
   } catch (err) {
