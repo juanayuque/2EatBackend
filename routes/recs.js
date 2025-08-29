@@ -8,12 +8,7 @@ const { createPlacesService } = require("../src/services/placesService");
 const { haversineKm, asFloat } = require("../src/utils/geo");
 
 // Modularized helpers
-const {
-  filterAndPrioritizeByPreferences,
-  requirementsFromUser,
-  priceBandFromBudget,
-  radiusFromUser,
-} = require("../src/recs/filters");
+const { radiusFromUser } = require("../src/recs/filters");
 const {
   orderPoolDeterministic,
   encodeCursor,
@@ -21,7 +16,6 @@ const {
   mkSeed,
 } = require("../src/recs/pagination");
 const { ensurePreferredPool } = require("../src/recs/pool");
-const { discoverAndIngestAround } = require("../src/recs/discovery");
 const { rankIdsWithinPage, buildUserFeatures, buildItemFeatures } = require("../src/recs/rank");
 
 // Fallback fetch (Node 18+ has global fetch; this keeps older envs working)
@@ -98,13 +92,11 @@ router.post("/lookup", async (req, res) => {
 router.use(verifyFirebaseToken);
 
 // Start: creates/fetches active session and stores context (lat,lng,seed,radius)
-// routes/recs.js (/start with first page)
-// Start: creates/fetches active session and stores context (lat,lng,seed,radius)
 // No filtering, no discovery, no rank warmup here.
 router.post("/start", async (req, res) => {
   try {
     const uid = req.user.uid;
-    const { lat, lng } = req.body || {};
+    const { lat, lng, forceNew = false } = req.body || {};
     if (typeof lat !== "number" || typeof lng !== "number") {
       return res.status(400).json({ error: "lat/lng required" });
     }
@@ -112,12 +104,21 @@ router.post("/start", async (req, res) => {
     const user = await prisma.user.findUnique({ where: { firebaseUid: uid } });
     if (!user) return res.status(404).json({ error: "User not found. Sync profile first." });
 
-    let session = await prisma.swipeSession.findFirst({
-      where: { userId: user.id, status: "active" },
-      orderBy: { startedAt: "desc" },
-      include: { events: true },
-    });
+    let session = null;
+    if (!forceNew) {
+      session = await prisma.swipeSession.findFirst({
+        where: { userId: user.id, status: "active" },
+        orderBy: { startedAt: "desc" },
+        include: { events: true },
+      });
+    }
     if (!session) {
+      session = await prisma.swipeSession.create({ data: { userId: user.id } });
+    } else if (forceNew) {
+      await prisma.swipeSession.update({
+        where: { id: session.id },
+        data: { status: "completed", endedAt: new Date() },
+      });
       session = await prisma.swipeSession.create({ data: { userId: user.id } });
     }
 
@@ -135,8 +136,6 @@ router.post("/start", async (req, res) => {
     res.status(500).json({ error: "start failed" });
   }
 });
-
-
 
 // Next: returns a page of items using an opaque cursor. First call after /start
 // can omit lat/lng because they are stored in session.context.
@@ -166,18 +165,18 @@ router.post("/next", async (req, res) => {
           data: { status: "completed", endedAt: new Date() },
         });
       }
-      return res.json({ items: [], sessionCompleted: true });
+      return res.json({ items: [], cursor: null, exhausted: true, sessionCompleted: true });
     }
 
     // Decode cursor or initialize from session context
-    let state = decodeCursor(cursorIn);
+    const state = decodeCursor(cursorIn);
     let idx = Number(state?.idx || 0);
 
-    let ctx = session.context || {};
-    let useLat = state?.lat ?? ctx.lat ?? lat;
-    let useLng = state?.lng ?? ctx.lng ?? lng;
-    let seed = state?.seed ?? ctx.seed ?? mkSeed(sessionId);
-    let radiusKm = ctx.radiusKm ?? radiusFromUser(user);
+    const ctx = session.context || {};
+    const useLat = state?.lat ?? ctx.lat ?? lat;
+    const useLng = state?.lng ?? ctx.lng ?? lng;
+    const seed = state?.seed ?? ctx.seed ?? mkSeed(sessionId);
+    const radiusKm = ctx.radiusKm ?? radiusFromUser(user);
 
     if (typeof useLat !== "number" || typeof useLng !== "number") {
       return res.status(400).json({ error: "lat/lng missing; call /start first" });
@@ -192,18 +191,37 @@ router.post("/next", async (req, res) => {
     }
 
     // Build pool and remove already-swiped
-    const prefPool = await ensurePreferredPool({ places, lat: useLat, lng: useLng, user, desiredMin: 120 });
+    const prefPool = await ensurePreferredPool({
+      places,
+      lat: useLat,
+      lng: useLng,
+      user,
+      desiredMin: 120,
+    });
     const swipedIds = new Set(session.events.map((e) => e.restaurantId));
     const basePool = prefPool.filter((r) => !swipedIds.has(r.id));
 
+    console.log(
+      `[next] pref=${prefPool.length} swiped=${swipedIds.size} base=${basePool.length} idx=${idx} limit=${limit}`
+    );
+
     if (!basePool.length) {
-      return res.json({ items: [] });
+      return res.json({ items: [], cursor: null, exhausted: true, shouldMatchPrompt: false });
     }
 
     // Deterministic order across the whole pool; cursor slices by index
     const ordered = orderPoolDeterministic(basePool, sessionId, seed);
     const pageRecords = ordered.slice(idx, idx + Math.max(1, Number(limit)));
     const nextIdx = idx + pageRecords.length;
+
+    console.log(
+      `[next] ordered=${ordered.length} page=${pageRecords.length} nextIdx=${nextIdx}`
+    );
+
+    if (pageRecords.length === 0) {
+      // Cursor past end; tell client we're exhausted
+      return res.json({ items: [], cursor: null, exhausted: true, shouldMatchPrompt: false });
+    }
 
     // Rank within the page (does not affect cursor determinism)
     const interactions = session.events.map((e) => ({
@@ -213,13 +231,19 @@ router.post("/next", async (req, res) => {
     }));
     const userFeatures = buildUserFeatures(user);
     const itemFeatures = buildItemFeatures(pageRecords, useLat, useLng);
-    const rankedIds = await rankIdsWithinPage({
-      rankUrl: RECS_SERVICE_URL,
-      userId: user.id,
-      userFeatures,
-      items: itemFeatures,
-      interactions,
-    });
+    let rankedIds = [];
+    try {
+      rankedIds = await rankIdsWithinPage({
+        rankUrl: RECS_SERVICE_URL,
+        userId: user.id,
+        userFeatures,
+        items: itemFeatures,
+        interactions,
+      });
+    } catch (e) {
+      console.warn("[next] rank failed, using identity:", e?.message || e);
+      rankedIds = [];
+    }
 
     // Hydrate to client shape
     const ids = rankedIds.length ? rankedIds : pageRecords.map((x) => x.id);
@@ -267,11 +291,13 @@ router.post("/next", async (req, res) => {
       [...events].reverse().find((e) => e.action === "SUPERSTAR")?.restaurantId || null;
     const shouldSuggestMatch = (session.totalSwipes ?? events.length) >= 15 || false;
 
-    const nextCursor = encodeCursor({ idx: nextIdx, seed, lat: useLat, lng: useLng });
+    const atEnd = nextIdx >= ordered.length;
+    const nextCursor = atEnd ? null : encodeCursor({ idx: nextIdx, seed, lat: useLat, lng: useLng });
 
     res.json({
       items: clientItems,
       cursor: nextCursor,
+      exhausted: atEnd && clientItems.length === 0,
       shouldMatchPrompt: shouldSuggestMatch,
       top3CandidateIds,
       superStarRestaurantId,
