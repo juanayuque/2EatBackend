@@ -7,23 +7,36 @@ const {
 } = require("./filters");
 const { discoverAndIngestAround, buildBiasQueries } = require("./discovery");
 
+// Only pass TRUE requirements to the DB layer.
+// If a requirement is false, we omit it so the DB doesn't filter on it.
+function activeDbReq(user) {
+  const r = requirementsFromUser(user);
+  const dbReq = {};
+  if (r.vegetarian)  dbReq.vegetarian  = true;
+  if (r.petFriendly) dbReq.petFriendly = true;
+  if (r.parking)     dbReq.parking     = true;
+  return Object.keys(dbReq).length ? dbReq : undefined;
+}
+
 // Ensures a preference-filtered pool of at least `desiredMin` items.
 // Expands radius progressively and triggers discovery when needed.
 async function ensurePreferredPool({ places, lat, lng, user, desiredMin = 60 }) {
   const baseRadius = radiusFromUser(user);
-  const expansion = [baseRadius, Math.max(baseRadius, 5), 10, 15, 20, 30, 50];
+  // Keep first pass at the user's chosen radius, then widen out.
+  const expansion = Array.from(new Set([baseRadius, Math.max(baseRadius, 5), 10, 15, 20, 30, 50]));
 
-  const req = requirementsFromUser(user);
+  const reqRaw = requirementsFromUser(user);
+  const reqDB = activeDbReq(user);
   const rawCuisines = Array.isArray(user?.preferredCuisines) ? user.preferredCuisines : [];
   const expandedCuisineKeywords = Array.from(cuisineKeywordsFromUser(user));
   const biasQueries = buildBiasQueries(user);
 
-  // ── Top-level context log
   console.log(
     `[pool] user=${user?.id ?? "unknown"} lat=${lat} lng=${lng} ` +
       `baseRadiusKm=${baseRadius} desiredMin=${desiredMin}`
   );
-  console.log(`[pool] requirements=`, req);
+  console.log(`[pool] requirements(raw)=`, reqRaw);
+  console.log(`[pool] requirements(DB filter applied)=`, reqDB ?? "(none)");
   console.log(`[pool] preferredCuisines(raw)=`, rawCuisines);
   console.log(`[pool] preferredCuisines(expanded keywords)=`, expandedCuisineKeywords);
   console.log(`[pool] discovery biasQueries=`, biasQueries);
@@ -34,17 +47,17 @@ async function ensurePreferredPool({ places, lat, lng, user, desiredMin = 60 }) 
   for (const radiusKm of expansion) {
     console.log(`\n[pool] ---- pass radiusKm=${radiusKm}km ----`);
 
-    // Fetch from DB (already prefiltered by requirements if your places service supports it)
+    // Pull a generous slice from DB (prefiltered only by TRUE requirements)
     const dbPool = await places.ensureNearbyRestaurantsStrict(
       lat,
       lng,
       Math.max(desiredMin, 200),
       radiusKm,
-      req
+      reqDB
     );
     console.log(`[pool] radius=${radiusKm}km dbPool size=${dbPool.length}`);
 
-    // Apply preference filtering & prioritization
+    // Apply full preference filtering + prioritization (cuisine-first, then nearest)
     const filtered = filterAndPrioritizeByPreferences(
       dbPool,
       user,
@@ -53,24 +66,18 @@ async function ensurePreferredPool({ places, lat, lng, user, desiredMin = 60 }) 
       desiredMin,
       radiusKm
     );
-    console.log(
-      `[pool] radius=${radiusKm}km filtered size=${filtered.length} (acc before=${acc.size})`
-    );
+    console.log(`[pool] radius=${radiusKm}km filtered size=${filtered.length} (acc before=${acc.size})`);
 
     // De-dup across passes
-    for (const r of filtered) {
-      if (!acc.has(r.id)) acc.set(r.id, r);
-    }
+    for (const r of filtered) if (!acc.has(r.id)) acc.set(r.id, r);
     console.log(`[pool] radius=${radiusKm}km acc after=${acc.size}`);
 
     if (acc.size >= desiredMin) {
-      console.log(
-        `[pool] ✅ target satisfied: desiredMin=${desiredMin} at radius=${radiusKm}km`
-      );
+      console.log(`[pool] ✅ target satisfied: desiredMin=${desiredMin} at radius=${radiusKm}km`);
       break;
     }
 
-    // Try to discover more candidates around this radius (bias by prefs)
+    // Try discovery to enrich DB for next iterations (biased by prefs)
     const discoveryRes = await discoverAndIngestAround(places, lat, lng, {
       cellRadiusMeters: Math.round(radiusKm * 1000) || 3000,
       rankPrefs: ["POPULARITY", "DISTANCE"],
@@ -83,16 +90,14 @@ async function ensurePreferredPool({ places, lat, lng, user, desiredMin = 60 }) 
   // Final wide pass if still short
   if (acc.size < desiredMin) {
     const lastRadius = expansion[expansion.length - 1];
-    console.log(
-      `\n[pool] final wide pass: radius=${lastRadius}km (acc=${acc.size} < desiredMin=${desiredMin})`
-    );
+    console.log(`\n[pool] final wide pass: radius=${lastRadius}km (acc=${acc.size} < desiredMin=${desiredMin})`);
 
     const finalPool = await places.ensureNearbyRestaurantsStrict(
       lat,
       lng,
       Math.max(desiredMin, 240),
       lastRadius,
-      req
+      reqDB
     );
     console.log(`[pool] final pass dbPool size=${finalPool.length}`);
 
@@ -107,7 +112,6 @@ async function ensurePreferredPool({ places, lat, lng, user, desiredMin = 60 }) 
     console.log(`[pool] final pass filtered size=${filtered.length} (acc before=${acc.size})`);
 
     for (const r of filtered) if (!acc.has(r.id)) acc.set(r.id, r);
-
     console.log(`[pool] final pass acc after=${acc.size}`);
   }
 
