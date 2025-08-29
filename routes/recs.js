@@ -139,6 +139,7 @@ router.post("/start", async (req, res) => {
 
 // Next: returns a page of items using an opaque cursor. First call after /start
 // can omit lat/lng because they are stored in session.context.
+// routes/recs.js (/next)
 router.post("/next", async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -190,14 +191,16 @@ router.post("/next", async (req, res) => {
       });
     }
 
-    // Build pool and remove already-swiped
+    // Build pool and remove already-swiped (DB-only, no discovery)
+    const DESIRED_MIN_POOL = 32; // comfy cushion for ~15 swipes
     const prefPool = await ensurePreferredPool({
       places,
       lat: useLat,
       lng: useLng,
       user,
-      desiredMin: 120,
+      desiredMin: DESIRED_MIN_POOL,
     });
+
     const swipedIds = new Set(session.events.map((e) => e.restaurantId));
     const basePool = prefPool.filter((r) => !swipedIds.has(r.id));
 
@@ -206,7 +209,21 @@ router.post("/next", async (req, res) => {
     );
 
     if (!basePool.length) {
-      return res.json({ items: [], cursor: null, exhausted: true, shouldMatchPrompt: false });
+      // Still give prompt context even if empty
+      const likes = session.events.filter((e) => e.action === "LIKE").map((e) => e.restaurantId);
+      const top3CandidateIds = likes.slice(-3).reverse();
+      const superStarRestaurantId =
+        [...session.events].reverse().find((e) => e.action === "SUPERSTAR")?.restaurantId || null;
+      const shouldSuggestMatch = (session.totalSwipes ?? session.events.length) >= 15 || false;
+
+      return res.json({
+        items: [],
+        cursor: null,
+        exhausted: true,
+        shouldMatchPrompt: shouldSuggestMatch,
+        top3CandidateIds,
+        superStarRestaurantId,
+      });
     }
 
     // Deterministic order across the whole pool; cursor slices by index
@@ -214,13 +231,23 @@ router.post("/next", async (req, res) => {
     const pageRecords = ordered.slice(idx, idx + Math.max(1, Number(limit)));
     const nextIdx = idx + pageRecords.length;
 
-    console.log(
-      `[next] ordered=${ordered.length} page=${pageRecords.length} nextIdx=${nextIdx}`
-    );
+    console.log(`[next] ordered=${ordered.length} page=${pageRecords.length} nextIdx=${nextIdx}`);
 
     if (pageRecords.length === 0) {
-      // Cursor past end; tell client we're exhausted
-      return res.json({ items: [], cursor: null, exhausted: true, shouldMatchPrompt: false });
+      const likes = session.events.filter((e) => e.action === "LIKE").map((e) => e.restaurantId);
+      const top3CandidateIds = likes.slice(-3).reverse();
+      const superStarRestaurantId =
+        [...session.events].reverse().find((e) => e.action === "SUPERSTAR")?.restaurantId || null;
+      const shouldSuggestMatch = (session.totalSwipes ?? session.events.length) >= 15 || false;
+
+      return res.json({
+        items: [],
+        cursor: null,
+        exhausted: true,
+        shouldMatchPrompt: shouldSuggestMatch,
+        top3CandidateIds,
+        superStarRestaurantId,
+      });
     }
 
     // Rank within the page (does not affect cursor determinism)
@@ -307,6 +334,7 @@ router.post("/next", async (req, res) => {
     res.status(500).json({ error: "next failed" });
   }
 });
+
 
 // Feedback: records LIKE/PASS/SUPERSTAR (UPPERCASE) and may complete session
 router.post("/feedback", async (req, res) => {
