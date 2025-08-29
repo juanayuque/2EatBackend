@@ -65,19 +65,24 @@ function cuisineKeywordsFromUser(user) {
   return out;
 }
 
+
 function restaurantMatchesCuisine(r, keywordSet) {
   if (!keywordSet || !keywordSet.size) return true;
   const primary = (r.primaryType || "").toLowerCase();
   const types = Array.isArray(r.types) ? r.types.map((t) => String(t).toLowerCase()) : [];
-  const display = (r.primaryTypeDisplayName || r.name || "").toLowerCase();
+  // Combine all relevant text fields into one searchable string.
+  const searchableText = [r.name, r.primaryTypeDisplayName, r.editorialSummary].filter(Boolean).join(" ").toLowerCase();
+
   for (const k of keywordSet) {
-    const needle = k.replace(/\s+/g, "_");
+    const needle = k.replace(/\s+/g, "_"); // For matching against Google's type format (e.g., "italian_restaurant")
     if (primary.includes(needle)) return true;
     if (types.some((t) => t.includes(needle))) return true;
-    if (display.includes(k)) return true;
+    // Check the original keyword against the combined free-text fields.
+    if (searchableText.includes(k)) return true;
   }
   return false;
 }
+
 
 function textIncludesAny(r, needles) {
   const fields = [
@@ -202,63 +207,45 @@ function generateRingCenters(lat, lng, minKm = 2, maxKm = 12, stepKm = 2) {
   return centers;
 }
 
-/**
- * [FIXED] The original function created separate queries for each preference,
- * leading to an "OR" search (e.g., find vegetarian OR pet-friendly places).
- * This updated version combines preferences into a single, more specific query first
- * (e.g., "vegetarian pet friendly restaurant") to perform an "AND"-like search,
- * and includes broader queries as fallbacks.
- */
 function buildBiasQueries(user) {
   const req = requirementsFromUser(user);
   const requirementKeywords = [];
   const queries = new Set();
 
-  // 1. Collect requirement keywords from user preferences
   if (req.vegetarian) requirementKeywords.push("vegetarian");
   if (req.petFriendly) requirementKeywords.push("pet friendly");
-  // Using "with parking" is more explicit for text searches than just "parking"
   if (req.parking) requirementKeywords.push("with parking");
 
   const cuisines = Array.from(cuisineKeywordsFromUser(user));
 
-  // 2. Create the most specific, combined query with all preferences
   if (requirementKeywords.length > 0 || cuisines.length > 0) {
-    const allKeywords = [...cuisines, ...requirementKeywords, "restaurant"];
+    const allKeywords = [...cuines, ...requirementKeywords, "restaurant"];
     queries.add(allKeywords.join(" "));
   }
 
-  // 3. Add broader fallback queries in case the specific one yields no results
-  // Add a query for combined cuisines if more than one is selected
   if (cuisines.length > 1) {
     queries.add([...cuisines, "restaurant"].join(" "));
   }
-  // Add queries for each individual cuisine
   for (const cuisine of cuisines) {
     queries.add(`${cuisine} restaurant`);
   }
 
-  // Add a query for combined requirements if more than one is selected
   if (requirementKeywords.length > 1) {
     queries.add([...requirementKeywords, "restaurant"].join(" "));
   }
-  // Add queries for each individual requirement
   if (req.vegetarian) queries.add("vegetarian restaurant");
   if (req.petFriendly) queries.add("pet friendly restaurant");
   if (req.parking) queries.add("restaurant with parking");
 
-  // 4. Add a final generic fallback if no other queries were generated
   if (queries.size === 0) {
     queries.add("restaurant");
   }
 
-  // 5. Prioritize the most specific query by placing it at the front of the array
   const queryArray = Array.from(queries);
   if (requirementKeywords.length > 0 || cuisines.length > 0) {
       const mostSpecificQuery = [...cuisines, ...requirementKeywords, "restaurant"].join(" ");
       const specificIndex = queryArray.indexOf(mostSpecificQuery);
       if (specificIndex > 0) {
-        // Move the most specific query to the beginning of the array
         const [specific] = queryArray.splice(specificIndex, 1);
         queryArray.unshift(specific);
       }
