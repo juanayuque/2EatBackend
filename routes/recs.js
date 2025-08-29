@@ -1,7 +1,4 @@
 // routes/recs.js
-// Router focused on HTTP orchestration. Business logic for Places ingest/backfill
-// lives in services/placesService. Geo/price helpers live in utils so multiple modules share them.
-
 const express = require("express");
 const prisma = require("../src/prisma");
 const verifyFirebaseToken = require("../middleware/auth");
@@ -205,16 +202,28 @@ function generateRingCenters(lat, lng, minKm = 2, maxKm = 12, stepKm = 2) {
   return centers;
 }
 
-function buildBiasQuery(user) {
+function buildBiasQueries(user) {
   const req = requirementsFromUser(user);
-  const parts = [];
-  if (req.vegetarian) parts.push("vegetarian");
-  if (req.parking) parts.push("parking");
-  if (req.petFriendly) parts.push("dog friendly");
+  const qs = [];
   const cuisines = Array.from(cuisineKeywordsFromUser(user)).slice(0, 3);
-  parts.push(...cuisines);
-  parts.push("restaurant");
-  return parts.join(" ");
+
+  if (req.petFriendly) {
+    qs.push("dog friendly restaurant");
+    qs.push("pet friendly restaurant");
+  }
+  if (req.parking) {
+    qs.push("restaurant with parking");
+    qs.push("restaurant car park");
+  }
+  if (req.vegetarian) {
+    qs.push("vegetarian restaurant");
+  }
+  if (!qs.length) {
+    qs.push([...cuisines, "restaurant"].join(" ").trim() || "restaurant");
+  } else if (cuisines.length) {
+    for (const c of cuisines) qs.push(`${c} restaurant`);
+  }
+  return qs;
 }
 
 async function discoverAndIngestAround(
@@ -226,35 +235,40 @@ async function discoverAndIngestAround(
     includeTypes = [["restaurant"]],
     maxCenters = 18,
     delayMs = 120,
-    biasQuery = null,
+    biasQueries = [],
   } = {}
 ) {
   const centers = generateRingCenters(lat, lng, 2, 12, 2).slice(0, maxCenters);
   const byId = new Map();
 
   for (const c of centers) {
-    for (const rankPreference of rankPrefs) {
-      for (const types of includeTypes) {
-        let chunk = [];
-        if (biasQuery) {
-          chunk = await places.googlePlacesSearchText(biasQuery, {
-            lat: c.lat,
-            lng: c.lng,
-            radiusMeters: cellRadiusMeters,
-            maxPages: 2,
-          });
-        } else {
-          chunk = await places.googlePlacesSearchNearby(c.lat, c.lng, {
+    if (biasQueries.length) {
+      for (const q of biasQueries) {
+        const chunk = await places.googlePlacesSearchText(q, {
+          lat: c.lat,
+          lng: c.lng,
+          radiusMeters: cellRadiusMeters,
+          maxPages: 2,
+        });
+        for (const p of chunk || []) {
+          if (p?.id && !byId.has(p.id)) byId.set(p.id, p);
+        }
+        if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
+      }
+    } else {
+      for (const rankPreference of rankPrefs) {
+        for (const types of includeTypes) {
+          const chunk = await places.googlePlacesSearchNearby(c.lat, c.lng, {
             radiusMeters: cellRadiusMeters,
             maxPages: 3,
             rankPreference,
             includedTypes: types,
           });
+          for (const p of chunk || []) {
+            if (p?.id && !byId.has(p.id)) byId.set(p.id, p);
+          }
+          if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
         }
-        for (const p of chunk || []) {
-          if (p?.id && !byId.has(p.id)) byId.set(p.id, p);
-        }
-        if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
       }
     }
   }
@@ -263,17 +277,28 @@ async function discoverAndIngestAround(
   if (!discovered.length) return { discovered: 0 };
 
   const created = await places.upsertPlacesBatch(discovered);
-  console.log(`[recs] discovery sweep: fetched=${discovered.length} (biased=${!!biasQuery}) new=${created}`);
+  console.log(
+    `[recs] discovery sweep: fetched=${discovered.length} (biased=${biasQueries.length > 0}) new=${created}`
+  );
   return { discovered: discovered.length, created };
 }
 
-/* pool builder */
+/* pool builder + shuffle */
+
+function hashStr(s) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h >>> 0;
+}
 
 async function ensurePreferredPool(lat, lng, user, desiredMin = 60) {
   const baseRadius = radiusFromUser(user);
   const expansion = [baseRadius, Math.max(baseRadius, 5), 10, 15, 20, 30, 50];
-  const biasQuery = buildBiasQuery(user);
   const req = requirementsFromUser(user);
+  const biasQueries = buildBiasQueries(user);
 
   const acc = new Map();
 
@@ -304,7 +329,7 @@ async function ensurePreferredPool(lat, lng, user, desiredMin = 60) {
       cellRadiusMeters: Math.round(radiusKm * 1000) || 3000,
       rankPrefs: ["POPULARITY", "DISTANCE"],
       includeTypes: [["restaurant"]],
-      biasQuery,
+      biasQueries,
     });
   }
 
@@ -329,17 +354,6 @@ async function ensurePreferredPool(lat, lng, user, desiredMin = 60) {
   }
 
   return Array.from(acc.values()).slice(0, desiredMin);
-}
-
-/* stable shuffle */
-
-function hashStr(s) {
-  let h = 2166136261 >>> 0;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619) >>> 0;
-  }
-  return h >>> 0;
 }
 
 /* routes */
@@ -407,7 +421,9 @@ router.post("/start", async (req, res) => {
     const filteredPool = await ensurePreferredPool(lat, lng, user, Math.max(60, minPool));
     const pool = filteredPool;
 
-    console.log(`[recs/start] user=${user.id} pool=${pool.length} strictPool=${filteredPool.length}`);
+    console.log(
+      `[recs/start] user=${user.id} pool=${pool.length} strictPool=${filteredPool.length}`
+    );
 
     try {
       const items = filteredPool.slice(0, 200).map((r) => {
@@ -480,10 +496,8 @@ router.post("/next", async (req, res) => {
     }
 
     const prefPool = await ensurePreferredPool(lat, lng, user, 120);
-    const radiusKm = radiusFromUser(user);
     const swipedIds = new Set(session.events.map((e) => e.restaurantId));
     const exclude = new Set(Array.isArray(excludeIds) ? excludeIds.filter(Boolean) : []);
-
     const basePool = prefPool.filter((r) => !swipedIds.has(r.id) && !exclude.has(r.id));
 
     const shuffledPool = basePool

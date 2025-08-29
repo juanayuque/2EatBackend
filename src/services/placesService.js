@@ -1,6 +1,4 @@
 // src/services/placesService.js
-// Encapsulates Google Places fetch, parsing, DB upsert, and DB-first nearby fetch.
-
 const { haversineKm, asFloat } = require("../utils/geo");
 
 const fetchFn =
@@ -14,7 +12,7 @@ function bboxFromCenter(lat, lng, radiusKm) {
 }
 
 function parseGooglePlace(p) {
-  const id = p.id || p.googlePlaceId || p.placeId || p.place_id;
+  const id = p.id || p.googlePlaceId || p.placeId || p.place_id || (p.name && p.name.split("/").pop());
   const lat =
     p.location?.latitude ??
     p.location?.latLng?.latitude ??
@@ -25,10 +23,19 @@ function parseGooglePlace(p) {
     p.location?.latLng?.longitude ??
     p.geometry?.location?.lng ??
     p.lng;
+
+  const displayName = p.displayName?.text || p.name || p.title || "";
+  const editorialSummary = p.editorialSummary?.text || p.editorial_summary || null;
+
+  const dogsHeuristic =
+    /\bdog[- ]?friendly\b|\bpet[- ]?friendly\b|\bdogs welcome\b/i.test(
+      (editorialSummary || "") + " " + displayName
+    );
+
   return {
     id,
     googlePlaceId: id,
-    name: p.displayName?.text || p.name || p.title || "",
+    name: displayName || "",
     latitude: lat,
     longitude: lng,
     formattedAddress: p.formattedAddress || p.vicinity || p.formatted_address || null,
@@ -40,13 +47,13 @@ function parseGooglePlace(p) {
     userRatingCount: p.userRatingCount ?? p.user_ratings_total ?? null,
     priceLevel: p.priceLevel ?? p.price_level ?? null,
     servesVegetarianFood: p.servesVegetarianFood ?? null,
-    editorialSummary: p.editorialSummary?.text || p.editorial_summary || null,
+    editorialSummary,
     takeout: p.takeout ?? null,
     dineIn: p.dineIn ?? p.dine_in ?? null,
     curbsidePickup: p.curbsidePickup ?? p.curbside_pickup ?? null,
     delivery: p.delivery ?? null,
     outdoorSeating: p.outdoorSeating ?? p.outdoor_seating ?? null,
-    allowsDogs: p.allowsDogs ?? null,
+    allowsDogs: p.allowsDogs ?? (dogsHeuristic ? true : null),
     parkingOptions: p.parkingOptions ?? null,
     websiteUri: p.websiteUri ?? p.website_uri ?? null,
     internationalPhoneNumber:
@@ -77,19 +84,67 @@ function createPlacesService({ prisma, googleApiKey }) {
   async function ensureNearbyRestaurantsStrict(lat, lng, minCount = 100, radiusKm = 15, req = {}) {
     const box = bboxFromCenter(lat, lng, radiusKm);
 
+    const petTextOR = [
+      { name: { contains: "dog", mode: "insensitive" } },
+      { name: { contains: "pet friendly", mode: "insensitive" } },
+      { editorialSummary: { contains: "dog", mode: "insensitive" } },
+      { editorialSummary: { contains: "dogs welcome", mode: "insensitive" } },
+      { editorialSummary: { contains: "pet friendly", mode: "insensitive" } },
+    ];
+
+    const parkTextOR = [
+      { editorialSummary: { contains: "parking", mode: "insensitive" } },
+      { editorialSummary: { contains: "car park", mode: "insensitive" } },
+      { name: { contains: "parking", mode: "insensitive" } },
+      { name: { contains: "car park", mode: "insensitive" } },
+    ];
+
+    const vegTextOR = [
+      { editorialSummary: { contains: "vegetarian", mode: "insensitive" } },
+      { editorialSummary: { contains: "vegan", mode: "insensitive" } },
+      { name: { contains: "vegetarian", mode: "insensitive" } },
+      { name: { contains: "vegan", mode: "insensitive" } },
+    ];
+
     const where = {
       latitude: { gte: box.minLat, lte: box.maxLat },
       longitude: { gte: box.minLng, lte: box.maxLng },
       ...(req?.vegetarian
-        ? { OR: [{ servesVegetarianFood: true }, { types: { has: "vegetarian_restaurant" } }] }
+        ? {
+            AND: [
+              {
+                OR: [
+                  { servesVegetarianFood: true },
+                  { types: { has: "vegetarian_restaurant" } },
+                  ...vegTextOR,
+                ],
+              },
+            ],
+          }
         : {}),
-      ...(req?.petFriendly ? { allowsDogs: true } : {}),
-      ...(req?.parking ? { NOT: { parkingOptions: null } } : {}),
+      ...(req?.petFriendly
+        ? {
+            AND: [
+              {
+                OR: [{ allowsDogs: true }, ...petTextOR],
+              },
+            ],
+          }
+        : {}),
+      ...(req?.parking
+        ? {
+            AND: [
+              {
+                OR: [{ NOT: { parkingOptions: null } }, ...parkTextOR],
+              },
+            ],
+          }
+        : {}),
     };
 
     const rows = await prisma.restaurant.findMany({
       where,
-      take: Math.max(minCount * 5, 500),
+      take: Math.max(minCount * 5, 800),
     });
 
     const here = { lat, lng };
@@ -112,7 +167,7 @@ function createPlacesService({ prisma, googleApiKey }) {
         chunk.map(async (raw) => {
           const p = parseGooglePlace(raw);
           if (!p.googlePlaceId || !p.latitude || !p.longitude) return;
-          await prisma.restaurant.upsert({
+          const result = await prisma.restaurant.upsert({
             where: { googlePlaceId: String(p.googlePlaceId) },
             create: {
               googlePlaceId: String(p.googlePlaceId),
@@ -136,7 +191,7 @@ function createPlacesService({ prisma, googleApiKey }) {
               curbsidePickup: p.curbsidePickup === true,
               delivery: p.delivery === true,
               outdoorSeating: p.outdoorSeating === true,
-              allowsDogs: p.allowsDogs === true,
+              allowsDogs: p.allowsDogs === true ? true : false,
               parkingOptions: p.parkingOptions || null,
             },
             update: {
@@ -163,11 +218,14 @@ function createPlacesService({ prisma, googleApiKey }) {
               delivery: p.delivery == null ? undefined : p.delivery === true,
               outdoorSeating:
                 p.outdoorSeating == null ? undefined : p.outdoorSeating === true,
-              allowsDogs: p.allowsDogs == null ? undefined : p.allowsDogs === true,
+              allowsDogs:
+                p.allowsDogs === true
+                  ? true
+                  : undefined,
               parkingOptions: p.parkingOptions ?? undefined,
             },
           });
-          created += 1;
+          if (result.createdAt.getTime() === result.updatedAt.getTime()) created += 1;
         })
       );
     }
@@ -203,7 +261,7 @@ function createPlacesService({ prisma, googleApiKey }) {
           "Content-Type": "application/json",
           "X-Goog-Api-Key": googleApiKey,
           "X-Goog-FieldMask":
-            "places.id,places.displayName,places.location,places.formattedAddress,places.primaryType,places.primaryTypeDisplayName,places.types,places.rating,places.userRatingCount,places.priceLevel",
+            "places.id,places.displayName,places.location,places.formattedAddress,places.primaryType,places.primaryTypeDisplayName,places.types,places.rating,places.userRatingCount,places.priceLevel,places.editorialSummary,places.parkingOptions",
         },
         body: JSON.stringify(body),
       });
@@ -245,7 +303,7 @@ function createPlacesService({ prisma, googleApiKey }) {
           "Content-Type": "application/json",
           "X-Goog-Api-Key": googleApiKey,
           "X-Goog-FieldMask":
-            "places.id,places.displayName,places.location,places.formattedAddress,places.primaryType,places.primaryTypeDisplayName,places.types,places.rating,places.userRatingCount,places.priceLevel",
+            "places.id,places.displayName,places.location,places.formattedAddress,places.primaryType,places.primaryTypeDisplayName,places.types,places.rating,places.userRatingCount,places.priceLevel,places.editorialSummary,places.parkingOptions",
         },
         body: JSON.stringify(body),
       });
