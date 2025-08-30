@@ -82,29 +82,61 @@ router.get("/", async (req, res) => {
 /** PUT /api/matches/:id/comment  { comment: string }
  *  Saves/updates a single user comment on the match (per user).
  */
+/** PUT /api/matches/:id/comment  { comment: string }
+ *  Works for both solo Match and GroupMatch.
+ *  Returns { ok: true, userComment }
+ */
 router.put("/:id/comment", async (req, res) => {
   try {
-    const uid = req.user.uid;
-    const user = await prisma.user.findUnique({ where: { firebaseUid: uid } });
-    if (!user) return res.status(404).json({ error: "User not found" });
+    const uid = req.user?.uid;
+    if (!uid) return res.status(401).json({ error: "unauthorized" });
+
+    const me = await prisma.user.findUnique({ where: { firebaseUid: uid } });
+    if (!me) return res.status(404).json({ error: "User not found" });
 
     const { id } = req.params;
     const { comment } = req.body || {};
-    if (typeof comment !== "string") return res.status(400).json({ error: "comment required" });
+    if (typeof comment !== "string") {
+      return res.status(400).json({ error: "comment required" });
+    }
+    const normalized = comment.trim() || null;
 
-    const match = await prisma.match.findUnique({ where: { id } });
-    if (!match || match.userId !== user.id) return res.status(404).json({ error: "Match not found" });
+    // 1) Try SOLO match first
+    const solo = await prisma.match.findUnique({ where: { id } });
+    if (solo) {
+      if (solo.userId !== me.id) {
+        return res.status(403).json({ error: "Not your match" });
+      }
+      const updated = await prisma.match.update({
+        where: { id },
+        data: { userComment: normalized },
+        select: { userComment: true },
+      });
+      return res.json({ ok: true, userComment: updated.userComment });
+    }
 
-    const updated = await prisma.match.update({
-      where: { id },
-      data: { userComment: comment.trim() || null },
-    });
+    // 2) Try GROUP match
+    const group = await prisma.groupMatch.findUnique({ where: { id } });
+    if (group) {
+      if (group.hostUserId !== me.id && group.friendUserId !== me.id) {
+        return res.status(403).json({ error: "Not your group match" });
+      }
+      const updated = await prisma.groupMatch.update({
+        where: { id },
+        data: { comment: normalized },
+        select: { comment: true },
+      });
+      // Normalize field name for the client
+      return res.json({ ok: true, userComment: updated.comment ?? null });
+    }
 
-    res.json({ ok: true, userComment: updated.userComment });
+    // 3) Nothing found
+    return res.status(404).json({ error: "Match not found" });
   } catch (e) {
     console.error("[matches] save comment error:", e);
     res.status(500).json({ error: "failed_save_comment" });
   }
 });
+
 
 module.exports = router;
