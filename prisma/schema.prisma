@@ -1,9 +1,6 @@
 // This is your Prisma schema file,
 // learn more about it in the docs: https://pris.ly/d/prisma-schema
 
-// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
-// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
-
 generator client {
   provider = "prisma-client-js"
   //output   = "../generated/prisma"
@@ -14,7 +11,7 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-//Predefined options
+// ─────────── Enums ───────────
 enum Gender {
   MALE
   FEMALE
@@ -35,6 +32,14 @@ enum FriendRequestStatus {
   CANCELED
 }
 
+enum GroupRequestStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  CANCELED
+}
+
+// ─────────── Friends ───────────
 model FriendRequest {
   id         String              @id @default(uuid())
   fromUserId String
@@ -43,11 +48,17 @@ model FriendRequest {
   createdAt  DateTime            @default(now())
   updatedAt  DateTime            @updatedAt
 
+<<<<<<< HEAD
   fromUser User @relation("FriendRequestsSent", fields: [fromUserId], references: [id])
   toUser   User @relation("FriendRequestsReceived", fields: [toUserId], references: [id])
+=======
+  fromUser    User                 @relation("FriendRequestsSent",     fields: [fromUserId], references: [id])
+  toUser      User                 @relation("FriendRequestsReceived", fields: [toUserId],   references: [id])
+>>>>>>> effdb18e740fd2354cff4c11567e73cd965db05a
 
   @@unique([fromUserId, toUserId]) // enables where: { fromUserId_toUserId: {...} }
   @@index([toUserId, status])
+  @@index([fromUserId, status])
 }
 
 model Friend {
@@ -56,13 +67,22 @@ model Friend {
   friendId  String
   createdAt DateTime @default(now())
 
+<<<<<<< HEAD
   user   User @relation("FriendsOwner", fields: [userId], references: [id])
   friend User @relation("FriendsFriend", fields: [friendId], references: [id])
+=======
+  user      User     @relation("FriendsOwner",  fields: [userId],   references: [id])
+  friend    User     @relation("FriendsFriend", fields: [friendId], references: [id])
+>>>>>>> effdb18e740fd2354cff4c11567e73cd965db05a
 
   @@unique([userId, friendId]) // enables where: { userId_friendId: {...} }
   @@index([friendId])
 }
 
+<<<<<<< HEAD
+=======
+// ─────────── Solo swiping ───────────
+>>>>>>> effdb18e740fd2354cff4c11567e73cd965db05a
 model SwipeSession {
   id          String       @id @default(cuid())
   userId      String
@@ -87,7 +107,11 @@ model SwipeEvent {
   user         User         @relation(fields: [userId], references: [id])
   restaurantId String
   action       SwipeAction
+<<<<<<< HEAD
   position     Int // 1..N within session
+=======
+  position     Int
+>>>>>>> effdb18e740fd2354cff4c11567e73cd965db05a
   createdAt    DateTime     @default(now())
 
   @@index([userId])
@@ -101,7 +125,7 @@ model Superstar {
   user         User     @relation(fields: [userId], references: [id])
   restaurantId String
   sessionId    String?
-  createdAt    DateTime @default(now())
+  createdAt    DateTime  @default(now())
 
   @@unique([userId, restaurantId])
   @@index([sessionId])
@@ -109,6 +133,7 @@ model Superstar {
 }
 
 model Match {
+<<<<<<< HEAD
   id        String       @id @default(cuid())
   userId    String
   user      User         @relation(fields: [userId], references: [id])
@@ -123,11 +148,28 @@ model Match {
   createdAt             DateTime @default(now())
 
   userComment String? // <— NEW
+=======
+  id                     String        @id @default(cuid())
+  userId                 String
+  user                   User          @relation(fields: [userId], references: [id])
+  sessionId              String        @unique
+  session                SwipeSession  @relation(fields: [sessionId], references: [id])
+
+  top1RestaurantId       String
+  top2RestaurantId       String?
+  top3RestaurantId       String?
+  superStarRestaurantId  String?
+  winnerRestaurantId     String
+  createdAt              DateTime      @default(now())
+
+  userComment            String?
+>>>>>>> effdb18e740fd2354cff4c11567e73cd965db05a
 
   @@index([userId])
   @@map("matches")
 }
 
+<<<<<<< HEAD
 model User {
   id          String  @id @default(cuid())
   firebaseUid String  @unique
@@ -135,6 +177,16 @@ model User {
   username    String? @unique
   displayName String?
   photoUrl    String?
+=======
+// ─────────── Users ───────────
+model User {
+  id                String   @id @default(cuid())
+  firebaseUid       String   @unique
+  email             String?  @unique
+  username          String?  @unique
+  displayName       String?
+  photoUrl          String?
+>>>>>>> effdb18e740fd2354cff4c11567e73cd965db05a
 
   age               Int?
   gender            Gender?
@@ -143,6 +195,7 @@ model User {
   dietaryNeeds      String[] @map("dietary_needs")
   preferredCuisines String[] @map("preferred_cuisines")
 
+<<<<<<< HEAD
   // existing relations
   sessions   SwipeSession[]
   events     SwipeEvent[]
@@ -156,6 +209,30 @@ model User {
   friendsFriend          Friend[]            @relation("FriendsFriend")
   roupSessionsHosted     GroupSwipeSession[] @relation("GroupHost")
   groupSessionsAsFriend  GroupSwipeSession[] @relation("GroupFriend")
+=======
+  // Solo swipe relations
+  sessions          SwipeSession[]
+  events            SwipeEvent[]
+  superstars        Superstar[]
+  matches           Match[]
+
+  // Friend relations
+  friendRequestsSent     FriendRequest[] @relation("FriendRequestsSent")
+  friendRequestsReceived FriendRequest[] @relation("FriendRequestsReceived")
+  friendsOwner           Friend[]        @relation("FriendsOwner")
+  friendsFriend          Friend[]        @relation("FriendsFriend")
+
+  // Group request relations
+  groupRequestsSent      GroupRequest[]      @relation("GroupRequestsSent")
+  groupRequestsReceived  GroupRequest[]      @relation("GroupRequestsReceived")
+
+  // Group session relations
+  groupSessionsStarted   GroupSwipeSession[] @relation("GroupSessionsStarter")
+  groupSessionsA         GroupSwipeSession[] @relation("GroupSessionsA")
+  groupSessionsB         GroupSwipeSession[] @relation("GroupSessionsB")
+
+  // Group swipe events
+>>>>>>> effdb18e740fd2354cff4c11567e73cd965db05a
   groupEvents            GroupSwipeEvent[]
 
   emailVerified Boolean? @default(false)
@@ -165,20 +242,20 @@ model User {
   @@map("users")
 }
 
+// ─────────── Places ───────────
 model Restaurant {
-  // We use `googlePlaceId` as the unique identifier for Google Places.
   id                       String   @id @default(uuid())
-  googlePlaceId            String   @unique @map("google_place_id") // Google's unique Place ID, MUST be NOT NULL
+  googlePlaceId            String   @unique @map("google_place_id")
   name                     String
-  latitude                 Decimal  @db.Decimal(10, 7) // Store with specific precision for lat/lng
+  latitude                 Decimal  @db.Decimal(10, 7)
   longitude                Decimal  @db.Decimal(10, 7)
-  formattedAddress         String?  @map("formatted_address") @db.Text // Use @db.Text for longer strings
+  formattedAddress         String?  @map("formatted_address") @db.Text
   internationalPhoneNumber String?  @map("international_phone_number")
   websiteUri               String?  @map("website_uri") @db.Text
   primaryTypeDisplayName   String?  @map("primary_type_display_name")
   primaryType              String?  @map("primary_type")
   types                    String[] @map("types")
-  rating                   Decimal? @db.Decimal(2, 1) // Store with specific precision for rating
+  rating                   Decimal? @db.Decimal(2, 1)
   userRatingCount          Int?     @map("user_rating_count")
   priceLevel               Int?     @map("price_level")
   servesVegetarianFood     Boolean? @default(false) @map("serves_vegetarian_food")
@@ -190,18 +267,16 @@ model Restaurant {
   delivery                 Boolean? @default(false)
   outdoorSeating           Boolean? @default(false) @map("outdoor_seating")
   allowsDogs               Boolean? @default(false) @map("allows_dogs")
-  parkingOptions           Json?    @map("parking_options") // Use Json for PostgreSQL's JSONB type
-  regularOpeningHours      Json?    @map("regular_opening_hours") // Use Json for PostgreSQL's JSONB type
+  parkingOptions           Json?    @map("parking_options")
+  regularOpeningHours      Json?    @map("regular_opening_hours")
 
-  // Relations to other models
   reviews Review[]
   photos  Photo[]
 
-  // Timestamps
   createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
+  updatedAt DateTime @updatedAt      @map("updated_at")
 
-  @@map("restaurants") // Maps this model to the 'restaurants' table in the database
+  @@map("restaurants")
 }
 
 model Review {
@@ -214,7 +289,7 @@ model Review {
   publishTime  DateTime?  @map("publish_time")
 
   createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
+  updatedAt DateTime @updatedAt      @map("updated_at")
 
   @@map("reviews")
 }
@@ -228,13 +303,14 @@ model Photo {
   heightPx     Int?       @map("height_px")
 
   createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
+  updatedAt DateTime @updatedAt      @map("updated_at")
 
   @@map("photos")
 }
 
-// --- NEW ---
+// ─────────── Group swiping ───────────
 model GroupSwipeSession {
+<<<<<<< HEAD
   id           String    @id @default(cuid())
   hostUserId   String
   friendUserId String
@@ -246,19 +322,32 @@ model GroupSwipeSession {
 
   events GroupSwipeEvent[]
   match  GroupMatch?
+=======
+  id           String   @id @default(cuid())
+  status       String   @default("active") // "active" | "completed"
+  startedAt    DateTime @default(now())
+  endedAt      DateTime?
+  context      Json?
 
-  host   User @relation("GroupHost", fields: [hostUserId], references: [id])
-  friend User @relation("GroupFriend", fields: [friendUserId], references: [id])
+  startedById  String
+  aUserId      String
+  bUserId      String
+>>>>>>> effdb18e740fd2354cff4c11567e73cd965db05a
 
-  @@index([hostUserId, status])
-  @@index([friendUserId, status])
+  startedBy    User     @relation("GroupSessionsStarter", fields: [startedById], references: [id])
+  aUser        User     @relation("GroupSessionsA",       fields: [aUserId],     references: [id])
+  bUser        User     @relation("GroupSessionsB",       fields: [bUserId],     references: [id])
+
+  @@index([aUserId])
+  @@index([bUserId])
+  @@index([status])
   @@map("group_swipe_sessions")
 }
 
 model GroupSwipeEvent {
   id           String      @id @default(cuid())
   sessionId    String
-  userId       String // who tapped (host for MVP)
+  userId       String
   restaurantId String
   action       SwipeAction
   position     Int
@@ -274,11 +363,20 @@ model GroupSwipeEvent {
 }
 
 model GroupMatch {
+<<<<<<< HEAD
   id           String            @id @default(cuid())
   sessionId    String            @unique
   session      GroupSwipeSession @relation(fields: [sessionId], references: [id])
   hostUserId   String
   friendUserId String
+=======
+  id                    String             @id @default(cuid())
+  sessionId             String             @unique
+  session               GroupSwipeSession  @relation(fields: [sessionId], references: [id])
+
+  hostUserId            String
+  friendUserId          String
+>>>>>>> effdb18e740fd2354cff4c11567e73cd965db05a
 
   top1RestaurantId      String
   top2RestaurantId      String?
@@ -293,3 +391,23 @@ model GroupMatch {
   @@index([friendUserId])
   @@map("group_matches")
 }
+<<<<<<< HEAD
+=======
+
+model GroupRequest {
+  id          String              @id @default(uuid())
+  fromUserId  String
+  toUserId    String
+  status      GroupRequestStatus  @default(PENDING)
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  fromUser    User                @relation("GroupRequestsSent",     fields: [fromUserId], references: [id])
+  toUser      User                @relation("GroupRequestsReceived", fields: [toUserId],   references: [id])
+
+  @@unique([fromUserId, toUserId])
+  @@index([toUserId, status])
+  @@index([fromUserId, status])
+  @@map("group_requests")
+}
+>>>>>>> effdb18e740fd2354cff4c11567e73cd965db05a
