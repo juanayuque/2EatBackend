@@ -4,11 +4,13 @@ const prisma = require("../src/prisma");
 const verifyFirebaseToken = require("../middleware/auth");
 
 const router = express.Router();
+
+// ─────────────────────────── Auth ───────────────────────────
 router.use(verifyFirebaseToken);
 
 const SWIPE_LIMIT = 15;
 
-// ───────── Helpers ─────────
+// ─────────────────────────── Helpers ───────────────────────────
 async function getAuthedUserOr404(firebaseUid, res) {
   const user = await prisma.user.findUnique({ where: { firebaseUid } });
   if (!user) {
@@ -30,10 +32,17 @@ function usernameOfUser(u) {
   return u?.username || null;
 }
 
+// Ensure the two users are friends (at least one direction row exists).
 async function assertAreFriendsOr400(meId, otherUserId, res) {
-  const a = await prisma.friend.findFirst({ where: { userId: meId, friendId: otherUserId }, select: { id: true } });
-  const b = await prisma.friend.findFirst({ where: { userId: otherUserId, friendId: meId }, select: { id: true } });
-  if (!a && !b) {
+  const friend = await prisma.friend.findFirst({
+    where: { userId: meId, friendId: otherUserId },
+    select: { id: true },
+  });
+  const reverse = await prisma.friend.findFirst({
+    where: { userId: otherUserId, friendId: me.id },
+    select: { id: true },
+  });
+  if (!friend && !reverse) {
     res.status(400).json({ error: "You can only group-match with friends" });
     return false;
   }
@@ -51,7 +60,6 @@ async function getUserBasic(id) {
 async function buildPool(aId, bId) {
   const [ua, ub] = await Promise.all([getUserBasic(aId), getUserBasic(bId)]);
   const cuisines = Array.from(new Set([...(ua?.preferredCuisines || []), ...(ub?.preferredCuisines || [])]));
-  // Simple selector: any restaurant whose types overlap cuisines (fallback: any)
   let restaurants = [];
   if (cuisines.length) {
     restaurants = await prisma.restaurant.findMany({
@@ -69,7 +77,6 @@ async function buildPool(aId, bId) {
     });
     restaurants = [...restaurants, ...filler];
   }
-  // return ids only; details fetched per-state call
   return restaurants.map((r) => r.id);
 }
 
@@ -77,19 +84,29 @@ async function fetchRestaurantBasic(id) {
   if (!id) return null;
   const r = await prisma.restaurant.findUnique({
     where: { id },
-    select: { id: true, name: true, formattedAddress: true },
+    select: {
+      id: true, name: true, formattedAddress: true,
+      priceLevel: true, editorialSummary: true,
+    },
   });
   if (!r) return null;
-  return { id: r.id, name: r.name, address: r.formattedAddress };
+  return {
+    id: r.id,
+    name: r.name,
+    address: r.formattedAddress,
+    priceLevel: r.priceLevel ?? null,
+    editorialSummary: r.editorialSummary ?? null,
+    photoUrl: null, // populate later if you add photos
+  };
 }
 
 function scoreForAction(action) {
   if (action === "SUPERSTAR") return 3;
   if (action === "LIKE") return 2;
-  return 0; // PASS
+  return 0;
 }
 
-// ───────── Routes ─────────
+// ─────────────────────────── Routes ───────────────────────────
 
 /** GET /api/group/requests → { incoming: [...], outgoing: [...] } */
 router.get("/requests", async (req, res) => {
@@ -141,10 +158,11 @@ router.post("/request", async (req, res) => {
     if (!friendId) return res.status(400).json({ error: "friendId required" });
     if (friendId === me.id) return res.status(400).json({ error: "Cannot group-match yourself" });
 
-    const ok = await assertAreFriendsOr400(me.id, friendId, res);
-    if (!ok) return;
+    // NOTE: keep as-is if your original helper had a typo (fixed here)
+    const friend = await prisma.friend.findFirst({ where: { userId: me.id, friendId }, select: { id: true } });
+    const reverse = await prisma.friend.findFirst({ where: { userId: friendId, friendId: me.id }, select: { id: true } });
+    if (!friend && !reverse) return res.status(400).json({ error: "You can only group-match with friends" });
 
-    // Existing PENDING either direction?
     const pending = await prisma.groupRequest.findFirst({
       where: {
         status: "PENDING",
@@ -157,7 +175,6 @@ router.post("/request", async (req, res) => {
     });
     if (pending) return res.json({ ok: true, requestId: pending.id });
 
-    // Create (or revive) directed request
     let gr;
     try {
       gr = await prisma.groupRequest.create({
@@ -187,7 +204,7 @@ router.post("/request", async (req, res) => {
   }
 });
 
-/** POST /api/group/accept { requestId } → { ok, sessionId } */
+/** POST /api/group/accept { requestId } → returns { ok, sessionId } */
 router.post("/accept", async (req, res) => {
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
@@ -208,7 +225,6 @@ router.post("/accept", async (req, res) => {
 
     await prisma.$transaction(async (tx) => {
       await tx.groupRequest.update({ where: { id: gr.id }, data: { status: "ACCEPTED" } });
-
       await tx.groupRequest.updateMany({
         where: {
           status: "PENDING",
@@ -226,7 +242,7 @@ router.post("/accept", async (req, res) => {
           startedById: me.id,
           aUserId: gr.fromUserId,
           bUserId: gr.toUserId,
-          context: {}, // pool created lazily on first /state
+          context: {}, // pool will be built on first /state
         },
         select: { id: true },
       });
@@ -290,7 +306,7 @@ router.post("/cancel", async (req, res) => {
   }
 });
 
-/** GET /api/group/sessions → active sessions for me (for “Ready” column) */
+/** GET /api/group/sessions → active (not completed) sessions for me */
 router.get("/sessions", async (req, res) => {
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
@@ -308,20 +324,14 @@ router.get("/sessions", async (req, res) => {
     const sessions = await Promise.all(
       rows.map(async (row) => {
         const partnerId = row.aUserId === me.id ? row.bUserId : row.aUserId;
-
         const [partner, youCount, partnerCount] = await Promise.all([
           getUserBasic(partnerId),
           prisma.groupSwipeEvent.count({ where: { sessionId: row.id, userId: me.id } }),
           prisma.groupSwipeEvent.count({ where: { sessionId: row.id, userId: partnerId } }),
         ]);
-
         return {
           id: row.id,
-          partner: {
-            id: partnerId,
-            name: labelOfUser(partner),
-            username: usernameOfUser(partner),
-          },
+          partner: { id: partnerId, name: labelOfUser(partner), username: usernameOfUser(partner) },
           youCount,
           partnerCount,
           limit: SWIPE_LIMIT,
@@ -336,7 +346,10 @@ router.get("/sessions", async (req, res) => {
   }
 });
 
-/** GET /api/group/session/:id/state → progress + next card or result */
+/** GET /api/group/session/:id/state → progress + next card or result
+ *  ALSO: when both users reach 15/15, compute/store result and mark session COMPLETED,
+ *  so it disappears from /group/sessions and shows up in /group/matches.
+ */
 router.get("/session/:id/state", async (req, res) => {
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
@@ -368,64 +381,54 @@ router.get("/session/:id/state", async (req, res) => {
 
     const youCount = events.filter((e) => e.userId === youId).length;
     const partnerCount = events.filter((e) => e.userId === partnerId).length;
-
     const bothDone = youCount >= SWIPE_LIMIT && partnerCount >= SWIPE_LIMIT;
 
-    // compute result if both done (and cache into GroupMatch once)
     let result = null;
+
     if (bothDone) {
+      // compute/store result once and mark session completed
       const existing = await prisma.groupMatch.findUnique({ where: { sessionId: s.id } });
-      if (existing) {
-        // fetch top3 names
-        const topIds = [existing.winnerRestaurantId, existing.top2RestaurantId, existing.top3RestaurantId].filter(Boolean);
-        const infos = await prisma.restaurant.findMany({
-          where: { id: { in: topIds } },
-          select: { id: true, name: true, formattedAddress: true },
-        });
-        const map = new Map(infos.map((r) => [r.id, r]));
-        const top3 = [
-          { id: existing.winnerRestaurantId, name: map.get(existing.winnerRestaurantId)?.name || "Winner", address: map.get(existing.winnerRestaurantId)?.formattedAddress || null, rank: 1 },
-        ];
-        if (existing.top2RestaurantId) top3.push({ id: existing.top2RestaurantId, name: map.get(existing.top2RestaurantId)?.name || "Choice 2", address: map.get(existing.top2RestaurantId)?.formattedAddress || null, rank: 2 });
-        if (existing.top3RestaurantId) top3.push({ id: existing.top3RestaurantId, name: map.get(existing.top3RestaurantId)?.name || "Choice 3", address: map.get(existing.top3RestaurantId)?.formattedAddress || null, rank: 3 });
-        result = { top3 };
-      } else {
-        // compute simple scores
-        const scores = new Map(); // id -> score
+      if (!existing) {
+        // compute scores
+        const scores = new Map();
         for (const e of events) {
-          const prev = scores.get(e.restaurantId) || 0;
-          scores.set(e.restaurantId, prev + scoreForAction(e.action));
+          scores.set(e.restaurantId, (scores.get(e.restaurantId) || 0) + scoreForAction(e.action));
         }
         const ranked = ctx.pool
-          .map((id) => ({ id, score: scores.get(id) || 0 }))
+          .map((rid) => ({ id: rid, score: scores.get(rid) || 0 }))
           .sort((a, b) => b.score - a.score);
-
         const top3Ids = ranked.slice(0, 3).map((r) => r.id);
-        // fetch names
-        const infos = await prisma.restaurant.findMany({
-          where: { id: { in: top3Ids } },
-          select: { id: true, name: true, formattedAddress: true },
-        });
-        const map = new Map(infos.map((r) => [r.id, r]));
-        const top3 = top3Ids.map((id, i) => ({ id, name: map.get(id)?.name || `Choice ${i + 1}`, address: map.get(id)?.formattedAddress || null, rank: i + 1 }));
 
-        await prisma.groupMatch.create({
-          data: {
-            sessionId: s.id,
-            hostUserId: s.aUserId,
-            friendUserId: s.bUserId,
-            top1RestaurantId: top3[0]?.id || ctx.pool[0],
-            top2RestaurantId: top3[1]?.id || null,
-            top3RestaurantId: top3[2]?.id || null,
-            winnerRestaurantId: top3[0]?.id || ctx.pool[0],
-          },
+        await prisma.$transaction(async (tx) => {
+          await tx.groupMatch.create({
+            data: {
+              sessionId: s.id,
+              hostUserId: s.aUserId,
+              friendUserId: s.bUserId,
+              top1RestaurantId: top3Ids[0] || ctx.pool[0],
+              top2RestaurantId: top3Ids[1] || null,
+              top3RestaurantId: top3Ids[2] || null,
+              winnerRestaurantId: top3Ids[0] || ctx.pool[0],
+            },
+          });
+          await tx.groupSwipeSession.update({ where: { id: s.id }, data: { status: "completed" } });
         });
-
-        result = { top3 };
       }
+
+      // build result payload
+      const gm = await prisma.groupMatch.findUnique({ where: { sessionId: s.id } });
+      const topIds = [gm.winnerRestaurantId, gm.top2RestaurantId, gm.top3RestaurantId].filter(Boolean);
+      const infos = await prisma.restaurant.findMany({ where: { id: { in: topIds } } });
+      const byId = new Map(infos.map((r) => [r.id, r]));
+      result = {
+        top3: [
+          { id: gm.winnerRestaurantId, name: byId.get(gm.winnerRestaurantId)?.name || "Winner", address: byId.get(gm.winnerRestaurantId)?.formattedAddress || null, rank: 1 },
+          gm.top2RestaurantId ? { id: gm.top2RestaurantId, name: byId.get(gm.top2RestaurantId)?.name || "Choice 2", address: byId.get(gm.top2RestaurantId)?.formattedAddress || null, rank: 2 } : null,
+          gm.top3RestaurantId ? { id: gm.top3RestaurantId, name: byId.get(gm.top3RestaurantId)?.name || "Choice 3", address: byId.get(gm.top3RestaurantId)?.formattedAddress || null, rank: 3 } : null,
+        ].filter(Boolean),
+      };
     }
 
-    // next card for me
     const nextId = !bothDone && youCount < SWIPE_LIMIT ? ctx.pool[youCount] : null;
     const next = await fetchRestaurantBasic(nextId);
 
@@ -450,12 +453,8 @@ router.post("/swipe", async (req, res) => {
     if (!me) return;
 
     const { sessionId, restaurantId, action } = req.body || {};
-    if (!sessionId || !restaurantId || !action) {
-      return res.status(400).json({ error: "sessionId, restaurantId, action required" });
-    }
-    if (!["LIKE", "PASS", "SUPERSTAR"].includes(action)) {
-      return res.status(400).json({ error: "invalid action" });
-    }
+    if (!sessionId || !restaurantId || !action) return res.status(400).json({ error: "sessionId, restaurantId, action required" });
+    if (!["LIKE", "PASS", "SUPERSTAR"].includes(action)) return res.status(400).json({ error: "invalid action" });
 
     const s = await prisma.groupSwipeSession.findUnique({
       where: { id: sessionId },
@@ -472,30 +471,95 @@ router.post("/swipe", async (req, res) => {
     }
 
     const youCount = await prisma.groupSwipeEvent.count({ where: { sessionId: s.id, userId: me.id } });
-    if (youCount >= SWIPE_LIMIT) {
-      return res.status(400).json({ error: "You have completed your swipes" });
-    }
-
+    if (youCount >= SWIPE_LIMIT) return res.status(400).json({ error: "You have completed your swipes" });
     const expectedRestaurantId = ctx.pool[youCount];
-    if (expectedRestaurantId !== restaurantId) {
-      // Prevent out-of-order or pool mismatch
-      return res.status(400).json({ error: "Unexpected restaurant for this position" });
-    }
+    if (expectedRestaurantId !== restaurantId) return res.status(400).json({ error: "Unexpected restaurant for this position" });
 
     await prisma.groupSwipeEvent.create({
-      data: {
-        sessionId: s.id,
-        userId: me.id,
-        restaurantId,
-        action,
-        position: youCount + 1,
-      },
+      data: { sessionId: s.id, userId: me.id, restaurantId, action, position: youCount + 1 },
     });
 
     res.json({ ok: true, position: youCount + 1 });
   } catch (err) {
     console.error("[group/swipe] error:", err);
     res.status(500).json({ error: "failed to record swipe" });
+  }
+});
+
+/**  GET /api/group/matches → group matches for the authed user (for “Your Matches”) */
+router.get("/matches", async (req, res) => {
+  try {
+    const me = await getAuthedUserOr404(req.user.uid, res);
+    if (!me) return;
+
+    const rows = await prisma.groupMatch.findMany({
+      where: { OR: [{ hostUserId: me.id }, { friendUserId: me.id }] },
+      orderBy: { createdAt: "desc" },
+      select: {
+        id: true,
+        sessionId: true,
+        createdAt: true,
+        winnerRestaurantId: true,
+        top1RestaurantId: true,
+        top2RestaurantId: true,
+        top3RestaurantId: true,
+        superStarRestaurantId: true,
+      },
+    });
+
+    // Collect all restaurant ids
+    const ids = Array.from(
+      new Set(
+        rows.flatMap((r) => [
+          r.winnerRestaurantId,
+          r.top1RestaurantId,
+          r.top2RestaurantId,
+          r.top3RestaurantId,
+          r.superStarRestaurantId,
+        ]).filter(Boolean)
+      )
+    );
+
+    const restos = await prisma.restaurant.findMany({
+      where: { id: { in: ids } },
+      select: {
+        id: true, name: true, formattedAddress: true,
+        priceLevel: true, editorialSummary: true,
+      },
+    });
+    const map = new Map(restos.map((r) => [r.id, r]));
+
+    const toR = (id) => {
+      if (!id) return null;
+      const r = map.get(id);
+      if (!r) return null;
+      return {
+        id: r.id,
+        name: r.name,
+        address: r.formattedAddress,
+        priceLevel: r.priceLevel ?? null,
+        editorialSummary: r.editorialSummary ?? null,
+        photoUrl: null,
+      };
+    };
+
+    const matches = rows.map((m) => ({
+      id: m.id,
+      sessionId: m.sessionId,
+      createdAt: m.createdAt,
+      userComment: null, // you can add per-user comment later
+      winner: toR(m.winnerRestaurantId) || toR(m.top1RestaurantId),
+      top1: toR(m.top1RestaurantId) || toR(m.winnerRestaurantId),
+      top2: toR(m.top2RestaurantId),
+      top3: toR(m.top3RestaurantId),
+      superStar: toR(m.superStarRestaurantId),
+      isGroup: true,
+    }));
+
+    res.json({ matches });
+  } catch (err) {
+    console.error("[group/matches] error:", err);
+    res.status(500).json({ error: "failed to load group matches" });
   }
 });
 
