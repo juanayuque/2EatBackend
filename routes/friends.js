@@ -338,4 +338,31 @@ router.post("/decline", async (req, res) => {
   }
 });
 
+/** POST /api/friends/remove { friendId } */
+router.post("/remove", async (req, res) => {
+  try {
+    const me = await getAuthedUserOr404(req.user.uid, res);
+    if (!me) return;
+
+    const friendId = req.body?.friendId;
+    if (!friendId) return res.status(400).json({ error: "friendId required" });
+
+    const result = await prisma.$transaction(async (tx) => {
+      const a = await tx.friend.deleteMany({
+        where: { userId: me.id, friendId },
+      });
+      const b = await tx.friend.deleteMany({
+        where: { userId: friendId, friendId: me.id },
+      });
+      return (a.count || 0) + (b.count || 0);
+    });
+
+    res.json({ ok: true, removed: result });
+  } catch (err) {
+    console.error("[friends/remove] error:", err);
+    res.status(500).json({ error: "failed to remove friend" });
+  }
+});
+
+
 module.exports = router;
