@@ -39,15 +39,15 @@ enum GroupRequestStatus {
 
 // ───────────────────────── Friends ─────────────────────────
 model FriendRequest {
-  id          String               @id @default(uuid())
-  fromUserId  String
-  toUserId    String
-  status      FriendRequestStatus  @default(PENDING)
-  createdAt   DateTime             @default(now())
-  updatedAt   DateTime             @updatedAt
+  id         String              @id @default(uuid())
+  fromUserId String
+  toUserId   String
+  status     FriendRequestStatus @default(PENDING)
+  createdAt  DateTime            @default(now())
+  updatedAt  DateTime            @updatedAt
 
-  fromUser    User                 @relation("FriendRequestsSent",     fields: [fromUserId], references: [id])
-  toUser      User                 @relation("FriendRequestsReceived", fields: [toUserId],   references: [id])
+  fromUser User @relation("FriendRequestsSent", fields: [fromUserId], references: [id])
+  toUser   User @relation("FriendRequestsReceived", fields: [toUserId], references: [id])
 
   @@unique([fromUserId, toUserId])
   @@index([toUserId, status])
@@ -59,8 +59,8 @@ model Friend {
   friendId  String
   createdAt DateTime @default(now())
 
-  user      User     @relation("FriendsOwner",  fields: [userId],   references: [id])
-  friend    User     @relation("FriendsFriend", fields: [friendId], references: [id])
+  user   User @relation("FriendsOwner", fields: [userId], references: [id])
+  friend User @relation("FriendsFriend", fields: [friendId], references: [id])
 
   @@unique([userId, friendId])
   @@index([friendId])
@@ -68,16 +68,16 @@ model Friend {
 
 // ───────────────────────── Solo swiping ─────────────────────────
 model SwipeSession {
-  id           String     @id @default(cuid())
-  userId       String
-  user         User       @relation(fields: [userId], references: [id])
-  status       String     @default("active") // active|completed
-  startedAt    DateTime   @default(now())
-  endedAt      DateTime?
-  totalSwipes  Int        @default(0)
-  context      Json?
-  events       SwipeEvent[]
-  match        Match?
+  id          String       @id @default(cuid())
+  userId      String
+  user        User         @relation(fields: [userId], references: [id])
+  status      String       @default("active") // active|completed
+  startedAt   DateTime     @default(now())
+  endedAt     DateTime?
+  totalSwipes Int          @default(0)
+  context     Json?
+  events      SwipeEvent[]
+  match       Match?
 
   @@index([userId, status])
   @@map("swipe_sessions")
@@ -113,20 +113,20 @@ model Superstar {
 }
 
 model Match {
-  id                     String   @id @default(cuid())
-  userId                 String
-  user                   User     @relation(fields: [userId], references: [id])
-  sessionId              String   @unique
-  session                SwipeSession @relation(fields: [sessionId], references: [id])
+  id        String       @id @default(cuid())
+  userId    String
+  user      User         @relation(fields: [userId], references: [id])
+  sessionId String       @unique
+  session   SwipeSession @relation(fields: [sessionId], references: [id])
 
-  top1RestaurantId       String
-  top2RestaurantId       String?
-  top3RestaurantId       String?
-  superStarRestaurantId  String?
-  winnerRestaurantId     String
-  createdAt              DateTime @default(now())
+  top1RestaurantId      String
+  top2RestaurantId      String?
+  top3RestaurantId      String?
+  superStarRestaurantId String?
+  winnerRestaurantId    String
+  createdAt             DateTime @default(now())
 
-  userComment            String?
+  userComment String?
 
   @@index([userId])
   @@map("matches")
@@ -134,12 +134,12 @@ model Match {
 
 // ───────────────────────── Users ─────────────────────────
 model User {
-  id                String   @id @default(cuid())
-  firebaseUid       String   @unique
-  email             String?  @unique
-  username          String?  @unique
-  displayName       String?
-  photoUrl          String?
+  id          String  @id @default(cuid())
+  firebaseUid String  @unique
+  email       String? @unique
+  username    String? @unique
+  displayName String?
+  photoUrl    String?
 
   age               Int?
   gender            Gender?
@@ -149,10 +149,10 @@ model User {
   preferredCuisines String[] @map("preferred_cuisines")
 
   // Solo relations
-  sessions          SwipeSession[]
-  events            SwipeEvent[]
-  superstars        Superstar[]
-  matches           Match[]
+  sessions   SwipeSession[]
+  events     SwipeEvent[]
+  superstars Superstar[]
+  matches    Match[]
 
   // Friends relations
   friendRequestsSent     FriendRequest[] @relation("FriendRequestsSent")
@@ -161,20 +161,20 @@ model User {
   friendsFriend          Friend[]        @relation("FriendsFriend")
 
   // Group request relations
-  groupRequestsSent      GroupRequest[]      @relation("GroupRequestsSent")
-  groupRequestsReceived  GroupRequest[]      @relation("GroupRequestsReceived")
+  groupRequestsSent     GroupRequest[] @relation("GroupRequestsSent")
+  groupRequestsReceived GroupRequest[] @relation("GroupRequestsReceived")
 
   // Group session relations (all optional to allow backfilling old rows)
-  groupSessionsStarted   GroupSwipeSession[] @relation("GroupSessionsStarter")
-  groupSessionsA         GroupSwipeSession[] @relation("GroupSessionsA")
-  groupSessionsB         GroupSwipeSession[] @relation("GroupSessionsB")
+  groupSessionsStarted GroupSwipeSession[] @relation("GroupSessionsStarter")
+  groupSessionsA       GroupSwipeSession[] @relation("GroupSessionsA")
+  groupSessionsB       GroupSwipeSession[] @relation("GroupSessionsB")
 
   // Group swipe events
-  groupEvents            GroupSwipeEvent[]
+  groupEvents GroupSwipeEvent[]
 
-  emailVerified     Boolean? @default(false)
-  createdAt         DateTime @default(now()) @map("created_at")
-  updatedAt         DateTime @updatedAt      @map("updated_at")
+  emailVerified Boolean? @default(false)
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
 
   @@map("users")
 }
@@ -247,24 +247,24 @@ model Photo {
 
 // ───────────────────────── Group swiping ─────────────────────────
 model GroupSwipeSession {
-  id           String   @id @default(cuid())
-  status       String   @default("active") // "active" | "completed"
-  startedAt    DateTime @default(now())
-  endedAt      DateTime?
-  context      Json?
+  id        String    @id @default(cuid())
+  status    String    @default("active") // "active" | "completed"
+  startedAt DateTime  @default(now())
+  endedAt   DateTime?
+  context   Json?
 
   // ⬇ made optional to allow migrating existing rows
-  startedById  String?
-  aUserId      String?
-  bUserId      String?
+  startedById String?
+  aUserId     String?
+  bUserId     String?
 
-  startedBy    User?    @relation("GroupSessionsStarter", fields: [startedById], references: [id])
-  aUser        User?    @relation("GroupSessionsA",       fields: [aUserId],     references: [id])
-  bUser        User?    @relation("GroupSessionsB",       fields: [bUserId],     references: [id])
+  startedBy User? @relation("GroupSessionsStarter", fields: [startedById], references: [id])
+  aUser     User? @relation("GroupSessionsA", fields: [aUserId], references: [id])
+  bUser     User? @relation("GroupSessionsB", fields: [bUserId], references: [id])
 
   // Back-relations
-  events       GroupSwipeEvent[]
-  match        GroupMatch?
+  events GroupSwipeEvent[]
+  match  GroupMatch?
 
   @@index([aUserId])
   @@index([bUserId])
@@ -274,13 +274,13 @@ model GroupSwipeSession {
 }
 
 model GroupSwipeEvent {
-  id           String   @id @default(cuid())
+  id           String      @id @default(cuid())
   sessionId    String
   userId       String
   restaurantId String
   action       SwipeAction
   position     Int
-  createdAt    DateTime @default(now())
+  createdAt    DateTime    @default(now())
 
   session GroupSwipeSession @relation(fields: [sessionId], references: [id])
   user    User              @relation(fields: [userId], references: [id])
@@ -292,12 +292,12 @@ model GroupSwipeEvent {
 }
 
 model GroupMatch {
-  id                    String   @id @default(cuid())
-  sessionId             String   @unique
-  session               GroupSwipeSession @relation(fields: [sessionId], references: [id])
+  id        String            @id @default(cuid())
+  sessionId String            @unique
+  session   GroupSwipeSession @relation(fields: [sessionId], references: [id])
 
-  hostUserId            String
-  friendUserId          String
+  hostUserId   String
+  friendUserId String
 
   top1RestaurantId      String
   top2RestaurantId      String?
@@ -305,8 +305,8 @@ model GroupMatch {
   superStarRestaurantId String?
   winnerRestaurantId    String
 
-  createdAt             DateTime @default(now())
-  comment               String?
+  createdAt DateTime @default(now())
+  comment   String?
 
   @@index([hostUserId])
   @@index([friendUserId])
@@ -314,15 +314,15 @@ model GroupMatch {
 }
 
 model GroupRequest {
-  id          String              @id @default(uuid())
-  fromUserId  String
-  toUserId    String
-  status      GroupRequestStatus  @default(PENDING)
-  createdAt   DateTime            @default(now())
-  updatedAt   DateTime            @updatedAt
+  id         String             @id @default(uuid())
+  fromUserId String
+  toUserId   String
+  status     GroupRequestStatus @default(PENDING)
+  createdAt  DateTime           @default(now())
+  updatedAt  DateTime           @updatedAt
 
-  fromUser    User                @relation("GroupRequestsSent",     fields: [fromUserId], references: [id])
-  toUser      User                @relation("GroupRequestsReceived", fields: [toUserId],   references: [id])
+  fromUser User @relation("GroupRequestsSent", fields: [fromUserId], references: [id])
+  toUser   User @relation("GroupRequestsReceived", fields: [toUserId], references: [id])
 
   @@unique([fromUserId, toUserId])
   @@index([toUserId, status])
