@@ -479,4 +479,99 @@ router.post("/session/:id/feedback", async (req, res) => {
   }
 });
 
+// --- ADD: list group matches for the authed user ----------------------------
+router.get("/matches", async (req, res) => {
+  try {
+    const me = await getAuthedUserOr404(req.user.uid, res);
+    if (!me) return;
+
+    // Fetch group matches where I'm host or friend
+    const rows = await prisma.groupMatch.findMany({
+      where: {
+        OR: [{ hostUserId: me.id }, { friendUserId: me.id }],
+      },
+      orderBy: { createdAt: "desc" },
+      select: {
+        id: true,
+        sessionId: true,
+        createdAt: true,
+        comment: true,
+        winnerRestaurantId: true,
+        top1RestaurantId: true,
+        top2RestaurantId: true,
+        top3RestaurantId: true,
+        superStarRestaurantId: true,
+      },
+    });
+
+    // Collect restaurant IDs we need
+    const ids = new Set();
+    for (const r of rows) {
+      [r.winnerRestaurantId, r.top1RestaurantId, r.top2RestaurantId, r.top3RestaurantId, r.superStarRestaurantId]
+        .filter(Boolean)
+        .forEach((id) => ids.add(id));
+    }
+
+    // Load restaurants in one query
+    const restos = await prisma.restaurant.findMany({
+      where: { id: { in: Array.from(ids) } },
+      select: {
+        id: true,
+        name: true,
+        formattedAddress: true,
+        priceLevel: true,
+        primaryType: true,
+        primaryTypeDisplayName: true,
+        types: true,
+        editorialSummary: true,
+      },
+    });
+    const byId = new Map(restos.map((r) => [r.id, r]));
+
+    // Normalize to the List screen shape
+    function mapResto(r) {
+      if (!r) return null;
+      return {
+        id: r.id,
+        name: r.name,
+        address: r.formattedAddress ?? null,
+        priceLevel: r.priceLevel ?? null,
+        primaryType: r.primaryTypeDisplayName || r.primaryType || null,
+        types: r.types ?? null,
+        editorialSummary: r.editorialSummary ?? null,
+        editorial_summary: r.editorialSummary ?? null, // your UI checks either key
+        photoUrl: null, // optional: wire to your photos table if you want
+      };
+    }
+
+    const matches = rows.map((m) => {
+      const winner = m.winnerRestaurantId ? byId.get(m.winnerRestaurantId) : null;
+      const top1 = m.top1RestaurantId ? byId.get(m.top1RestaurantId) : null;
+      const top2 = m.top2RestaurantId ? byId.get(m.top2RestaurantId) : null;
+      const top3 = m.top3RestaurantId ? byId.get(m.top3RestaurantId) : null;
+      const superStar = m.superStarRestaurantId ? byId.get(m.superStarRestaurantId) : null;
+
+      return {
+        id: m.id,
+        sessionId: m.sessionId,
+        createdAt: m.createdAt,
+        userComment: m.comment ?? null,
+        winner: mapResto(winner) || mapResto(top1),
+        top1: mapResto(top1),
+        top2: mapResto(top2),
+        top3: mapResto(top3),
+        superStar: mapResto(superStar),
+        // optional: flag so you can tint differently client-side
+        isGroup: true,
+      };
+    });
+
+    res.json({ matches });
+  } catch (err) {
+    console.error("[group/matches] error:", err);
+    res.status(500).json({ error: "failed to load group matches" });
+  }
+});
+
+
 module.exports = router;
