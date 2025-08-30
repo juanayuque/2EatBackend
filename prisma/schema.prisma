@@ -1,9 +1,7 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
+// prisma/schema.prisma
 
 generator client {
   provider = "prisma-client-js"
-  //output   = "../generated/prisma"
 }
 
 datasource db {
@@ -11,7 +9,7 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// ─────────── Enums ───────────
+// ───────────────────────── Enums ─────────────────────────
 enum Gender {
   MALE
   FEMALE
@@ -39,7 +37,7 @@ enum GroupRequestStatus {
   CANCELED
 }
 
-// ─────────── Friends ───────────
+// ───────────────────────── Friends ─────────────────────────
 model FriendRequest {
   id          String               @id @default(uuid())
   fromUserId  String
@@ -51,9 +49,8 @@ model FriendRequest {
   fromUser    User                 @relation("FriendRequestsSent",     fields: [fromUserId], references: [id])
   toUser      User                 @relation("FriendRequestsReceived", fields: [toUserId],   references: [id])
 
-  @@unique([fromUserId, toUserId]) // enables where: { fromUserId_toUserId: {...} }
+  @@unique([fromUserId, toUserId])
   @@index([toUserId, status])
-  @@index([fromUserId, status])
 }
 
 model Friend {
@@ -65,11 +62,11 @@ model Friend {
   user      User     @relation("FriendsOwner",  fields: [userId],   references: [id])
   friend    User     @relation("FriendsFriend", fields: [friendId], references: [id])
 
-  @@unique([userId, friendId]) // enables where: { userId_friendId: {...} }
+  @@unique([userId, friendId])
   @@index([friendId])
 }
 
-// ─────────── Solo swiping ───────────
+// ───────────────────────── Solo swiping ─────────────────────────
 model SwipeSession {
   id           String     @id @default(cuid())
   userId       String
@@ -108,7 +105,7 @@ model Superstar {
   user         User     @relation(fields: [userId], references: [id])
   restaurantId String
   sessionId    String?
-  createdAt    DateTime  @default(now())
+  createdAt    DateTime @default(now())
 
   @@unique([userId, restaurantId])
   @@index([sessionId])
@@ -116,18 +113,18 @@ model Superstar {
 }
 
 model Match {
-  id                     String        @id @default(cuid())
+  id                     String   @id @default(cuid())
   userId                 String
-  user                   User          @relation(fields: [userId], references: [id])
-  sessionId              String        @unique
-  session                SwipeSession  @relation(fields: [sessionId], references: [id])
+  user                   User     @relation(fields: [userId], references: [id])
+  sessionId              String   @unique
+  session                SwipeSession @relation(fields: [sessionId], references: [id])
 
   top1RestaurantId       String
   top2RestaurantId       String?
   top3RestaurantId       String?
   superStarRestaurantId  String?
   winnerRestaurantId     String
-  createdAt              DateTime      @default(now())
+  createdAt              DateTime @default(now())
 
   userComment            String?
 
@@ -135,7 +132,7 @@ model Match {
   @@map("matches")
 }
 
-// ─────────── Users ───────────
+// ───────────────────────── Users ─────────────────────────
 model User {
   id                String   @id @default(cuid())
   firebaseUid       String   @unique
@@ -151,13 +148,13 @@ model User {
   dietaryNeeds      String[] @map("dietary_needs")
   preferredCuisines String[] @map("preferred_cuisines")
 
-  // Solo swipe relations
+  // Solo relations
   sessions          SwipeSession[]
   events            SwipeEvent[]
   superstars        Superstar[]
   matches           Match[]
 
-  // Friend relations
+  // Friends relations
   friendRequestsSent     FriendRequest[] @relation("FriendRequestsSent")
   friendRequestsReceived FriendRequest[] @relation("FriendRequestsReceived")
   friendsOwner           Friend[]        @relation("FriendsOwner")
@@ -167,7 +164,7 @@ model User {
   groupRequestsSent      GroupRequest[]      @relation("GroupRequestsSent")
   groupRequestsReceived  GroupRequest[]      @relation("GroupRequestsReceived")
 
-  // Group session relations
+  // Group session relations (all optional to allow backfilling old rows)
   groupSessionsStarted   GroupSwipeSession[] @relation("GroupSessionsStarter")
   groupSessionsA         GroupSwipeSession[] @relation("GroupSessionsA")
   groupSessionsB         GroupSwipeSession[] @relation("GroupSessionsB")
@@ -182,7 +179,7 @@ model User {
   @@map("users")
 }
 
-// ─────────── Places ───────────
+// ───────────────────────── Restaurants ─────────────────────────
 model Restaurant {
   id                       String   @id @default(uuid())
   googlePlaceId            String   @unique @map("google_place_id")
@@ -214,7 +211,7 @@ model Restaurant {
   photos  Photo[]
 
   createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt      @map("updated_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
 
   @@map("restaurants")
 }
@@ -229,7 +226,7 @@ model Review {
   publishTime  DateTime?  @map("publish_time")
 
   createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt      @map("updated_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
 
   @@map("reviews")
 }
@@ -243,12 +240,12 @@ model Photo {
   heightPx     Int?       @map("height_px")
 
   createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt      @map("updated_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
 
   @@map("photos")
 }
 
-// --- Group ---
+// ───────────────────────── Group swiping ─────────────────────────
 model GroupSwipeSession {
   id           String   @id @default(cuid())
   status       String   @default("active") // "active" | "completed"
@@ -256,27 +253,30 @@ model GroupSwipeSession {
   endedAt      DateTime?
   context      Json?
 
-  startedById  String
-  aUserId      String
-  bUserId      String
+  // ⬇ made optional to allow migrating existing rows
+  startedById  String?
+  aUserId      String?
+  bUserId      String?
 
-  startedBy    User     @relation("GroupSessionsStarter", fields: [startedById], references: [id])
-  aUser        User     @relation("GroupSessionsA",       fields: [aUserId],     references: [id])
-  bUser        User     @relation("GroupSessionsB",       fields: [bUserId],     references: [id])
+  startedBy    User?    @relation("GroupSessionsStarter", fields: [startedById], references: [id])
+  aUser        User?    @relation("GroupSessionsA",       fields: [aUserId],     references: [id])
+  bUser        User?    @relation("GroupSessionsB",       fields: [bUserId],     references: [id])
 
-  events       GroupSwipeEvent[]   // opposite of GroupSwipeEvent.session
-  match        GroupMatch?         // opposite of GroupMatch.session (1:1 via unique sessionId)
+  // Back-relations
+  events       GroupSwipeEvent[]
+  match        GroupMatch?
 
   @@index([aUserId])
   @@index([bUserId])
   @@index([status])
+  @@index([startedById])
   @@map("group_swipe_sessions")
 }
 
 model GroupSwipeEvent {
   id           String   @id @default(cuid())
   sessionId    String
-  userId       String // who tapped (host for MVP)
+  userId       String
   restaurantId String
   action       SwipeAction
   position     Int
@@ -313,7 +313,6 @@ model GroupMatch {
   @@map("group_matches")
 }
 
-
 model GroupRequest {
   id          String              @id @default(uuid())
   fromUserId  String
@@ -325,7 +324,7 @@ model GroupRequest {
   fromUser    User                @relation("GroupRequestsSent",     fields: [fromUserId], references: [id])
   toUser      User                @relation("GroupRequestsReceived", fields: [toUserId],   references: [id])
 
-  @@unique([fromUserId, toUserId])   // one open row per direction
+  @@unique([fromUserId, toUserId])
   @@index([toUserId, status])
   @@index([fromUserId, status])
   @@map("group_requests")
