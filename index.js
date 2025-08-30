@@ -112,6 +112,8 @@ app.use("/api", locationRoutes);
 app.use("/api", geocodeRoutes);
 app.use("/api/matches", require("./routes/matches"));
 app.use("/api/friends", friendsRouter);
+app.use("/api/group-match", require("./routes/groupmatch"));
+
 
 
 // Mount recs (guard in case of wrong export)

@@ -151,11 +151,15 @@ model User {
   superstars        Superstar[]
   matches           Match[]
 
-  // NEW opposite relation fields
+  // opposite relation fields
   friendRequestsSent     FriendRequest[] @relation("FriendRequestsSent")
   friendRequestsReceived FriendRequest[] @relation("FriendRequestsReceived")
   friendsOwner           Friend[]        @relation("FriendsOwner")
   friendsFriend          Friend[]        @relation("FriendsFriend")
+  roupSessionsHosted  GroupSwipeSession[] @relation("GroupHost")
+  groupSessionsAsFriend GroupSwipeSession[] @relation("GroupFriend")
+  groupEvents          GroupSwipeEvent[]
+  
 
   emailVerified     Boolean? @default(false)
   createdAt         DateTime @default(now()) @map("created_at")
@@ -231,4 +235,66 @@ model Photo {
 
   @@map("photos")
 }
+
+// --- NEW ---
+model GroupSwipeSession {
+  id            String   @id @default(cuid())
+  hostUserId    String
+  friendUserId  String
+  status        String   @default("active") // active|completed
+  startedAt     DateTime @default(now())
+  endedAt       DateTime?
+  totalSwipes   Int      @default(0)
+  context       Json?
+
+  events        GroupSwipeEvent[]
+  match         GroupMatch?
+
+  host   User @relation("GroupHost", fields: [hostUserId], references: [id])
+  friend User @relation("GroupFriend", fields: [friendUserId], references: [id])
+
+  @@index([hostUserId, status])
+  @@index([friendUserId, status])
+  @@map("group_swipe_sessions")
+}
+
+model GroupSwipeEvent {
+  id           String   @id @default(cuid())
+  sessionId    String
+  userId       String // who tapped (host for MVP)
+  restaurantId String
+  action       SwipeAction
+  position     Int
+  createdAt    DateTime @default(now())
+
+  session GroupSwipeSession @relation(fields: [sessionId], references: [id])
+  user    User              @relation(fields: [userId], references: [id])
+
+  @@index([sessionId])
+  @@index([userId])
+  @@index([restaurantId])
+  @@map("group_swipe_events")
+}
+
+model GroupMatch {
+  id                    String   @id @default(cuid())
+  sessionId             String   @unique
+  session               GroupSwipeSession @relation(fields: [sessionId], references: [id])
+  hostUserId            String
+  friendUserId          String
+
+  top1RestaurantId      String
+  top2RestaurantId      String?
+  top3RestaurantId      String?
+  superStarRestaurantId String?
+  winnerRestaurantId    String
+
+  createdAt             DateTime @default(now())
+  comment               String?
+
+  @@index([hostUserId])
+  @@index([friendUserId])
+  @@map("group_matches")
+}
+
 
