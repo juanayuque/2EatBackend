@@ -4,11 +4,10 @@ const prisma = require("../src/prisma");
 const verifyFirebaseToken = require("../middleware/auth");
 
 const router = express.Router();
-
-// ─────────────────────────── Auth ───────────────────────────
 router.use(verifyFirebaseToken);
 
-const SWIPE_LIMIT = 15;
+// ─────────────────────────── Config ───────────────────────────
+const SWIPE_LIMIT = 15; // 15 swipes per user to finish
 
 // ─────────────────────────── Helpers ───────────────────────────
 async function getAuthedUserOr404(firebaseUid, res) {
@@ -39,7 +38,7 @@ async function assertAreFriendsOr400(meId, otherUserId, res) {
     select: { id: true },
   });
   const reverse = await prisma.friend.findFirst({
-    where: { userId: otherUserId, friendId: me.id },
+    where: { userId: otherUserId, friendId: meId },
     select: { id: true },
   });
   if (!friend && !reverse) {
@@ -49,64 +48,113 @@ async function assertAreFriendsOr400(meId, otherUserId, res) {
   return true;
 }
 
-async function getUserBasic(id) {
-  return prisma.user.findUnique({
-    where: { id },
-    select: { id: true, displayName: true, username: true, email: true, preferredCuisines: true },
+// Progress counters for a session
+async function getSessionCounts(sessionId, aUserId, bUserId) {
+  const rows = await prisma.groupSwipeEvent.groupBy({
+    by: ["userId"],
+    where: { sessionId },
+    _count: { _all: true },
   });
+  const byUser = new Map(rows.map((r) => [r.userId, r._count._all]));
+  const a = byUser.get(aUserId) || 0;
+  const b = byUser.get(bUserId) || 0;
+  return { aCount: a, bCount: b, limit: SWIPE_LIMIT };
 }
 
-/** Build a 15-item pool from both users' cuisine prefs. */
-async function buildPool(aId, bId) {
-  const [ua, ub] = await Promise.all([getUserBasic(aId), getUserBasic(bId)]);
-  const cuisines = Array.from(new Set([...(ua?.preferredCuisines || []), ...(ub?.preferredCuisines || [])]));
-  let restaurants = [];
-  if (cuisines.length) {
-    restaurants = await prisma.restaurant.findMany({
-      where: { types: { hasSome: cuisines } },
-      take: SWIPE_LIMIT,
-      orderBy: { createdAt: "desc" },
-      select: { id: true },
-    });
-  }
-  if (restaurants.length < SWIPE_LIMIT) {
-    const filler = await prisma.restaurant.findMany({
-      take: SWIPE_LIMIT - restaurants.length,
-      orderBy: { createdAt: "desc" },
-      select: { id: true },
-    });
-    restaurants = [...restaurants, ...filler];
-  }
-  return restaurants.map((r) => r.id);
-}
-
-async function fetchRestaurantBasic(id) {
-  if (!id) return null;
-  const r = await prisma.restaurant.findUnique({
-    where: { id },
-    select: {
-      id: true, name: true, formattedAddress: true,
-      priceLevel: true, editorialSummary: true,
-    },
+// Build a top3 + winner from the session’s events
+async function rankTop3(sessionId) {
+  // Score: LIKE = 1, SUPERSTAR = 3, PASS = 0. Bonus if both users liked.
+  const events = await prisma.groupSwipeEvent.findMany({
+    where: { sessionId },
+    select: { restaurantId: true, userId: true, action: true, createdAt: true },
   });
-  if (!r) return null;
-  return {
-    id: r.id,
-    name: r.name,
-    address: r.formattedAddress,
-    priceLevel: r.priceLevel ?? null,
-    editorialSummary: r.editorialSummary ?? null,
-    photoUrl: null, // populate later if you add photos
-  };
+
+  if (events.length === 0) return { top: [], winner: null };
+
+  const score = new Map(); // rid -> { s, likedBy:Set, last:Date }
+  for (const e of events) {
+    let entry = score.get(e.restaurantId);
+    if (!entry) entry = { s: 0, likedBy: new Set(), last: e.createdAt };
+    if (e.action === "LIKE") entry.s += 1;
+    if (e.action === "SUPERSTAR") entry.s += 3;
+    if (e.action === "LIKE" || e.action === "SUPERSTAR") entry.likedBy.add(e.userId);
+    if (e.createdAt > entry.last) entry.last = e.createdAt;
+    score.set(e.restaurantId, entry);
+  }
+
+  // If nobody liked anything, fallback to “most recent exposures”
+  let items = Array.from(score.entries()).map(([rid, v]) => ({
+    restaurantId: rid,
+    s: v.s + (v.likedBy.size >= 2 ? 2 : 0), // tiny boost if both liked
+    likedByCount: v.likedBy.size,
+    last: v.last,
+  }));
+
+  const allZero = items.every((i) => i.s === 0);
+  items.sort((a, b) => {
+    if (b.s !== a.s) return b.s - a.s;
+    if (b.likedByCount !== a.likedByCount) return b.likedByCount - a.likedByCount;
+    return b.last - a.last;
+  });
+
+  if (allZero) {
+    // use recency only
+    items.sort((a, b) => b.last - a.last);
+  }
+
+  const top = items.slice(0, 3).map((i) => i.restaurantId);
+  const winner = top[0] || null;
+  return { top, winner };
 }
 
-function scoreForAction(action) {
-  if (action === "SUPERSTAR") return 3;
-  if (action === "LIKE") return 2;
-  return 0;
+// Finalize a session if both users finished; idempotent
+async function maybeFinalizeSession(sessionId) {
+  const s = await prisma.groupSwipeSession.findUnique({
+    where: { id: sessionId },
+    select: { id: true, status: true, aUserId: true, bUserId: true },
+  });
+  if (!s) return { finalized: false };
+  if (s.status !== "active") return { finalized: false };
+
+  const { aCount, bCount } = await getSessionCounts(s.id, s.aUserId, s.bUserId);
+  if (aCount < SWIPE_LIMIT || bCount < SWIPE_LIMIT) return { finalized: false };
+
+  // already have a match?
+  const existing = await prisma.groupMatch.findUnique({ where: { sessionId: s.id } });
+  if (existing) {
+    await prisma.groupSwipeSession.update({
+      where: { id: s.id },
+      data: { status: "completed", endedAt: new Date() },
+    });
+    return { finalized: true, matchId: existing.id };
+  }
+
+  const { top, winner } = await rankTop3(s.id);
+  // We require at least 1 candidate to finalize; if not, just mark completed
+  const [top1, top2, top3] = [top[0] || null, top[1] || null, top[2] || null];
+  await prisma.$transaction(async (tx) => {
+    await tx.groupSwipeSession.update({
+      where: { id: s.id },
+      data: { status: "completed", endedAt: new Date() },
+    });
+    await tx.groupMatch.create({
+      data: {
+        sessionId: s.id,
+        hostUserId: s.aUserId,     // semantic: creator vs friend is flexible here
+        friendUserId: s.bUserId,
+        top1RestaurantId: top1 || "",
+        top2RestaurantId: top2 || null,
+        top3RestaurantId: top3 || null,
+        superStarRestaurantId: null,
+        winnerRestaurantId: winner || (top1 || ""),
+      },
+    });
+  });
+
+  return { finalized: true };
 }
 
-// ─────────────────────────── Routes ───────────────────────────
+// ─────────────────────────── Requests ───────────────────────────
 
 /** GET /api/group/requests → { incoming: [...], outgoing: [...] } */
 router.get("/requests", async (req, res) => {
@@ -158,10 +206,8 @@ router.post("/request", async (req, res) => {
     if (!friendId) return res.status(400).json({ error: "friendId required" });
     if (friendId === me.id) return res.status(400).json({ error: "Cannot group-match yourself" });
 
-    // NOTE: keep as-is if your original helper had a typo (fixed here)
-    const friend = await prisma.friend.findFirst({ where: { userId: me.id, friendId }, select: { id: true } });
-    const reverse = await prisma.friend.findFirst({ where: { userId: friendId, friendId: me.id }, select: { id: true } });
-    if (!friend && !reverse) return res.status(400).json({ error: "You can only group-match with friends" });
+    const ok = await assertAreFriendsOr400(me.id, friendId, res);
+    if (!ok) return;
 
     const pending = await prisma.groupRequest.findFirst({
       where: {
@@ -204,7 +250,7 @@ router.post("/request", async (req, res) => {
   }
 });
 
-/** POST /api/group/accept { requestId } → returns { ok, sessionId } */
+/** POST /api/group/accept { requestId } → { ok } */
 router.post("/accept", async (req, res) => {
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
@@ -221,8 +267,7 @@ router.post("/accept", async (req, res) => {
     if (gr.toUserId !== me.id) return res.status(403).json({ error: "Not your request" });
     if (gr.status !== "PENDING") return res.status(400).json({ error: "Request is not pending" });
 
-    let sessionId = null;
-
+    // mark accepted + create an active session
     await prisma.$transaction(async (tx) => {
       await tx.groupRequest.update({ where: { id: gr.id }, data: { status: "ACCEPTED" } });
       await tx.groupRequest.updateMany({
@@ -235,21 +280,18 @@ router.post("/accept", async (req, res) => {
         },
         data: { status: "ACCEPTED" },
       });
-
-      const newSession = await tx.groupSwipeSession.create({
+      await tx.groupSwipeSession.create({
         data: {
           status: "active",
           startedById: me.id,
           aUserId: gr.fromUserId,
           bUserId: gr.toUserId,
-          context: {}, // pool will be built on first /state
+          context: {},
         },
-        select: { id: true },
       });
-      sessionId = newSession.id;
     });
 
-    res.json({ ok: true, sessionId });
+    res.json({ ok: true });
   } catch (err) {
     console.error("[group/accept] error:", err);
     res.status(500).json({ error: "failed to accept group request" });
@@ -261,8 +303,7 @@ router.post("/decline", async (req, res) => {
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
     if (!me) return;
-
-    const requestId = req.body?.requestId;
+  const requestId = req.body?.requestId;
     if (!requestId) return res.status(400).json({ error: "requestId required" });
 
     const gr = await prisma.groupRequest.findUnique({
@@ -306,38 +347,57 @@ router.post("/cancel", async (req, res) => {
   }
 });
 
-/** GET /api/group/sessions → active (not completed) sessions for me */
+// ─────────────────────────── Sessions (“Ready”) ───────────────────────────
+
+/** GET /api/group/sessions → active sessions for the authed user (finalizes any finished) */
 router.get("/sessions", async (req, res) => {
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
     if (!me) return;
 
+    // Fetch active sessions where I am A or B
     const rows = await prisma.groupSwipeSession.findMany({
       where: {
         status: "active",
         OR: [{ aUserId: me.id }, { bUserId: me.id }],
       },
       orderBy: { startedAt: "desc" },
-      select: { id: true, aUserId: true, bUserId: true },
+      select: {
+        id: true, aUserId: true, bUserId: true,
+        aUser: { select: { id: true, displayName: true, username: true, email: true } },
+        bUser: { select: { id: true, displayName: true, username: true, email: true } },
+      },
     });
 
-    const sessions = await Promise.all(
-      rows.map(async (row) => {
-        const partnerId = row.aUserId === me.id ? row.bUserId : row.aUserId;
-        const [partner, youCount, partnerCount] = await Promise.all([
-          getUserBasic(partnerId),
-          prisma.groupSwipeEvent.count({ where: { sessionId: row.id, userId: me.id } }),
-          prisma.groupSwipeEvent.count({ where: { sessionId: row.id, userId: partnerId } }),
-        ]);
-        return {
-          id: row.id,
-          partner: { id: partnerId, name: labelOfUser(partner), username: usernameOfUser(partner) },
-          youCount,
-          partnerCount,
-          limit: SWIPE_LIMIT,
-        };
-      })
-    );
+    const sessions = [];
+    for (const s of rows) {
+      // eager finalize if done
+      await maybeFinalizeSession(s.id);
+
+      // re-check status
+      const nowRow = await prisma.groupSwipeSession.findUnique({
+        where: { id: s.id },
+        select: { status: true },
+      });
+      if (nowRow?.status !== "active") continue;
+
+      const partner = s.aUserId === me.id ? s.bUser : s.aUser;
+      const { aCount, bCount, limit } = await getSessionCounts(s.id, s.aUserId, s.bUserId);
+      const you = s.aUserId === me.id ? aCount : bCount;
+      const them = s.aUserId === me.id ? bCount : aCount;
+
+      sessions.push({
+        id: s.id,
+        partner: {
+          id: partner.id,
+          name: labelOfUser(partner),
+          username: usernameOfUser(partner),
+        },
+        youCount: you,
+        partnerCount: them,
+        limit,
+      });
+    }
 
     res.json({ sessions });
   } catch (err) {
@@ -346,220 +406,76 @@ router.get("/sessions", async (req, res) => {
   }
 });
 
-/** GET /api/group/session/:id/state → progress + next card or result
- *  ALSO: when both users reach 15/15, compute/store result and mark session COMPLETED,
- *  so it disappears from /group/sessions and shows up in /group/matches.
- */
+/** GET /api/group/session/:id/state → { status, youCount, partnerCount, limit } (also finalizes if done) */
 router.get("/session/:id/state", async (req, res) => {
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
     if (!me) return;
-    const id = String(req.params.id);
 
     const s = await prisma.groupSwipeSession.findUnique({
-      where: { id },
-      select: { id: true, status: true, aUserId: true, bUserId: true, context: true },
+      where: { id: req.params.id },
+      select: { id: true, status: true, aUserId: true, bUserId: true },
     });
     if (!s) return res.status(404).json({ error: "Session not found" });
-    if (s.aUserId !== me.id && s.bUserId !== me.id) return res.status(403).json({ error: "Not your session" });
+    if (s.aUserId !== me.id && s.bUserId !== me.id) return res.status(403).json({ error: "Not in this session" });
 
-    // ensure pool exists
-    let ctx = s.context || {};
-    if (!Array.isArray(ctx.pool) || ctx.pool.length < SWIPE_LIMIT) {
-      ctx.pool = await buildPool(s.aUserId, s.bUserId);
-      await prisma.groupSwipeSession.update({ where: { id: s.id }, data: { context: ctx } });
-    }
-
-    const events = await prisma.groupSwipeEvent.findMany({
-      where: { sessionId: s.id },
-      orderBy: { createdAt: "asc" },
-      select: { userId: true, restaurantId: true, action: true },
+    // maybe finalize
+    await maybeFinalizeSession(s.id);
+    const after = await prisma.groupSwipeSession.findUnique({
+      where: { id: s.id },
+      select: { id: true, status: true, aUserId: true, bUserId: true },
     });
 
-    const youId = me.id;
-    const partnerId = s.aUserId === me.id ? s.bUserId : s.aUserId;
+    const { aCount, bCount, limit } = await getSessionCounts(s.id, after.aUserId, after.bUserId);
+    const you = after.aUserId === me.id ? aCount : bCount;
+    const them = after.aUserId === me.id ? bCount : aCount;
 
-    const youCount = events.filter((e) => e.userId === youId).length;
-    const partnerCount = events.filter((e) => e.userId === partnerId).length;
-    const bothDone = youCount >= SWIPE_LIMIT && partnerCount >= SWIPE_LIMIT;
-
-    let result = null;
-
-    if (bothDone) {
-      // compute/store result once and mark session completed
-      const existing = await prisma.groupMatch.findUnique({ where: { sessionId: s.id } });
-      if (!existing) {
-        // compute scores
-        const scores = new Map();
-        for (const e of events) {
-          scores.set(e.restaurantId, (scores.get(e.restaurantId) || 0) + scoreForAction(e.action));
-        }
-        const ranked = ctx.pool
-          .map((rid) => ({ id: rid, score: scores.get(rid) || 0 }))
-          .sort((a, b) => b.score - a.score);
-        const top3Ids = ranked.slice(0, 3).map((r) => r.id);
-
-        await prisma.$transaction(async (tx) => {
-          await tx.groupMatch.create({
-            data: {
-              sessionId: s.id,
-              hostUserId: s.aUserId,
-              friendUserId: s.bUserId,
-              top1RestaurantId: top3Ids[0] || ctx.pool[0],
-              top2RestaurantId: top3Ids[1] || null,
-              top3RestaurantId: top3Ids[2] || null,
-              winnerRestaurantId: top3Ids[0] || ctx.pool[0],
-            },
-          });
-          await tx.groupSwipeSession.update({ where: { id: s.id }, data: { status: "completed" } });
-        });
-      }
-
-      // build result payload
-      const gm = await prisma.groupMatch.findUnique({ where: { sessionId: s.id } });
-      const topIds = [gm.winnerRestaurantId, gm.top2RestaurantId, gm.top3RestaurantId].filter(Boolean);
-      const infos = await prisma.restaurant.findMany({ where: { id: { in: topIds } } });
-      const byId = new Map(infos.map((r) => [r.id, r]));
-      result = {
-        top3: [
-          { id: gm.winnerRestaurantId, name: byId.get(gm.winnerRestaurantId)?.name || "Winner", address: byId.get(gm.winnerRestaurantId)?.formattedAddress || null, rank: 1 },
-          gm.top2RestaurantId ? { id: gm.top2RestaurantId, name: byId.get(gm.top2RestaurantId)?.name || "Choice 2", address: byId.get(gm.top2RestaurantId)?.formattedAddress || null, rank: 2 } : null,
-          gm.top3RestaurantId ? { id: gm.top3RestaurantId, name: byId.get(gm.top3RestaurantId)?.name || "Choice 3", address: byId.get(gm.top3RestaurantId)?.formattedAddress || null, rank: 3 } : null,
-        ].filter(Boolean),
-      };
-    }
-
-    const nextId = !bothDone && youCount < SWIPE_LIMIT ? ctx.pool[youCount] : null;
-    const next = await fetchRestaurantBasic(nextId);
-
-    res.json({
-      limit: SWIPE_LIMIT,
-      youCount,
-      partnerCount,
-      bothDone,
-      next: next || null,
-      result,
-    });
+    res.json({ status: after.status, youCount: you, partnerCount: them, limit });
   } catch (err) {
     console.error("[group/session/state] error:", err);
-    res.status(500).json({ error: "failed to load session state" });
+    res.status(500).json({ error: "failed to load state" });
   }
 });
 
-/** POST /api/group/swipe { sessionId, restaurantId, action } */
-router.post("/swipe", async (req, res) => {
+/** POST /api/group/session/:id/feedback { restaurantId, action } — logs a swipe and maybe finalizes */
+router.post("/session/:id/feedback", async (req, res) => {
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
     if (!me) return;
 
-    const { sessionId, restaurantId, action } = req.body || {};
-    if (!sessionId || !restaurantId || !action) return res.status(400).json({ error: "sessionId, restaurantId, action required" });
-    if (!["LIKE", "PASS", "SUPERSTAR"].includes(action)) return res.status(400).json({ error: "invalid action" });
+    const { restaurantId, action } = req.body || {};
+    if (!restaurantId || !action) return res.status(400).json({ error: "restaurantId and action required" });
 
     const s = await prisma.groupSwipeSession.findUnique({
-      where: { id: sessionId },
-      select: { id: true, status: true, aUserId: true, bUserId: true, context: true },
+      where: { id: req.params.id },
+      select: { id: true, status: true, aUserId: true, bUserId: true },
     });
     if (!s) return res.status(404).json({ error: "Session not found" });
     if (s.status !== "active") return res.status(400).json({ error: "Session not active" });
-    if (s.aUserId !== me.id && s.bUserId !== me.id) return res.status(403).json({ error: "Not your session" });
+    if (s.aUserId !== me.id && s.bUserId !== me.id) return res.status(403).json({ error: "Not in this session" });
 
-    let ctx = s.context || {};
-    if (!Array.isArray(ctx.pool) || ctx.pool.length < SWIPE_LIMIT) {
-      ctx.pool = await buildPool(s.aUserId, s.bUserId);
-      await prisma.groupSwipeSession.update({ where: { id: s.id }, data: { context: ctx } });
-    }
-
-    const youCount = await prisma.groupSwipeEvent.count({ where: { sessionId: s.id, userId: me.id } });
-    if (youCount >= SWIPE_LIMIT) return res.status(400).json({ error: "You have completed your swipes" });
-    const expectedRestaurantId = ctx.pool[youCount];
-    if (expectedRestaurantId !== restaurantId) return res.status(400).json({ error: "Unexpected restaurant for this position" });
+    // position = count+1 for this user
+    const countForUser = await prisma.groupSwipeEvent.count({
+      where: { sessionId: s.id, userId: me.id },
+    });
 
     await prisma.groupSwipeEvent.create({
-      data: { sessionId: s.id, userId: me.id, restaurantId, action, position: youCount + 1 },
-    });
-
-    res.json({ ok: true, position: youCount + 1 });
-  } catch (err) {
-    console.error("[group/swipe] error:", err);
-    res.status(500).json({ error: "failed to record swipe" });
-  }
-});
-
-/**  GET /api/group/matches → group matches for the authed user (for “Your Matches”) */
-router.get("/matches", async (req, res) => {
-  try {
-    const me = await getAuthedUserOr404(req.user.uid, res);
-    if (!me) return;
-
-    const rows = await prisma.groupMatch.findMany({
-      where: { OR: [{ hostUserId: me.id }, { friendUserId: me.id }] },
-      orderBy: { createdAt: "desc" },
-      select: {
-        id: true,
-        sessionId: true,
-        createdAt: true,
-        winnerRestaurantId: true,
-        top1RestaurantId: true,
-        top2RestaurantId: true,
-        top3RestaurantId: true,
-        superStarRestaurantId: true,
+      data: {
+        sessionId: s.id,
+        userId: me.id,
+        restaurantId,
+        action, // "LIKE" | "PASS" | "SUPERSTAR"
+        position: countForUser + 1,
       },
     });
 
-    // Collect all restaurant ids
-    const ids = Array.from(
-      new Set(
-        rows.flatMap((r) => [
-          r.winnerRestaurantId,
-          r.top1RestaurantId,
-          r.top2RestaurantId,
-          r.top3RestaurantId,
-          r.superStarRestaurantId,
-        ]).filter(Boolean)
-      )
-    );
+    // maybe finalize
+    await maybeFinalizeSession(s.id);
 
-    const restos = await prisma.restaurant.findMany({
-      where: { id: { in: ids } },
-      select: {
-        id: true, name: true, formattedAddress: true,
-        priceLevel: true, editorialSummary: true,
-      },
-    });
-    const map = new Map(restos.map((r) => [r.id, r]));
-
-    const toR = (id) => {
-      if (!id) return null;
-      const r = map.get(id);
-      if (!r) return null;
-      return {
-        id: r.id,
-        name: r.name,
-        address: r.formattedAddress,
-        priceLevel: r.priceLevel ?? null,
-        editorialSummary: r.editorialSummary ?? null,
-        photoUrl: null,
-      };
-    };
-
-    const matches = rows.map((m) => ({
-      id: m.id,
-      sessionId: m.sessionId,
-      createdAt: m.createdAt,
-      userComment: null, // you can add per-user comment later
-      winner: toR(m.winnerRestaurantId) || toR(m.top1RestaurantId),
-      top1: toR(m.top1RestaurantId) || toR(m.winnerRestaurantId),
-      top2: toR(m.top2RestaurantId),
-      top3: toR(m.top3RestaurantId),
-      superStar: toR(m.superStarRestaurantId),
-      isGroup: true,
-    }));
-
-    res.json({ matches });
+    res.json({ ok: true });
   } catch (err) {
-    console.error("[group/matches] error:", err);
-    res.status(500).json({ error: "failed to load group matches" });
+    console.error("[group/session/feedback] error:", err);
+    res.status(500).json({ error: "failed to record feedback" });
   }
 });
 
