@@ -113,6 +113,7 @@ app.use("/api", geocodeRoutes);
 app.use("/api/matches", require("./routes/matches"));
 app.use("/api/friends", friendsRouter);
 app.use("/api/group-match", require("./routes/groupmatch"));
+app.use("/api/group", require("./routes/group"));
 
 
 
