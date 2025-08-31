@@ -83,25 +83,21 @@ model SwipeSession {
   @@map("swipe_sessions")
 }
 
-model GroupSwipeEvent {
-  id           String   @id @default(cuid())
+model SwipeEvent {
+  id           String       @id @default(cuid())
   sessionId    String
+  session      SwipeSession @relation(fields: [sessionId], references: [id])
   userId       String
+  user         User         @relation(fields: [userId], references: [id])
   restaurantId String
   action       SwipeAction
   position     Int
-  createdAt    DateTime @default(now())
+  createdAt    DateTime     @default(now())
 
-  session GroupSwipeSession @relation(fields: [sessionId], references: [id])
-  user    User              @relation(fields: [userId], references: [id])
-
-  @@unique([sessionId, userId, restaurantId]) // ← add this
-  @@index([sessionId])
   @@index([userId])
   @@index([restaurantId])
+  @@map("swipe_events")
 }
-
-
 
 model Superstar {
   id           String   @id @default(cuid())
@@ -285,22 +281,23 @@ model GroupSwipeSession {
 }
 
 model GroupSwipeEvent {
-  id           String      @id @default(cuid())
+  id           String   @id @default(cuid())
   sessionId    String
   userId       String
   restaurantId String
   action       SwipeAction
   position     Int
-  createdAt    DateTime    @default(now())
+  createdAt    DateTime @default(now())
 
   session GroupSwipeSession @relation(fields: [sessionId], references: [id])
   user    User              @relation(fields: [userId], references: [id])
 
+  @@unique([sessionId, userId, restaurantId]) // ← add this
   @@index([sessionId])
   @@index([userId])
   @@index([restaurantId])
-  @@map("group_swipe_events")
 }
+
 
 model GroupMatch {
   id        String            @id @default(cuid())
