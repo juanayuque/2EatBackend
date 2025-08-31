@@ -318,7 +318,48 @@ router.get("/session/:id/state", async (req, res) => {
   }
 });
 
-// POST /session/:sessionId/feedback
+
+// helper: derive outcome from events
+function computeGroupOutcome(events = [], { superstarWins = true } = {}) {
+  let lastSuper = null;
+  const byId = new Map();
+
+  events.forEach((e, idx) => {
+    const id = e.restaurantId;
+    const pos = Number(e.position ?? idx + 1);
+    const rec = byId.get(id) || { likes: 0, posSum: 0, firstPos: null, total: 0 };
+    if (e.action === "LIKE" || e.action === "SUPERSTAR") {
+      rec.likes += 1;
+      rec.posSum += pos;
+      if (rec.firstPos == null) rec.firstPos = pos;
+    }
+    if (e.action === "SUPERSTAR") lastSuper = id;
+    rec.total += 1;
+    byId.set(id, rec);
+  });
+
+  const rows = Array.from(byId.entries()); // [id, rec]
+
+  // sort by: likes desc → posSum asc → firstPos asc
+  rows.sort((a, b) => {
+    const A = a[1], B = b[1];
+    if (B.likes !== A.likes) return B.likes - A.likes;
+    if ((A.posSum ?? 0) !== (B.posSum ?? 0)) return A.posSum - B.posSum;
+    return (A.firstPos ?? 1e9) - (B.firstPos ?? 1e9);
+  });
+
+  const orderedIds = rows.map(([id]) => id);
+  const winnerId = superstarWins && lastSuper ? lastSuper : (orderedIds[0] || null);
+
+  return {
+    winnerId,
+    superStarId: lastSuper || null,
+    top1: orderedIds[0] || null,
+    top2: orderedIds[1] || null,
+    top3: orderedIds[2] || null,
+  };
+}
+
 router.post("/session/:sessionId/feedback", async (req, res) => {
   try {
     const me = await authedUser(req.user.uid);
@@ -339,63 +380,112 @@ router.post("/session/:sessionId/feedback", async (req, res) => {
     if (!s) return res.status(400).json({ error: "Invalid session" });
     if (s.status !== "active") return res.status(410).json({ ok: false, sessionCompleted: true });
 
-    // Idempotency (exact last)
+    // Idempotency
     const last = s.events[s.events.length - 1];
-    if (last && last.restaurantId === restaurantId && last.action === action && last.userId === me.id) {
-      return res.json({ ok: true, duplicate: true, shouldRerank: false, shouldSuggestMatch: false, sessionCompleted: false });
+    if (last && last.restaurantId === restaurantId && last.action === action) {
+      return res.json({
+        ok: true,
+        duplicate: true,
+        shouldRerank: false,
+        shouldSuggestMatch: false,
+        sessionCompleted: s.status !== "active",
+      });
     }
-    // Optional: if same user+restaurant+action exists anywhere, skip
-    if (s.events.some(e => e.userId === me.id && e.restaurantId === restaurantId && e.action === action)) {
-      return res.json({ ok: true, duplicate: true, shouldRerank: false, shouldSuggestMatch: false, sessionCompleted: false });
+    if (s.events.some((e) => e.restaurantId === restaurantId && e.action === action)) {
+      return res.json({
+        ok: true,
+        duplicate: true,
+        shouldRerank: false,
+        shouldSuggestMatch: false,
+        sessionCompleted: s.status !== "active",
+      });
     }
 
     const isA = s.aUserId && me.id === s.aUserId;
     const isB = s.bUserId && me.id === s.bUserId;
 
-    const position = s.events.length + 1;
     let sessionCompleted = false;
     let aSwipes = 0, bSwipes = 0;
 
     await prisma.$transaction(async (tx) => {
+      // record event
+      const position = (s.events?.length || 0) + 1;
       await tx.groupSwipeEvent.create({
         data: { sessionId, userId: me.id, restaurantId, action, position },
       });
 
-      const inc = isA
-        ? { aSwipes: { increment: 1 } }
-        : isB
-          ? { bSwipes: { increment: 1 } }
-          : {};
-
+      // bump counters
+      const inc =
+        isA ? { aSwipes: { increment: 1 } } :
+        isB ? { bSwipes: { increment: 1 } } : {};
       if (Object.keys(inc).length) {
         await tx.groupSwipeSession.update({ where: { id: sessionId }, data: inc });
       }
 
+      // fresh session + events
       const fresh = await tx.groupSwipeSession.findUnique({
         where: { id: sessionId },
-        select: { aSwipes: true, bSwipes: true },
+        include: { events: { orderBy: { position: "asc" } } },
       });
+
       aSwipes = fresh?.aSwipes ?? 0;
       bSwipes = fresh?.bSwipes ?? 0;
 
-      const bothDone = (aSwipes >= MAX_SWIPES) && (bSwipes >= MAX_SWIPES);
-      const endNow = bothDone || (END_ON_SUPERSTAR && action === "SUPERSTAR");
+      const reachedCap = aSwipes >= MAX_SWIPES && bSwipes >= MAX_SWIPES;
+      const endNow = reachedCap || (END_ON_SUPERSTAR && action === "SUPERSTAR");
 
       if (endNow) {
+        // compute outcome & persist GroupMatch
+        const { winnerId, superStarId, top1, top2, top3 } = computeGroupOutcome(
+          fresh?.events || [],
+          { superstarWins: END_ON_SUPERSTAR }
+        );
+
+        // figure host/friend for your schema
+        const hostUserId = fresh?.startedById || fresh?.aUserId || fresh?.bUserId || null;
+        let friendUserId = null;
+        if (hostUserId === fresh?.aUserId) friendUserId = fresh?.bUserId || null;
+        else if (hostUserId === fresh?.bUserId) friendUserId = fresh?.aUserId || null;
+        else friendUserId = fresh?.aUserId || fresh?.bUserId || null;
+
+        await tx.groupMatch.upsert({
+          where: { sessionId },
+          create: {
+            sessionId,
+            hostUserId,
+            friendUserId,
+            top1RestaurantId: top1,
+            top2RestaurantId: top2,
+            top3RestaurantId: top3,
+            superStarRestaurantId: superStarId,
+            winnerRestaurantId: winnerId,
+            comment: null,
+          },
+          update: {
+            top1RestaurantId: top1,
+            top2RestaurantId: top2,
+            top3RestaurantId: top3,
+            superStarRestaurantId: superStarId,
+            winnerRestaurantId: winnerId,
+          },
+        });
+
         await tx.groupSwipeSession.update({
           where: { id: sessionId },
           data: { status: "completed", endedAt: new Date() },
         });
+
         sessionCompleted = true;
       }
     });
 
-    // Rerank cadence per-user every 5
-    const youSwipes = isA ? aSwipes : isB ? bSwipes : (s.events.filter(e => e.userId === me.id).length);
-    const shouldRerank = youSwipes > 0 && youSwipes % 5 === 0;
+    // optional: clear any cached pool now that we’re done
+    try { clearPool(sessionId); } catch {}
 
-    // Suggest match only when BOTH done (change this if you want a per-user prompt)
-    const shouldSuggestMatch = sessionCompleted || ((aSwipes >= MAX_SWIPES) && (bSwipes >= MAX_SWIPES));
+    const combinedNext = (aSwipes ?? 0) + (bSwipes ?? 0);
+    const shouldRerank = combinedNext % 5 === 0;
+    // we already finalize on complete, so only suggest match while in-progress
+    const shouldSuggestMatch = false;
 
     return res.json({ ok: true, shouldRerank, shouldSuggestMatch, sessionCompleted });
   } catch (err) {
@@ -403,5 +493,6 @@ router.post("/session/:sessionId/feedback", async (req, res) => {
     res.status(500).json({ error: "feedback failed" });
   }
 });
+
 
 module.exports = router;
