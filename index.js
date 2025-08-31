@@ -106,6 +106,12 @@ const locationRoutes = require("./routes/location");
 const geocodeRoutes = require("./routes/geocode");
 const friendsRouter = require("./routes/friends");
 const meRouter = require("./routes/me");
+app.use(
+  "/api/me",
+  (req, _res, next) => { console.log("me-router hit:", req.method, req.url); next(); },
+  meRouter
+);
+
 let recsRoutes = require("./routes/recs");
 
 // Basic mounts
@@ -116,7 +122,7 @@ app.use("/api/friends", friendsRouter);
 app.use("/api/group", require("./routes/groupmatches"));
 app.use("/api/group", require("./routes/group"));
 app.use("/api/group", require("./routes/grouprequests"));
-app.use("/api/me", meRouter);
+
 
 
 
