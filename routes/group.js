@@ -1,17 +1,18 @@
 // routes/group.js
-// Group swiping (DB-only). No Places API calls here.
 
 const express = require("express");
 const prisma = require("../src/prisma");
 const verifyFirebaseToken = require("../middleware/auth");
 
 const { getOrBuildSessionPool, clearPool } = require("../src/group/pool");
+const { haversineKm, asFloat } = require("../src/utils/geo");
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
 
 const MAX_SWIPES = Number(process.env.GROUP_MAX_SWIPES || 15);
 const END_ON_SUPERSTAR = process.env.END_ON_SUPERSTAR === "1";
+const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL || "https://2eatapp.com"; // used for photo URLs
 
 // ───────────────────────── helpers ─────────────────────────
 
@@ -68,7 +69,7 @@ function tagForUserId(session, uid) {
 
 // ───────────────────────── endpoints ─────────────────────────
 
-// List my recent group sessions (tolerant; no params required).
+// List my recent group sessions
 router.get("/sessions", async (req, res) => {
   try {
     const me = await authedUser(req.user.uid);
@@ -78,7 +79,7 @@ router.get("/sessions", async (req, res) => {
       where: {
         OR: [{ startedById: me.id }, { aUserId: me.id }, { bUserId: me.id }],
       },
-      orderBy: { startedAt: "desc" },
+      orderBy: { startedAt: "asc" }, // or "desc", your call
       take: 10,
       select: {
         id: true,
@@ -175,7 +176,7 @@ router.get("/session/:id/state", async (req, res) => {
       bUser: { id: userB?.id, name: userB?.displayName || userB?.username || null, prefs: bPrefs, tag: "B" },
       locA,
       locB,
-      want: 12,
+      want: 24, // you logged plenty—bump page size to match your needs
       log: console.log,
     });
 
@@ -183,14 +184,57 @@ router.get("/session/:id/state", async (req, res) => {
     const idx = youCount;
     const nextItem = idx < pool.items.length ? pool.items[idx] : null;
 
+    let nextPayload = null;
+
     if (nextItem) {
+      // Hydrate details (including first photo name) for the single card
+      const r = await prisma.restaurant.findUnique({
+        where: { id: nextItem.id },
+        include: { photos: { take: 1 } },
+      });
+
+      // Decide which location to measure from for *you*
+      const myLoc = myTag === "A" ? locA : myTag === "B" ? locB : null;
+      let distance = null;
+      if (myLoc && r?.latitude != null && r?.longitude != null) {
+        distance = haversineKm(
+          myLoc,
+          { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }
+        );
+      }
+
+      const photoName = r?.photos?.[0]?.name || null;
+      const photoUrl = photoName
+        ? `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(photoName)}&w=1200`
+        : null; // <-- uses your existing photo proxy
+
+      nextPayload = {
+        id: nextItem.id,
+        name: r?.name || nextItem.name || "",
+        from: nextItem.from || null, // "A" | "B"
+        address: r?.formattedAddress || null,
+        priceLevel: r?.priceLevel ?? null,
+        primaryType: r?.primaryType || null,
+        types: r?.types || [],
+        editorialSummary: r?.editorialSummary || null,
+        editorial_summary: r?.editorialSummary || null, // backward compat if UI expects it
+        photoUrl,
+        distance,
+        servesVegetarianFood: r?.servesVegetarianFood ?? null,
+        allowsDogs: r?.allowsDogs ?? null,
+        hasParking:
+          r?.parkingOptions && typeof r.parkingOptions === "object"
+            ? Object.values(r.parkingOptions).some(Boolean)
+            : false,
+      };
+
       console.log("[group] nextCard", {
         sessionId,
         userId: me.id,
         countForUser: youCount,
         idx,
-        restaurant: { id: nextItem.id, name: nextItem.name },
-        from: nextItem.from || null, // "A" | "B"
+        restaurant: { id: nextPayload.id, name: nextPayload.name },
+        from: nextPayload.from || null,
       });
     } else {
       console.log("[group] state(no-next)", {
@@ -208,13 +252,7 @@ router.get("/session/:id/state", async (req, res) => {
       youCount,
       partnerCount,
       limit: MAX_SWIPES,
-      next: nextItem
-        ? {
-            id: nextItem.id,
-            name: nextItem.name,
-            from: nextItem.from || null, // surface source to the client if you want
-          }
-        : null,
+      next: nextPayload, // now fully hydrated with photoUrl and details
     });
   } catch (err) {
     console.error("[group/session/state] error:", err);
@@ -254,7 +292,7 @@ router.post("/session/:sessionId/feedback", async (req, res) => {
         sessionCompleted: false,
       });
     }
-    // Optional extra: if same restaurant+action exists anywhere, skip
+    // Optional: if same restaurant+action exists anywhere, skip
     if (s.events.some((e) => e.restaurantId === restaurantId && e.action === action)) {
       return res.json({
         ok: true,
@@ -283,7 +321,7 @@ router.post("/session/:sessionId/feedback", async (req, res) => {
         ? { aSwipes: { increment: 1 } }
         : isB
           ? { bSwipes: { increment: 1 } }
-          : {}; // if neither, don't bump counters
+          : {}; // if neither, don't bump counters (shouldn't happen for host/guest)
 
       if (Object.keys(inc).length) {
         await tx.groupSwipeSession.update({ where: { id: sessionId }, data: inc });
