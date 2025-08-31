@@ -103,6 +103,8 @@ router.get("/matches", async (req, res) => {
           top3,
           superStar,
           isGroup: true,
+          hostUserId: s.startedById,
+          friendUserId: s.aUserId === s.startedById ? s.bUserId : s.aUserId,
         };
       });
 
