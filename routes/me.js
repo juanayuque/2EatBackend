@@ -17,6 +17,7 @@ function readLatLng(req) {
 }
 
 router.post("/me/geo", async (req, res) => {
+    console.log("[me/geo] hit", { ua: req.headers['user-agent'], at: new Date().toISOString() });
   try {
     const me = await prisma.user.findUnique({ where: { firebaseUid: req.user.uid } });
     if (!me) return res.status(404).json({ error: "User not found" });
