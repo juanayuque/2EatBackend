@@ -1,118 +1,129 @@
-// src/recs/pool.js
-//
-// Build a "preferred" pool near a lat/lng for ONE user.
-// No session reads/writes here. Safe to use from solo or group flows.
+// src/group/service.js
+'use strict';
 
-const { haversineKm, asFloat } = require("../utils/geo");
+const prisma = require('../prisma'); // shared Prisma client
+const { getOrBuildSessionPool, nextCardForUser } = require('./pool');
 
-// crude mapping so "Chinese" matches Google place types like "chinese_restaurant"
-const CUISINE_ALIASES = {
-  "fast food": ["fast_food", "meal_takeaway"],
-  chinese: ["chinese", "chinese_restaurant"],
-  italian: ["italian", "italian_restaurant", "pizza", "pizzeria"],
-  japanese: ["japanese", "japanese_restaurant", "sushi", "ramen"],
-  spanish: ["spanish", "spanish_restaurant", "tapas"],
-  indian: ["indian", "indian_restaurant"],
-  thai: ["thai", "thai_restaurant"],
-  mexican: ["mexican", "mexican_restaurant", "tex-mex"],
-  greek: ["greek", "greek_restaurant"],
-  turkish: ["turkish", "turkish_restaurant", "kebab"],
-};
+/**
+ * Persist a user's location into the group's session context.
+ * Expects key to be "locA" or "locB" (the caller decides which).
+ */
+async function storeLocationForUser({ sessionId, userId, key, lat, lng }) {
+  if (!sessionId || !key || typeof lat !== 'number' || typeof lng !== 'number') {
+    throw new Error('sessionId, key, lat, lng required');
+  }
+  // Merge into existing JSON context
+  const s = await prisma.groupSwipeSession.findUnique({
+    where: { id: sessionId },
+    select: { context: true },
+  });
+  const ctx = (s?.context && typeof s.context === 'object') ? s.context : {};
+  const next = { ...ctx, [key]: { lat, lng, at: Date.now(), by: userId || null } };
 
-function normalizeCuisine(c) {
-  return String(c || "").trim().toLowerCase();
-}
-
-function typeMatchesCuisine(types = [], cuisine) {
-  const t = (types || []).map((x) => String(x).toLowerCase());
-  const key = normalizeCuisine(cuisine);
-  const aliases = CUISINE_ALIASES[key] || [key];
-  return aliases.some((a) => t.some((ty) => ty.includes(a)));
-}
-
-// VERY rough price mapping: if user budgets are low, prefer cheaper priceLevels
-function eligibleByBudget(priceLevel, budgetMax) {
-  if (budgetMax == null) return true;
-  // tweak as you like
-  if (budgetMax <= 15) return (priceLevel ?? 2) <= 1;
-  if (budgetMax <= 25) return (priceLevel ?? 2) <= 2;
-  if (budgetMax <= 40) return (priceLevel ?? 2) <= 3;
-  return true;
-}
-
-async function ensurePreferredPool({
-  places,          // created via createPlacesService({ prisma, googleApiKey })
-  lat,
-  lng,
-  user,
-  desiredMin = 20, // aim for at least this many
-}) {
-  const prisma = places?.prisma;
-  if (!prisma) throw new Error("ensurePreferredPool: places.prisma missing");
-
-  const radiusKm = Number(user?.searchDistance ?? 5);
-  const widenKm = Math.max(radiusKm, 3); // give ourselves some headroom
-
-  // 1) Pull a chunk from DB (cheap), then filter/sort in JS.
-  const rows = await prisma.restaurant.findMany({
-    select: {
-      id: true,
-      name: true,
-      latitude: true,
-      longitude: true,
-      types: true,
-      priceLevel: true,
-      servesVegetarianFood: true,
-      allowsDogs: true,
-    },
-    take: 800, // adjust based on DB size
-    orderBy: { createdAt: "desc" },
+  await prisma.groupSwipeSession.update({
+    where: { id: sessionId },
+    data: { context: next },
   });
 
-  const withDist = rows
-    .map((r) => ({
-      ...r,
-      _dist: haversineKm(
-        { lat, lng },
-        { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }
-      ),
-    }))
-    .filter((r) => r._dist <= widenKm);
-
-  // 2) Preference filters
-  const prefCuisines = Array.isArray(user?.preferredCuisines) ? user.preferredCuisines : [];
-  const wantsVeg = (user?.dietaryNeeds || []).some((d) =>
-    String(d).toLowerCase().includes("veget")
-  );
-
-  let filtered = withDist.filter((r) => eligibleByBudget(r.priceLevel, user?.budgetMax));
-  if (wantsVeg) filtered = filtered.filter((r) => r.servesVegetarianFood === true);
-
-  if (prefCuisines.length) {
-    const want = prefCuisines.map(normalizeCuisine);
-    const keep = new Set();
-    for (const r of filtered) {
-      if (want.some((c) => typeMatchesCuisine(r.types, c))) keep.add(r.id);
-    }
-    // If nothing matched cuisines, fall back to distance-only (so we still return something)
-    if (keep.size) filtered = filtered.filter((r) => keep.has(r.id));
-  }
-
-  // 3) Sort (distance first), then truncate
-  filtered.sort((a, b) => a._dist - b._dist);
-  const base = filtered.slice(0, Math.max(desiredMin * 2, desiredMin));
-
-  // 4) Hydrate to a consistent minimal shape expected by callers (id, name, …)
-  return base.map((r) => ({
-    id: r.id,
-    name: r.name,
-    latitude: r.latitude,
-    longitude: r.longitude,
-    types: r.types,
-    priceLevel: r.priceLevel,
-  }));
+  return { ok: true, key, lat, lng };
 }
 
+/**
+ * Return per-user swipe counts so the UI can render "You X/Y • Friend A/B".
+ * If you pass currentUserId, we’ll also shape counts as {youCount, partnerCount}.
+ */
+async function getSessionCounts({ sessionId, currentUserId } = {}) {
+  if (!sessionId) throw new Error('sessionId required');
+
+  const s = await prisma.groupSwipeSession.findUnique({
+    where: { id: sessionId },
+    select: { aUserId: true, bUserId: true, status: true },
+  });
+  if (!s) throw new Error('session not found');
+
+  // Count events grouped by user
+  const grouped = await prisma.groupSwipeEvent.groupBy({
+    by: ['userId'],
+    where: { sessionId },
+    _count: { _all: true },
+  });
+
+  const byUser = Object.fromEntries(grouped.map(g => [g.userId, g._count._all]));
+  const aCount = byUser[s.aUserId] || 0;
+  const bCount = byUser[s.bUserId] || 0;
+
+  if (!currentUserId) {
+    return {
+      aUserId: s.aUserId,
+      bUserId: s.bUserId,
+      aCount,
+      bCount,
+      status: s.status,
+    };
+  }
+
+  const youIsA = currentUserId === s.aUserId;
+  return {
+    youCount: youIsA ? aCount : bCount,
+    partnerCount: youIsA ? bCount : aCount,
+    aUserId: s.aUserId,
+    bUserId: s.bUserId,
+    status: s.status,
+  };
+}
+
+/**
+ * Opportunistically mark a session completed if both users hit MAX
+ * or if either SUPERSTAR’d (when endOnSuperstar is true).
+ * Returns the (possibly updated) status.
+ */
+async function maybeFinalizeSession({ sessionId, maxSwipes = 15, endOnSuperstar = false } = {}) {
+  if (!sessionId) throw new Error('sessionId required');
+
+  const s = await prisma.groupSwipeSession.findUnique({
+    where: { id: sessionId },
+    select: { id: true, status: true },
+  });
+  if (!s) throw new Error('session not found');
+  if (s.status !== 'active') return s.status;
+
+  // Per-user counts
+  const grouped = await prisma.groupSwipeEvent.groupBy({
+    by: ['userId'],
+    where: { sessionId },
+    _count: { _all: true },
+  });
+  const counts = grouped.map(g => g._count._all);
+  const bothAtMax = counts.length >= 2 && counts.every(c => c >= maxSwipes);
+
+  let superstar = null;
+  if (endOnSuperstar) {
+    const star = await prisma.groupSwipeEvent.findFirst({
+      where: { sessionId, action: 'SUPERSTAR' },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true },
+    });
+    superstar = !!star;
+  }
+
+  if (bothAtMax || superstar) {
+    await prisma.groupSwipeSession.update({
+      where: { id: sessionId },
+      data: { status: 'completed', endedAt: new Date() },
+    });
+    return 'completed';
+  }
+  return 'active';
+}
+
+// IMPORTANT: CommonJS named exports
 module.exports = {
-  ensurePreferredPool,
+  // re-export pool helpers so routes can destructure from this module
+  getOrBuildSessionPool,
+  nextCardForUser,
+
+  // local utilities used by routes/group.js
+  storeLocationForUser,
+  getSessionCounts,
+  maybeFinalizeSession,
 };
