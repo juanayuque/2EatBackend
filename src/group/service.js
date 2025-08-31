@@ -1,129 +1,80 @@
 // src/group/service.js
+// Small helpers used by routes/group.js
+
 'use strict';
 
-const prisma = require('../prisma'); // shared Prisma client
-const { getOrBuildSessionPool, nextCardForUser } = require('./pool');
+const DEFAULT_MAX = Number(process.env.GROUP_MAX_SWIPES || 15);
 
 /**
- * Persist a user's location into the group's session context.
- * Expects key to be "locA" or "locB" (the caller decides which).
+ * Store a location (locA or locB) into session.context without clobbering other keys.
  */
-async function storeLocationForUser({ sessionId, userId, key, lat, lng }) {
+async function storeLocationForUser(prisma, { sessionId, key, lat, lng }) {
   if (!sessionId || !key || typeof lat !== 'number' || typeof lng !== 'number') {
     throw new Error('sessionId, key, lat, lng required');
   }
-  // Merge into existing JSON context
-  const s = await prisma.groupSwipeSession.findUnique({
-    where: { id: sessionId },
-    select: { context: true },
-  });
-  const ctx = (s?.context && typeof s.context === 'object') ? s.context : {};
-  const next = { ...ctx, [key]: { lat, lng, at: Date.now(), by: userId || null } };
+  const s = await prisma.groupSwipeSession.findUnique({ where: { id: sessionId } });
+  if (!s) throw new Error('session not found');
+
+  const ctx = Object(s.context || {});
+  ctx[key] = { lat, lng };
 
   await prisma.groupSwipeSession.update({
     where: { id: sessionId },
-    data: { context: next },
+    data: { context: ctx },
   });
-
-  return { ok: true, key, lat, lng };
+  return true;
 }
 
 /**
- * Return per-user swipe counts so the UI can render "You X/Y • Friend A/B".
- * If you pass currentUserId, we’ll also shape counts as {youCount, partnerCount}.
+ * Return counts for A & B; the router can map them to "you/partner".
  */
-async function getSessionCounts({ sessionId, currentUserId } = {}) {
+async function getSessionCounts(prisma, { sessionId, limit = DEFAULT_MAX }) {
+  if (!sessionId) throw new Error('sessionId required');
+  const s = await prisma.groupSwipeSession.findUnique({
+    where: { id: sessionId },
+    include: { events: { select: { userId: true } } },
+  });
+  if (!s) throw new Error('session not found');
+
+  // figure A/B from session row
+  const aId = s.aUserId || null;
+  const bId = s.bUserId || null;
+
+  const aCount = aId ? s.events.filter(e => e.userId === aId).length : 0;
+  const bCount = bId ? s.events.filter(e => e.userId === bId).length : 0;
+
+  return { aUserId: aId, bUserId: bId, aCount, bCount, limit };
+}
+
+/**
+ * If both finished (>= limit), mark session completed (idempotent).
+ */
+async function maybeFinalizeSession(prisma, { sessionId, limit = DEFAULT_MAX }) {
   if (!sessionId) throw new Error('sessionId required');
 
   const s = await prisma.groupSwipeSession.findUnique({
     where: { id: sessionId },
-    select: { aUserId: true, bUserId: true, status: true },
+    include: { events: { select: { userId: true } } },
   });
-  if (!s) throw new Error('session not found');
+  if (!s) return false;
+  if (s.status !== 'active') return false;
 
-  // Count events grouped by user
-  const grouped = await prisma.groupSwipeEvent.groupBy({
-    by: ['userId'],
-    where: { sessionId },
-    _count: { _all: true },
-  });
+  const aCount = s.aUserId ? s.events.filter(e => e.userId === s.aUserId).length : 0;
+  const bCount = s.bUserId ? s.events.filter(e => e.userId === s.bUserId).length : 0;
 
-  const byUser = Object.fromEntries(grouped.map(g => [g.userId, g._count._all]));
-  const aCount = byUser[s.aUserId] || 0;
-  const bCount = byUser[s.bUserId] || 0;
-
-  if (!currentUserId) {
-    return {
-      aUserId: s.aUserId,
-      bUserId: s.bUserId,
-      aCount,
-      bCount,
-      status: s.status,
-    };
-  }
-
-  const youIsA = currentUserId === s.aUserId;
-  return {
-    youCount: youIsA ? aCount : bCount,
-    partnerCount: youIsA ? bCount : aCount,
-    aUserId: s.aUserId,
-    bUserId: s.bUserId,
-    status: s.status,
-  };
-}
-
-/**
- * Opportunistically mark a session completed if both users hit MAX
- * or if either SUPERSTAR’d (when endOnSuperstar is true).
- * Returns the (possibly updated) status.
- */
-async function maybeFinalizeSession({ sessionId, maxSwipes = 15, endOnSuperstar = false } = {}) {
-  if (!sessionId) throw new Error('sessionId required');
-
-  const s = await prisma.groupSwipeSession.findUnique({
-    where: { id: sessionId },
-    select: { id: true, status: true },
-  });
-  if (!s) throw new Error('session not found');
-  if (s.status !== 'active') return s.status;
-
-  // Per-user counts
-  const grouped = await prisma.groupSwipeEvent.groupBy({
-    by: ['userId'],
-    where: { sessionId },
-    _count: { _all: true },
-  });
-  const counts = grouped.map(g => g._count._all);
-  const bothAtMax = counts.length >= 2 && counts.every(c => c >= maxSwipes);
-
-  let superstar = null;
-  if (endOnSuperstar) {
-    const star = await prisma.groupSwipeEvent.findFirst({
-      where: { sessionId, action: 'SUPERSTAR' },
-      orderBy: { createdAt: 'desc' },
-      select: { id: true },
-    });
-    superstar = !!star;
-  }
-
-  if (bothAtMax || superstar) {
+  if (aCount >= limit && bCount >= limit) {
     await prisma.groupSwipeSession.update({
       where: { id: sessionId },
       data: { status: 'completed', endedAt: new Date() },
     });
-    return 'completed';
+    return true;
   }
-  return 'active';
+  return false;
 }
 
-// IMPORTANT: CommonJS named exports
 module.exports = {
-  // re-export pool helpers so routes can destructure from this module
-  getOrBuildSessionPool,
-  nextCardForUser,
-
-  // local utilities used by routes/group.js
   storeLocationForUser,
   getSessionCounts,
   maybeFinalizeSession,
+  DEFAULT_MAX,
 };
