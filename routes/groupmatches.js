@@ -5,6 +5,8 @@ const express = require("express");
 const prisma = require("../src/prisma");
 const verifyFirebaseToken = require("../middleware/auth");
 
+const PUBLIC = process.env.BACKEND_PUBLIC_URL || "https://2eatapp.com";
+
 const router = express.Router();
 router.use(verifyFirebaseToken);
 
@@ -19,7 +21,8 @@ function toPhotoUrlFromRestaurant(r) {
     r?.photoName ||
     r?.photos?.[0]?.name ||
     null;
-  return name ? `/api/photo?name=${encodeURIComponent(name)}&maxWidthPx=1200` : null;
+  // IMPORTANT: absolute URL so RN Web <Image> loads from backend, not localhost.
+  return name ? `${PUBLIC}/api/photo?name=${encodeURIComponent(name)}&maxWidthPx=1200` : null;
 }
 
 function shapeResto(r) {
@@ -57,7 +60,13 @@ router.get("/matches", async (req, res) => {
     for (const s of sessions) {
       const m = s.match;
       if (!m) continue;
-      [m.winnerRestaurantId, m.superStarRestaurantId, m.top1RestaurantId, m.top2RestaurantId, m.top3RestaurantId]
+      [
+        m.winnerRestaurantId,
+        m.superStarRestaurantId,
+        m.top1RestaurantId,
+        m.top2RestaurantId,
+        m.top3RestaurantId,
+      ]
         .filter(Boolean)
         .forEach((id) => ids.add(id));
     }
@@ -84,7 +93,7 @@ router.get("/matches", async (req, res) => {
         return {
           id: m.id,
           sessionId: s.id,
-          createdAt: (m.createdAt || s.endedAt || s.startedAt || new Date()).toISOString?.() ?? String(m.createdAt || s.endedAt || s.startedAt || new Date()),
+          createdAt: new Date(m.createdAt || s.endedAt || s.startedAt || Date.now()).toISOString(),
           userComment: m.comment ?? null, // UI expects userComment
           winner,
           top1,
@@ -109,14 +118,27 @@ router.post("/matches/finalize", async (req, res) => {
     const me = await authedUser(req.user.uid);
     if (!me) return res.status(404).json({ error: "User not found" });
 
-    const { sessionId, top3 = [], winnerRestaurantId, superStarRestaurantId = null, comment = null } = req.body || {};
+    const {
+      sessionId,
+      top3 = [],
+      winnerRestaurantId,
+      superStarRestaurantId = null,
+      comment = null,
+    } = req.body || {};
+
     if (!sessionId || !winnerRestaurantId || !Array.isArray(top3) || top3.length === 0) {
       return res.status(400).json({ error: "sessionId, winnerRestaurantId, top3 required" });
     }
 
     const s = await prisma.groupSwipeSession.findUnique({
       where: { id: sessionId },
-      select: { id: true, status: true, startedById: true, aUserId: true, bUserId: true },
+      select: {
+        id: true,
+        status: true,
+        startedById: true,
+        aUserId: true,
+        bUserId: true,
+      },
     });
     if (!s) return res.status(404).json({ error: "Session not found" });
 
@@ -125,15 +147,22 @@ router.post("/matches/finalize", async (req, res) => {
 
     const hostUserId = s.startedById || s.aUserId || s.bUserId;
     const friendUserId =
-      hostUserId === s.aUserId ? s.bUserId ?? null :
-      hostUserId === s.bUserId ? s.aUserId ?? null :
-      s.aUserId || s.bUserId || null;
+      hostUserId === s.aUserId
+        ? s.bUserId ?? null
+        : hostUserId === s.bUserId
+        ? s.aUserId ?? null
+        : s.aUserId || s.bUserId || null;
+
+    if (!hostUserId || !friendUserId) {
+      return res.status(409).json({ error: "session missing participants" });
+    }
 
     await prisma.$transaction(async (tx) => {
       await tx.groupMatch.upsert({
         where: { sessionId: s.id },
         create: {
-          sessionId: s.id,
+          // IMPORTANT: nested connect for the relation
+          session: { connect: { id: s.id } },
           hostUserId,
           friendUserId,
           top1RestaurantId: top3[0],
