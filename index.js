@@ -35,7 +35,9 @@ app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 // Allow known production domains and common local dev origins (Expo/Metro).
 const allowSet = new Set([
   "https://2eatapp.com",
+  "https://app.2eatapp.com",
   "https://www.2eatapp.com",
+   /\.pages\.dev$/,
   "http://localhost:8081",  // Expo Metro (web preview)
   "http://localhost:19006", // Expo web dev
   "http://localhost:3000",  // General local dev
