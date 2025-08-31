@@ -1,655 +1,639 @@
-// routes/group.js
-const express = require("express");
-const prisma = require("../src/prisma");
-const verifyFirebaseToken = require("../middleware/auth");
+// app/group-match/session/[sessionId].tsx
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ActivityIndicator,
+  Animated,
+  Image,
+  Platform,
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
+import { useLocalSearchParams } from "expo-router";
+import { auth } from "../../../../firebaseConfig"; // <= correct relative path
 
-const router = express.Router();
-router.use(verifyFirebaseToken);
+const API_BASE = "https://2eatapp.com";
+const ACCENT = "#4f46e5";
+const TEXT = "#111";
+const MUTED = "#666";
+const BORDER = "#e5e5ea";
+const FALLBACK_IMG = require("../../../../src/assets/images/2Eat-Logo.png");
 
-// ─────────────────────────── Config ───────────────────────────
-const SWIPE_LIMIT = 15;            // target swipes per user
-const WANT_PER_USER = 10;          // aim to pool this many per user
-const DEFAULT_RADIUS_KM = 5;       // initial radius
-const MAX_RADIUS_KM = 15;          // max radius while expanding
-const RADIUS_STEP_KM = 3;          // step while expanding
-const CUISINE_RELAX_THRESHOLD = 6; // if fewer than this, relax cuisine
-const POOL_CACHE = new Map();      // sessionId -> { pool, aBuiltAt, bBuiltAt }
-const DECK_CACHE = new Map();      // `${sessionId}:${userId}` -> [ids...]
+// ---------- small helpers ----------
+const primaryReadable = (pt?: string | null) =>
+  pt ? pt.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()) : null;
 
-// ─────────────────────────── Helpers ───────────────────────────
-const jlog = (label, obj) => {
-  try { console.log(label, JSON.stringify(obj, null, 2)); }
-  catch { console.log(label, obj); }
+function hasParkingHeuristic(r: any): boolean {
+  const po = r?.parkingOptions;
+  const summary = String(r?.editorial_summary || r?.editorialSummary || "").toLowerCase();
+  const hint = summary.includes("parking") || summary.includes("car park") || summary.includes("parking lot");
+  if (po && typeof po === "object") return Object.values(po).some(Boolean) || hint;
+  return Boolean(po) || hint;
+}
+function renderBudgetStars(level?: number | null) {
+  if (level == null) return "☆☆☆☆  ·  Budget";
+  const l = Math.max(0, Math.min(4, level));
+  return `${"★".repeat(l)}${"☆".repeat(4 - l)}  ·  Budget`;
+}
+function pickDeterministic<T>(arr: T[], seed: string, count = 2): T[] {
+  if (!arr?.length) return [];
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+  const out: T[] = [];
+  const used = new Set<number>();
+  for (let i = 0; i < Math.min(count, arr.length); i++) {
+    let idx = (h + i * 97) % arr.length;
+    while (used.has(idx) && used.size < arr.length) idx = (idx + 1) % arr.length;
+    used.add(idx);
+    out.push(arr[idx]);
+  }
+  return out;
+}
+
+// ---------- types ----------
+type Card = {
+  id: string;
+  name: string;
+  address?: string | null;
+  distance?: number | null;
+  priceLevel?: number | null;
+  photoUrl?: string | null;
+  primaryType?: string | null;
+  primaryTypeDisplayName?: string | null;
+  types?: string[] | null;
+  editorialSummary?: string | null;
+  editorial_summary?: string | null;
+  allowsDogs?: boolean | null;
+  parkingOptions?: any;
 };
 
-async function getAuthedUserOr404(firebaseUid, res) {
-  const user = await prisma.user.findUnique({ where: { firebaseUid } });
-  if (!user) { res.status(404).json({ error: "User not found" }); return null; }
-  return user;
-}
-const labelOfUser = (u) => u?.displayName?.trim() || u?.username?.trim() || (u?.email?.split("@")[0]) || "Friend";
-const usernameOfUser = (u) => u?.username || null;
-
-async function assertAreFriendsOr400(meId, otherUserId, res) {
-  const a = await prisma.friend.findFirst({ where: { userId: meId, friendId: otherUserId }, select: { id: true } });
-  const b = await prisma.friend.findFirst({ where: { userId: otherUserId, friendId: meId }, select: { id: true } });
-  if (!a && !b) { res.status(400).json({ error: "You can only group-match with friends" }); return false; }
-  return true;
-}
-
-async function getSessionCounts(sessionId, aUserId, bUserId) {
-  const rows = await prisma.groupSwipeEvent.groupBy({
-    by: ["userId"],
-    where: { sessionId },
-    _count: { _all: true },
-  });
-  const byUser = new Map(rows.map((r) => [r.userId, r._count._all]));
-  return { aCount: byUser.get(aUserId) || 0, bCount: byUser.get(bUserId) || 0, limit: SWIPE_LIMIT };
-}
-
-// cuisine keywords
-const norm = (s) => String(s || "").toLowerCase().replace(/[_\s-]+/g, " ").trim();
-const CUISINE_KEYWORDS = {
-  indian: ["indian"],
-  chinese: ["chinese","szechuan","sichuan","cantonese","hunan"],
-  italian: ["italian","pizza","pasta","sicilian","tuscan"],
-  japanese: ["japanese","sushi","ramen","izakaya"],
-  thai: ["thai"],
-  mexican: ["mexican","taqueria","taco"],
-  korean: ["korean","bbq"],
-  american: ["american","burger","bbq","diner"],
-  vietnamese: ["vietnamese","pho","banh mi","bahn mi"],
-  mediterranean: ["mediterranean","greek","turkish","lebanese"],
-  "middle eastern": ["middle eastern","lebanese","turkish","persian","iranian"],
-  spanish: ["spanish","tapas"],
-  french: ["french","brasserie"],
-  greek: ["greek"],
-  turkish: ["turkish"],
-  lebanese: ["lebanese"],
-  persian: ["persian","iranian"],
-  fastfood: ["fast"],
+type SessionState = {
+  status: "active" | "completed" | string;
+  youCount: number;
+  partnerCount: number;
+  limit: number;
+  next?: Card | null;
 };
-function expandCuisineKeywords(prefs = []) {
-  const set = new Set();
-  for (const p of prefs) (CUISINE_KEYWORDS[norm(p)] || [norm(p)]).forEach((w) => set.add(w));
-  const words = [...set];
-  return { words, tags: words.map((w) => w.replace(/\s+/g, "_")) };
-}
 
-function bboxFrom(lat, lng, radiusKm) {
-  const dLat = radiusKm / 110.574;
-  const dLng = radiusKm / (111.320 * Math.cos((lat * Math.PI) / 180) || 1);
-  return { minLat: lat - dLat, maxLat: lat + dLat, minLng: lng - dLng, maxLng: lng + dLng };
-}
-function haversineKm(a, b) {
-  const R = 6371;
-  const dLat = ((b.lat - a.lat) * Math.PI) / 180;
-  const dLng = ((b.lng - a.lng) * Math.PI) / 180;
-  const la1 = (a.lat * Math.PI) / 180, la2 = (b.lat * Math.PI) / 180;
-  const h = Math.sin(dLat/2)**2 + Math.cos(la1)*Math.cos(la2)*Math.sin(dLng/2)**2;
-  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
-}
+type GroupSessionRow = {
+  id: string;
+  partner: { id: string; name: string; username?: string | null };
+  youCount: number;
+  partnerCount: number;
+  limit: number;
+};
 
-// Core fetch with progressive relax
-async function fetchForUserAt({ user, lat, lng, want = WANT_PER_USER, radiusKm = DEFAULT_RADIUS_KM }) {
-  const prefs = {
-    distance: user.searchDistance ?? null,
-    budgetMax: user.budgetMax ?? null,
-    dietaryNeeds: Array.isArray(user.dietaryNeeds) ? user.dietaryNeeds : [],
-    preferredCuisines: Array.isArray(user.preferredCuisines) ? user.preferredCuisines : [],
-  };
-  const cx = expandCuisineKeywords(prefs.preferredCuisines);
-  const initialRadius = Math.max(1, Math.min(MAX_RADIUS_KM, prefs.distance ?? radiusKm));
+// ---------- component ----------
+export default function GroupJoin() {
+  const { sessionId } = useLocalSearchParams<{ sessionId: string }>();
 
-  // helper to run a query with options
-  const run = async ({ radius, withCuisine }) => {
-    const box = bboxFrom(lat, lng, radius);
-    const where = {
-      latitude: { gte: box.minLat, lte: box.maxLat },
-      longitude: { gte: box.minLng, lte: box.maxLng },
-    };
-    if (withCuisine && (cx.tags.length || cx.words.length)) {
-      const OR = [];
-      if (cx.tags.length) OR.push({ types: { hasSome: cx.tags } }); // Postgres text[] column
-      if (cx.words.length) {
-        OR.push(
-          { primaryType: { in: cx.words.map((w) => w.replace(/\s+/g,"_").toUpperCase()) } },
-          ...cx.words.map((w) => ({ primaryTypeDisplayName: { contains: w, mode: "insensitive" } })),
-          ...cx.words.map((w) => ({ editorialSummary: { contains: w, mode: "insensitive" } }))
-        );
-      }
-      where.OR = OR;
-    }
-    const rows = await prisma.restaurant.findMany({
-      where,
-      take: Math.max(want * 3, 30),
-      select: {
-        id: true, name: true, formattedAddress: true, priceLevel: true,
-        primaryType: true, primaryTypeDisplayName: true, types: true,
-        editorialSummary: true, allowsDogs: true, parkingOptions: true,
-        latitude: true, longitude: true,
-        photos: { take: 1, select: { name: true } },
-      },
-    });
-    const withDist = rows
-      .map((r) => ({
-        r,
-        dist: (typeof r.latitude === "number" && typeof r.longitude === "number")
-          ? haversineKm({ lat, lng }, { lat: r.latitude, lng: r.longitude })
-          : 9999,
-      }))
-      .sort((a,b) => a.dist - b.dist)
-      .slice(0, want);
-    return withDist.map(({ r, dist }) => ({
-      id: r.id,
-      name: r.name,
-      address: r.formattedAddress ?? null,
-      priceLevel: r.priceLevel ?? null,
-      primaryType: r.primaryType ?? null,
-      primaryTypeDisplayName: r.primaryTypeDisplayName ?? null,
-      types: r.types ?? null,
-      editorialSummary: r.editorialSummary ?? null,
-      editorial_summary: r.editorialSummary ?? null,
-      allowsDogs: r.allowsDogs ?? null,
-      parkingOptions: r.parkingOptions ?? null,
-      distance: dist,
-      photoUrl: r.photos?.[0]?.name ? `/api/recs/photo?name=${encodeURIComponent(r.photos[0].name)}&w=1200` : null,
-    }));
+  // toast
+  const toastOpacity = useRef(new Animated.Value(0)).current;
+  const [toastMsg, setToastMsg] = useState<string | null>(null);
+  const toast = (msg: string) => {
+    setToastMsg(msg);
+    Animated.sequence([
+      Animated.timing(toastOpacity, { toValue: 1, duration: 160, useNativeDriver: true }),
+      Animated.delay(1600),
+      Animated.timing(toastOpacity, { toValue: 0, duration: 180, useNativeDriver: true }),
+    ]).start(() => setToastMsg(null));
   };
 
-  // Stage 1: initial radius + cuisine
-  let picks = await run({ radius: initialRadius, withCuisine: true });
-  jlog("[group] pool(stage1)", { radius: initialRadius, withCuisine: true, got: picks.length });
+  const [partnerName, setPartnerName] = useState<string>("Friend");
+  const [state, setState] = useState<SessionState | null>(null);
 
-  // Stage 2: expand radius (still with cuisine) until want or max
-  if (picks.length < want) {
-    for (let r = initialRadius + RADIUS_STEP_KM; r <= MAX_RADIUS_KM && picks.length < want; r += RADIUS_STEP_KM) {
-      const more = await run({ radius: r, withCuisine: true });
-      jlog("[group] pool(stage2)", { radius: r, withCuisine: true, got: more.length });
-      // merge by id
-      const seen = new Set(picks.map((x) => x.id));
-      for (const m of more) if (!seen.has(m.id)) { picks.push(m); seen.add(m.id); }
-    }
-  }
+  // current card (set only when id changes to avoid flicker)
+  const [card, setCard] = useState<Card | null>(null);
+  const lastCardIdRef = useRef<string | null>(null);
 
-  // Stage 3: if still low (< threshold), relax cuisine and try again (expand if needed)
-  if (picks.length < CUISINE_RELAX_THRESHOLD) {
-    const relaxed1 = await run({ radius: initialRadius, withCuisine: false });
-    jlog("[group] pool(stage3)", { radius: initialRadius, withCuisine: false, got: relaxed1.length });
-    const seen = new Set(picks.map((x) => x.id));
-    for (const m of relaxed1) if (!seen.has(m.id)) { picks.push(m); seen.add(m.id); }
+  const [loading, setLoading] = useState(true);
+  const [actionBusy, setActionBusy] = useState(false);
 
-    for (let r = initialRadius + RADIUS_STEP_KM; r <= MAX_RADIUS_KM && picks.length < want; r += RADIUS_STEP_KM) {
-      const more = await run({ radius: r, withCuisine: false });
-      jlog("[group] pool(stage3+expand)", { radius: r, withCuisine: false, got: more.length });
-      for (const m of more) if (!seen.has(m.id)) { picks.push(m); seen.add(m.id); }
-    }
-  }
+  // comments cache (solo + group matches)
+  const [commentsByRestaurant, setCommentsByRestaurant] = useState<Record<string, string[]>>({});
 
-  jlog("[group] pool(user-final)", { got: picks.length, want });
+  // my location (used to set locA/locB and sent as headers on /state)
+  const [myLoc, setMyLoc] = useState<{ lat: number; lng: number } | null>(null);
 
-  // return up to want
-  return picks.slice(0, want);
-}
+  const authedHeaders = useCallback(async () => {
+    const t = await auth.currentUser?.getIdToken(true);
+    return { Authorization: `Bearer ${t}`, "Content-Type": "application/json" } as Record<string, string>;
+  }, []);
 
-// Combine & dedupe pool for session
-async function getOrBuildSessionPool(session) {
-  const cache = POOL_CACHE.get(session.id);
-  if (cache?.pool?.length) return cache.pool;
-
-  const [a, b] = await Promise.all([
-    prisma.user.findUnique({ where: { id: session.aUserId } }),
-    prisma.user.findUnique({ where: { id: session.bUserId } }),
-  ]);
-  const ctx = session.context || {};
-  const locA = ctx?.locA || null;
-  const locB = ctx?.locB || null;
-
-  jlog("[group] pool(start)", {
-    sessionId: session.id,
-    want: WANT_PER_USER,
-    aUser: {
-      id: a?.id, name: a?.displayName || "A",
-      prefs: {
-        distance: a?.searchDistance ?? null,
-        budgetMax: a?.budgetMax ?? null,
-        dietaryNeeds: a?.dietaryNeeds || [],
-        preferredCuisines: a?.preferredCuisines || [],
-      },
-    },
-    bUser: {
-      id: b?.id, name: b?.displayName || "B",
-      prefs: {
-        distance: b?.searchDistance ?? null,
-        budgetMax: b?.budgetMax ?? null,
-        dietaryNeeds: b?.dietaryNeeds || [],
-        preferredCuisines: b?.preferredCuisines || [],
-      },
-    },
-    locA, locB,
-  });
-
-  if (!locA && !locB) {
-    jlog("[group] pool(no-locations)", { sessionId: session.id });
-    POOL_CACHE.set(session.id, { pool: [] });
-    return [];
-  }
-
-  let picksA = [], picksB = [];
-  if (locA && a) {
-    picksA = await fetchForUserAt({ user: a, lat: locA.lat, lng: locA.lng, want: WANT_PER_USER, radiusKm: DEFAULT_RADIUS_KM });
-    jlog("[group] pool(A-picked)", picksA.map((x) => ({ id: x.id, name: x.name, from: "A" })));
-  }
-  if (locB && b) {
-    picksB = await fetchForUserAt({ user: b, lat: locB.lat, lng: locB.lng, want: WANT_PER_USER, radiusKm: DEFAULT_RADIUS_KM });
-    jlog("[group] pool(B-picked)", picksB.map((x) => ({ id: x.id, name: x.name, from: "B" })));
-  }
-
-  const combined = [];
-  const seen = new Set();
-  const maxLen = Math.max(picksA.length, picksB.length);
-  for (let i = 0; i < maxLen; i++) {
-    const aRow = picksA[i]; if (aRow && !seen.has(aRow.id)) { combined.push({ id: aRow.id, from: "A" }); seen.add(aRow.id); }
-    const bRow = picksB[i]; if (bRow && !seen.has(bRow.id)) { combined.push({ id: bRow.id, from: "B" }); seen.add(bRow.id); }
-  }
-
-  jlog("[group] pool(combined)", { sessionId: session.id, total: combined.length, ids: combined.map((x) => x.id) });
-  POOL_CACHE.set(session.id, { pool: combined, aBuiltAt: new Date(), bBuiltAt: new Date() });
-  return combined;
-}
-
-function getOrBuildDeck(sessionId, userId, pool) {
-  const key = `${sessionId}:${userId}`;
-  let deck = DECK_CACHE.get(key);
-  if (!deck || deck.length !== pool.length) {
-    let h = 0; for (let i = 0; i < userId.length; i++) h = (h * 31 + userId.charCodeAt(i)) >>> 0;
-    const ids = pool.map((p) => p.id);
-    for (let i = ids.length - 1; i > 0; i--) {
-      const j = (h + i * 9301 + 49297) % (i + 1);
-      [ids[i], ids[j]] = [ids[j], ids[i]];
-    }
-    deck = ids;
-    DECK_CACHE.set(key, deck);
-  }
-  return deck;
-}
-
-async function computeNextForUser(session, userId) {
-  const pool = await getOrBuildSessionPool(session);
-  const deck = getOrBuildDeck(session.id, userId, pool);
-  const countForUser = await prisma.groupSwipeEvent.count({ where: { sessionId: session.id, userId } });
-  const idx = countForUser;
-  if (idx >= deck.length) {
-    jlog("[group] state(no-next)", { sessionId: session.id, youCount: countForUser, limit: SWIPE_LIMIT, poolSize: deck.length });
-    return { next: null, idx, poolSize: deck.length, countForUser };
-  }
-  const id = deck[idx];
-  const meta = (await getOrBuildSessionPool(session)).find((p) => p.id === id) || { from: null };
-  const r = await prisma.restaurant.findUnique({
-    where: { id },
-    select: {
-      id: true, name: true, formattedAddress: true, priceLevel: true,
-      primaryType: true, primaryTypeDisplayName: true, types: true,
-      editorialSummary: true, allowsDogs: true, parkingOptions: true,
-      photos: { take: 1, select: { name: true } },
-    },
-  });
-  const card = r ? {
-    id: r.id, name: r.name, address: r.formattedAddress ?? null, priceLevel: r.priceLevel ?? null,
-    primaryType: r.primaryType ?? null, primaryTypeDisplayName: r.primaryTypeDisplayName ?? null,
-    types: r.types ?? null, editorialSummary: r.editorialSummary ?? null, editorial_summary: r.editorialSummary ?? null,
-    allowsDogs: r.allowsDogs ?? null, parkingOptions: r.parkingOptions ?? null,
-    photoUrl: r.photos?.[0]?.name ? `/api/recs/photo?name=${encodeURIComponent(r.photos[0].name)}&w=1200` : null,
-  } : null;
-
-  jlog("[group] nextCard", {
-    sessionId: session.id,
-    userId,
-    countForUser,
-    idx,
-    restaurant: card ? { id: card.id, name: card.name } : null,
-    from: meta.from || null,
-  });
-
-  return { next: card, idx, poolSize: deck.length, countForUser };
-}
-
-// Ranking
-async function rankTop3(sessionId) {
-  const events = await prisma.groupSwipeEvent.findMany({
-    where: { sessionId },
-    select: { restaurantId: true, userId: true, action: true, createdAt: true },
-  });
-  if (!events.length) return { top: [], winner: null };
-  const score = new Map();
-  for (const e of events) {
-    let entry = score.get(e.restaurantId);
-    if (!entry) entry = { s: 0, likedBy: new Set(), last: e.createdAt };
-    if (e.action === "LIKE") entry.s += 1;
-    if (e.action === "SUPERSTAR") entry.s += 3;
-    if (e.action === "LIKE" || e.action === "SUPERSTAR") entry.likedBy.add(e.userId);
-    if (e.createdAt > entry.last) entry.last = e.createdAt;
-    score.set(e.restaurantId, entry);
-  }
-  let items = Array.from(score.entries()).map(([rid, v]) => ({
-    restaurantId: rid, s: v.s + (v.likedBy.size >= 2 ? 2 : 0), likedByCount: v.likedBy.size, last: v.last,
-  }));
-  const allZero = items.every((i) => i.s === 0);
-  items.sort((a,b) => (b.s - a.s) || (b.likedByCount - a.likedByCount) || (b.last - a.last));
-  if (allZero) items.sort((a,b) => b.last - a.last);
-  const top = items.slice(0, 3).map((i) => i.restaurantId);
-  return { top, winner: top[0] || null };
-}
-
-async function maybeFinalizeSession(sessionId) {
-  const s = await prisma.groupSwipeSession.findUnique({
-    where: { id: sessionId },
-    select: { id: true, status: true, aUserId: true, bUserId: true },
-  });
-  if (!s || s.status !== "active") return { finalized: false };
-  const { aCount, bCount } = await getSessionCounts(s.id, s.aUserId, s.bUserId);
-  if (aCount < SWIPE_LIMIT || bCount < SWIPE_LIMIT) return { finalized: false };
-  const existing = await prisma.groupMatch.findUnique({ where: { sessionId: s.id } });
-  if (existing) {
-    await prisma.groupSwipeSession.update({ where: { id: s.id }, data: { status: "completed", endedAt: new Date() } });
-    return { finalized: true, matchId: existing.id };
-  }
-  const { top, winner } = await rankTop3(s.id);
-  const [top1, top2, top3] = [top[0] || null, top[1] || null, top[2] || null];
-  await prisma.$transaction(async (tx) => {
-    await tx.groupSwipeSession.update({ where: { id: s.id }, data: { status: "completed", endedAt: new Date() } });
-    await tx.groupMatch.create({
-      data: {
-        sessionId: s.id,
-        hostUserId: s.aUserId,
-        friendUserId: s.bUserId,
-        top1RestaurantId: top1 || "",
-        top2RestaurantId: top2 || null,
-        top3RestaurantId: top3 || null,
-        superStarRestaurantId: null,
-        winnerRestaurantId: winner || (top1 || ""),
-      },
+  // helper to get browser geolocation (web & native)
+  const getBrowserLocation = useCallback(async (): Promise<{ lat: number; lng: number } | null> => {
+    if (typeof navigator === "undefined" || !("geolocation" in navigator)) return null;
+    return new Promise((resolve) => {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+        () => resolve(null),
+        { enableHighAccuracy: true, maximumAge: 60000, timeout: 8000 }
+      );
     });
-  });
-  return { finalized: true };
-}
+  }, []);
 
-// ─────────────────────────── Requests ───────────────────────────
-
-router.get("/requests", async (req, res) => {
-  try {
-    const me = await getAuthedUserOr404(req.user.uid, res); if (!me) return;
-    const [incomingRows, outgoingRows] = await Promise.all([
-      prisma.groupRequest.findMany({
-        where: { toUserId: me.id, status: "PENDING" },
-        orderBy: { createdAt: "desc" },
-        include: { fromUser: { select: { id: true, displayName: true, email: true, username: true } } },
-      }),
-      prisma.groupRequest.findMany({
-        where: { fromUserId: me.id, status: "PENDING" },
-        orderBy: { createdAt: "desc" },
-        include: { toUser: { select: { id: true, displayName: true, email: true, username: true } } },
-      }),
-    ]);
-    res.json({
-      incoming: incomingRows.map((r) => ({
-        id: r.id, fromUserId: r.fromUserId, fromName: labelOfUser(r.fromUser), fromUsername: usernameOfUser(r.fromUser),
-      })),
-      outgoing: outgoingRows.map((r) => ({
-        id: r.id, toUserId: r.toUserId, toName: labelOfUser(r.toUser), toUsername: usernameOfUser(r.toUser),
-      })),
-    });
-  } catch (err) { console.error("[group/requests] error:", err); res.status(500).json({ error: "failed to load group requests" }); }
-});
-
-router.post("/request", async (req, res) => {
-  try {
-    const me = await getAuthedUserOr404(req.user.uid, res); if (!me) return;
-    const friendId = req.body?.friendId;
-    if (!friendId) return res.status(400).json({ error: "friendId required" });
-    if (friendId === me.id) return res.status(400).json({ error: "Cannot group-match yourself" });
-    const ok = await assertAreFriendsOr400(me.id, friendId, res); if (!ok) return;
-
-    const pending = await prisma.groupRequest.findFirst({
-      where: { status: "PENDING", OR: [{ fromUserId: me.id, toUserId: friendId }, { fromUserId: friendId, toUserId: me.id }] },
-      select: { id: true },
-    });
-    if (pending) return res.json({ ok: true, requestId: pending.id });
-
-    let gr;
-    try {
-      gr = await prisma.groupRequest.create({ data: { fromUserId: me.id, toUserId: friendId, status: "PENDING" }, select: { id: true } });
-    } catch (e) {
-      const existing = await prisma.groupRequest.findUnique({
-        where: { fromUserId_toUserId: { fromUserId: me.id, toUserId: friendId } }, select: { id: true },
-      });
-      gr = existing
-        ? await prisma.groupRequest.update({ where: { id: existing.id }, data: { status: "PENDING" }, select: { id: true } })
-        : (() => { throw e })();
-    }
-    res.json({ ok: true, requestId: gr.id });
-  } catch (err) { console.error("[group/request] error:", err); res.status(500).json({ error: "failed to create group request" }); }
-});
-
-router.post("/accept", async (req, res) => {
-  try {
-    const me = await getAuthedUserOr404(req.user.uid, res); if (!me) return;
-    const requestId = req.body?.requestId;
-    if (!requestId) return res.status(400).json({ error: "requestId required" });
-
-    const gr = await prisma.groupRequest.findUnique({
-      where: { id: requestId }, select: { id: true, fromUserId: true, toUserId: true, status: true },
-    });
-    if (!gr) return res.status(404).json({ error: "Request not found" });
-    if (gr.toUserId !== me.id) return res.status(403).json({ error: "Not your request" });
-    if (gr.status !== "PENDING") return res.status(400).json({ error: "Request is not pending" });
-
-    await prisma.$transaction(async (tx) => {
-      await tx.groupRequest.update({ where: { id: gr.id }, data: { status: "ACCEPTED" } });
-      await tx.groupRequest.updateMany({
-        where: { status: "PENDING", OR: [{ fromUserId: me.id, toUserId: gr.fromUserId }, { fromUserId: gr.fromUserId, toUserId: me.id }] },
-        data: { status: "ACCEPTED" },
-      });
-      await tx.groupSwipeSession.create({
-        data: { status: "active", startedById: me.id, aUserId: gr.fromUserId, bUserId: gr.toUserId, context: {} },
-      });
-    });
-    res.json({ ok: true });
-  } catch (err) { console.error("[group/accept] error:", err); res.status(500).json({ error: "failed to accept group request" }); }
-});
-
-router.post("/decline", async (req, res) => {
-  try {
-    const me = await getAuthedUserOr404(req.user.uid, res); if (!me) return;
-    const requestId = req.body?.requestId;
-    if (!requestId) return res.status(400).json({ error: "requestId required" });
-
-    const gr = await prisma.groupRequest.findUnique({
-      where: { id: requestId }, select: { id: true, fromUserId: true, toUserId: true, status: true },
-    });
-    if (!gr) return res.status(404).json({ error: "Request not found" });
-    if (gr.toUserId !== me.id) return res.status(403).json({ error: "Not your request" });
-    if (gr.status !== "PENDING") return res.status(400).json({ error: "Request is not pending" });
-
-    await prisma.groupRequest.update({ where: { id: gr.id }, data: { status: "DECLINED" } });
-    res.json({ ok: true });
-  } catch (err) { console.error("[group/decline] error:", err); res.status(500).json({ error: "failed to decline group request" }); }
-});
-
-router.post("/cancel", async (req, res) => {
-  try {
-    const me = await getAuthedUserOr404(req.user.uid, res); if (!me) return;
-    const requestId = req.body?.requestId;
-    if (!requestId) return res.status(400).json({ error: "requestId required" });
-
-    const gr = await prisma.groupRequest.findUnique({
-      where: { id: requestId }, select: { id: true, fromUserId: true, status: true },
-    });
-    if (!gr) return res.status(404).json({ error: "Request not found" });
-    if (gr.fromUserId !== me.id) return res.status(403).json({ error: "Not your outgoing request" });
-    if (gr.status !== "PENDING") return res.status(400).json({ error: "Request is not pending" });
-
-    await prisma.groupRequest.update({ where: { id: gr.id }, data: { status: "CANCELED" } });
-    res.json({ ok: true });
-  } catch (err) { console.error("[group/cancel] error:", err); res.status(500).json({ error: "failed to cancel group request" }); }
-});
-
-// ─────────────────────── Sessions & State ───────────────────────
-
-// NEW: start – client can push lat/lng on join
-router.post("/session/:id/start", async (req, res) => {
-  try {
-    const me = await getAuthedUserOr404(req.user.uid, res); if (!me) return;
-    const s = await prisma.groupSwipeSession.findUnique({
-      where: { id: req.params.id },
-      select: { id: true, aUserId: true, bUserId: true, context: true },
-    });
-    if (!s) return res.status(404).json({ error: "Session not found" });
-    if (s.aUserId !== me.id && s.bUserId !== me.id) return res.status(403).json({ error: "Not in this session" });
-
-    const { lat, lng } = req.body || {};
-    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return res.status(400).json({ error: "lat/lng required" });
-
-    const key = s.aUserId === me.id ? "locA" : "locB";
-    const ctx = s.context || {};
-    await prisma.groupSwipeSession.update({
-      where: { id: s.id },
-      data: { context: { ...(ctx || {}), [key]: { lat, lng } } },
-    });
-    POOL_CACHE.delete(s.id);
-    DECK_CACHE.delete(`${s.id}:${s.aUserId}`);
-    DECK_CACHE.delete(`${s.id}:${s.bUserId}`);
-    jlog("[group] start(set-loc)", { sessionId: s.id, userId: me.id, key, lat, lng });
-    res.json({ ok: true });
-  } catch (err) { console.error("[group/session/start] error:", err); res.status(500).json({ error: "failed to start session" }); }
-});
-
-// GET state (also accepts headers X-Geo-Lat/X-Geo-Lng to capture location)
-router.get("/session/:id/state", async (req, res) => {
-  try {
-    const me = await getAuthedUserOr404(req.user.uid, res); if (!me) return;
-    const s = await prisma.groupSwipeSession.findUnique({
-      where: { id: req.params.id },
-      select: { id: true, status: true, aUserId: true, bUserId: true, context: true },
-    });
-    if (!s) return res.status(404).json({ error: "Session not found" });
-    if (s.aUserId !== me.id && s.bUserId !== me.id) return res.status(403).json({ error: "Not in this session" });
-
-    const latH = req.header("X-Geo-Lat");
-    const lngH = req.header("X-Geo-Lng");
-    if (latH && lngH) {
-      const lat = Number(latH), lng = Number(lngH);
-      if (Number.isFinite(lat) && Number.isFinite(lng)) {
-        const key = s.aUserId === me.id ? "locA" : "locB";
-        const ctx = s.context || {};
-        const prev = ctx[key];
-        if (!prev || prev.lat !== lat || prev.lng !== lng) {
-          await prisma.groupSwipeSession.update({
-            where: { id: s.id },
-            data: { context: { ...(ctx || {}), [key]: { lat, lng } } },
+  // On mount: fetch my location and POST it to /session/:id/start (writes locA/locB)
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!sessionId) return;
+      const loc = await getBrowserLocation();
+      if (cancelled) return;
+      if (loc) {
+        setMyLoc(loc);
+        try {
+          const headers = await authedHeaders();
+          await fetch(`${API_BASE}/api/group/session/${encodeURIComponent(sessionId)}/start`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ lat: loc.lat, lng: loc.lng }),
           });
-          POOL_CACHE.delete(s.id);
-          DECK_CACHE.delete(`${s.id}:${s.aUserId}`);
-          DECK_CACHE.delete(`${s.id}:${s.bUserId}`);
+        } catch {}
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, authedHeaders, getBrowserLocation]);
+
+  // load meta (partner name + initial counts) from /api/group/sessions
+  const loadMeta = useCallback(async () => {
+    if (!sessionId) return;
+    try {
+      const headers = await authedHeaders();
+      const r = await fetch(`${API_BASE}/api/group/sessions`, { headers });
+      if (!r.ok) return;
+      const j = await r.json();
+      const s: GroupSessionRow | undefined = (j?.sessions || []).find((x: any) => x.id === sessionId);
+      if (s) {
+        setPartnerName(s.partner?.name || "Friend");
+        setState((prev) => prev || { status: "active", youCount: s.youCount, partnerCount: s.partnerCount, limit: s.limit });
+      }
+    } catch {}
+  }, [sessionId, authedHeaders]);
+
+  // load live state (and set current card) from /api/group/session/:id/state
+  const loadState = useCallback(async () => {
+    if (!sessionId) return;
+    try {
+      const base = await authedHeaders();
+      const headers: Record<string, string> = { ...base };
+      if (myLoc) {
+        headers["X-Geo-Lat"] = String(myLoc.lat);
+        headers["X-Geo-Lng"] = String(myLoc.lng);
+      }
+      const r = await fetch(`${API_BASE}/api/group/session/${encodeURIComponent(sessionId)}/state`, {
+        headers,
+        cache: "no-store" as any,
+      });
+      if (!r.ok) throw new Error();
+      const j = await r.json();
+      const s: SessionState = {
+        status: j.status,
+        youCount: j.youCount,
+        partnerCount: j.partnerCount,
+        limit: j.limit,
+        next: j.next || null,
+      };
+      setState(s);
+
+      // only update local card if it changed to avoid flicker
+      const nextId = s.next?.id || null;
+      if (nextId !== lastCardIdRef.current) {
+        lastCardIdRef.current = nextId;
+        setCard(s.next || null);
+      }
+    } catch {
+      // swallow; transient network
+    } finally {
+      setLoading(false);
+    }
+  }, [sessionId, authedHeaders, myLoc]);
+
+  // pull comments from matches (solo + group)
+  const loadComments = useCallback(async () => {
+    try {
+      const token = await auth.currentUser?.getIdToken();
+      if (!token) return;
+      const [r1, r2] = await Promise.all([
+        fetch(`${API_BASE}/api/matches`, { headers: { Authorization: `Bearer ${token}` } }),
+        fetch(`${API_BASE}/api/group/matches`, { headers: { Authorization: `Bearer ${token}` } }),
+      ]);
+      const [j1, j2] = await Promise.all([r1.ok ? r1.json() : { matches: [] }, r2.ok ? r2.json() : { matches: [] }]);
+      const rows: any[] = [...(j1?.matches || []), ...(j2?.matches || [])];
+      const map: Record<string, string[]> = {};
+      for (const m of rows) {
+        const c = (m.userComment || m.comment || "").trim();
+        if (!c) continue;
+        const ids = [m.winner?.id, m.top1?.id, m.top2?.id, m.top3?.id].filter(Boolean) as string[];
+        for (const id of ids) {
+          if (!map[id]) map[id] = [];
+          map[id].push(c);
         }
       }
-    }
+      setCommentsByRestaurant(map);
+    } catch {}
+  }, []);
 
-    await maybeFinalizeSession(s.id);
-    const fresh = await prisma.groupSwipeSession.findUnique({
-      where: { id: s.id },
-      select: { id: true, status: true, aUserId: true, bUserId: true, context: true },
-    });
-    const { aCount, bCount, limit } = await getSessionCounts(fresh.id, fresh.aUserId, fresh.bUserId);
-    const you = fresh.aUserId === me.id ? aCount : bCount;
-    const them = fresh.aUserId === me.id ? bCount : aCount;
+  // animations (tiny bump on tap)
+  const cardScale = useRef(new Animated.Value(1)).current;
+  const bump = () => {
+    Animated.sequence([
+      Animated.timing(cardScale, { toValue: 0.97, duration: 90, useNativeDriver: Platform.OS !== "web" }),
+      Animated.timing(cardScale, { toValue: 1, duration: 120, useNativeDriver: Platform.OS !== "web" }),
+    ]).start();
+  };
 
-    const { next } = await computeNextForUser(fresh, me.id);
-    res.json({ status: fresh.status, youCount: you, partnerCount: them, limit, next });
-  } catch (err) { console.error("[group/session/state] error:", err); res.status(500).json({ error: "failed to load state" }); }
+  // init
+  useEffect(() => {
+    loadMeta();
+    loadState();
+    loadComments();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId]);
+
+  // poll state while active or while you finished but partner hasn't
+  useEffect(() => {
+    if (!state) return;
+    const active = state.status === "active";
+    const waitingForPartner = state.youCount >= state.limit && active;
+    if (!active && !waitingForPartner) return;
+    const id = setInterval(loadState, 3500);
+    return () => clearInterval(id);
+  }, [state?.status, state?.youCount, state?.limit, loadState]);
+
+  // derived
+  const done = state ? state.youCount >= state.limit : false;
+
+  // image with fallback
+  function HeroImage({ uri, altKey }: { uri?: string | null; altKey: string }) {
+    const [failed, setFailed] = useState(false);
+    useEffect(() => setFailed(false), [uri]);
+    const source = useMemo(() => {
+      if (!uri || failed) return FALLBACK_IMG;
+      return { uri };
+    }, [uri, failed]);
+    return (
+      <Image
+        key={uri ? `${altKey}:${uri}` : `fallback:${altKey}`}
+        source={source as any}
+        style={styles.cardImage}
+        resizeMode="cover"
+        onError={() => setFailed(true)}
+      />
+    );
+  }
+
+  // actions
+  const sendFeedback = useCallback(
+    async (action: "LIKE" | "PASS" | "SUPERSTAR" = "LIKE") => {
+      if (!card || !sessionId) return;
+      try {
+        setActionBusy(true);
+        bump();
+        const headers = await authedHeaders();
+        const r = await fetch(`${API_BASE}/api/group/session/${encodeURIComponent(sessionId)}/feedback`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ restaurantId: card.id, action }),
+        });
+        if (!r.ok) throw new Error();
+        setState((s) => (s ? { ...s, youCount: Math.min(s.limit, s.youCount + 1) } : s));
+      } catch {
+        toast("Failed to send feedback");
+      } finally {
+        // after sending, fetch next (server advances based on count)
+        setTimeout(loadState, 250);
+        setActionBusy(false);
+      }
+    },
+    [card?.id, sessionId, authedHeaders, loadState]
+  );
+
+  // comments for current card
+  const twoComments = useMemo(() => {
+    if (!card) return [];
+    const arr = commentsByRestaurant[card.id] || [];
+    return pickDeterministic(arr, card.id, 2);
+  }, [card?.id, commentsByRestaurant]);
+
+  return (
+    <View style={styles.screen}>
+      <View style={styles.container}>
+        <View style={styles.header}>
+          <Text style={styles.greeting}>
+            Group Match with <Text style={{ color: ACCENT }}>{partnerName}</Text>
+          </Text>
+          <Text style={styles.subtitle}>
+            {state ? `You ${state.youCount}/${state.limit} · Friend ${state.partnerCount}/${state.limit}` : "Loading…"}
+          </Text>
+        </View>
+
+        {/* STATES */}
+        {!state ? (
+          <View style={styles.centerFill}>
+            <ActivityIndicator />
+            <Text style={{ color: MUTED, marginTop: 6 }}>Loading session…</Text>
+          </View>
+        ) : state.status === "completed" ? (
+          <View style={styles.centerFill}>
+            <Text style={{ color: TEXT, fontWeight: "800" }}>Session finished 🎉</Text>
+            <Text style={{ color: MUTED, marginTop: 6, textAlign: "center" }}>
+              Check “Your Matches” for the winner.
+            </Text>
+          </View>
+        ) : done ? (
+          <View style={styles.centerFill}>
+            <Text style={{ color: TEXT, fontWeight: "800" }}>You’re done!</Text>
+            <Text style={{ color: MUTED, marginTop: 6, textAlign: "center" }}>
+              Waiting for your friend ({state.partnerCount}/{state.limit})…
+            </Text>
+          </View>
+        ) : loading && !card ? (
+          <View style={styles.centerFill}>
+            <ActivityIndicator />
+          </View>
+        ) : card ? (
+          <>
+            {/* PASS | IMAGE | LIKE/SUPER */}
+            <View style={styles.cardRow}>
+              <Pressable
+                onPress={() => sendFeedback("PASS")}
+                disabled={actionBusy}
+                style={({ pressed }) => [
+                  styles.sideBtn,
+                  (pressed || actionBusy) && styles.sideBtnPressed,
+                  actionBusy && { opacity: 0.6 },
+                ]}
+              >
+                <Text style={styles.sideLabel}>Pass</Text>
+              </Pressable>
+
+              <Animated.View style={[styles.card, styles.cardSquare, { transform: [{ scale: cardScale }] }]}>
+                <HeroImage uri={card.photoUrl} altKey={card.id} />
+              </Animated.View>
+
+              <View style={{ gap: 10 }}>
+                <Pressable
+                  onPress={() => sendFeedback("LIKE")}
+                  disabled={actionBusy}
+                  style={({ pressed }) => [
+                    styles.sideBtn,
+                    (pressed || actionBusy) && styles.sideBtnPressed,
+                    actionBusy && { opacity: 0.6 },
+                  ]}
+                >
+                  <Text style={styles.sideLabel}>Like</Text>
+                </Pressable>
+                <Pressable
+                  onPress={() => sendFeedback("SUPERSTAR")}
+                  disabled={actionBusy}
+                  style={({ pressed }) => [
+                    styles.sideBtn,
+                    styles.superBtn,
+                    (pressed || actionBusy) && styles.sideBtnPressed,
+                    actionBusy && { opacity: 0.6 },
+                  ]}
+                >
+                  <Text style={[styles.sideLabel, { color: "#fff" }]}>★</Text>
+                </Pressable>
+              </View>
+            </View>
+
+            {/* DETAILS */}
+            <View style={styles.details}>
+              <Text style={styles.name}>{card.name}</Text>
+
+              {!!card.address && (
+                <Text style={styles.address}>
+                  {card.address}{"  "}
+                  {typeof card.distance === "number" && (
+                    <Text style={styles.distance}>• {card.distance.toFixed(1)} km away</Text>
+                  )}
+                </Text>
+              )}
+
+              {(card.primaryType || (card.types && card.types.length)) && (
+                <View style={styles.typeRow}>
+                  <Text style={styles.typeLabel}>Type: </Text>
+                  <Text style={styles.typeFallback}>
+                    {primaryReadable(card.primaryType) || "Restaurant"}
+                    {Array.isArray(card.types) && card.types.length > 0 && (
+                      <>
+                        {"  ·  "}
+                        {card.types.slice(0, 3).map((t, i) => (
+                          <Text key={`t-${i}`}>{i > 0 ? `, ${t.replace(/_/g, " ")}` : t.replace(/_/g, " ")}</Text>
+                        ))}
+                      </>
+                    )}
+                  </Text>
+                </View>
+              )}
+
+              <View style={styles.indicatorsRow}>
+                <View
+                  style={[
+                    styles.indicator,
+                    card.allowsDogs ? styles.indicatorOn : styles.indicatorOff,
+                  ]}
+                >
+                  <Text style={card.allowsDogs ? styles.indicatorTextOn : styles.indicatorTextOff}>
+                    🐶 Pet friendly: {card.allowsDogs ? "✓" : "✗"}
+                  </Text>
+                </View>
+                <View
+                  style={[
+                    styles.indicator,
+                    hasParkingHeuristic(card) ? styles.indicatorOn : styles.indicatorOff,
+                  ]}
+                >
+                  <Text style={hasParkingHeuristic(card) ? styles.indicatorTextOn : styles.indicatorTextOff}>
+                    🅿️ Parking: {hasParkingHeuristic(card) ? "✓" : "✗"}
+                  </Text>
+                </View>
+              </View>
+
+              {!!(card.editorial_summary || card.editorialSummary) && (
+                <Text style={styles.summary}>{card.editorial_summary || card.editorialSummary}</Text>
+              )}
+
+              <Text style={styles.budget}>{renderBudgetStars(card.priceLevel ?? null)}</Text>
+
+              {/* Comments */}
+              <View style={styles.commentsBox}>
+                <Text style={styles.commentsTitle}>Comments from users</Text>
+                <View style={{ height: 10 }} />
+                {twoComments.length ? (
+                  twoComments.map((c, idx) => (
+                    <View key={`${card.id}-c-${idx}`} style={styles.commentRow}>
+                      <View style={styles.avatar}>
+                        <Text style={styles.avatarText}>☆</Text>
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.commentName}>2Eat user</Text>
+                        <Text style={styles.commentText}>{c}</Text>
+                      </View>
+                    </View>
+                  ))
+                ) : (
+                  <Text style={styles.noComments}>— No comments yet</Text>
+                )}
+              </View>
+            </View>
+          </>
+        ) : (
+          <View style={styles.centerFill}>
+            <Text style={{ color: MUTED }}>No more options. One moment…</Text>
+          </View>
+        )}
+      </View>
+
+      {toastMsg && (
+        <Animated.View pointerEvents="none" style={[styles.toast, { opacity: toastOpacity }]}>
+          <Text style={styles.toastText}>{toastMsg}</Text>
+        </Animated.View>
+      )}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  screen: { flex: 1, backgroundColor: "#f8fafc" }, // slightly different bg to Home
+  container: {
+    flex: 1,
+    paddingTop: 18,
+    paddingHorizontal: 16,
+    paddingBottom: 110,
+    maxWidth: 520,
+    width: "100%",
+    alignSelf: "center",
+  },
+  header: { gap: 4, marginBottom: 14 },
+  greeting: { fontSize: 22, fontWeight: "800", color: TEXT, textAlign: "left" },
+  subtitle: { fontSize: 14, color: MUTED },
+
+  // center blocks
+  centerFill: { flex: 1, alignItems: "center", justifyContent: "center", gap: 8 },
+
+  // main card row
+  cardRow: {
+    width: "100%",
+    paddingHorizontal: 6,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    marginBottom: 22,
+  },
+  sideBtn: {
+    width: 64,
+    height: 64,
+    borderRadius: 16,
+    backgroundColor: "#f2f2f7",
+    borderWidth: 1,
+    borderColor: BORDER,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  sideBtnPressed: { transform: [{ scale: 0.97 }] },
+  superBtn: { backgroundColor: ACCENT, borderColor: ACCENT },
+  sideLabel: { fontSize: 16, fontWeight: "700", color: TEXT },
+
+  // square hero
+  card: {
+    overflow: "hidden",
+    backgroundColor: "#f7f7f8",
+    borderWidth: 1,
+    borderColor: BORDER,
+    shadowColor: "#000",
+    shadowOpacity: 0.08,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 4,
+  },
+  cardSquare: {
+    flex: 1,
+    aspectRatio: 1,
+    maxWidth: 380,
+    minWidth: 180,
+    borderRadius: 24,
+  },
+  cardImage: { width: "100%", height: "100%" },
+
+  // details block
+  details: { marginTop: 0, gap: 10, paddingHorizontal: 8 },
+  name: { fontSize: 20, fontWeight: "800", color: TEXT, textAlign: "center", marginBottom: 2 },
+  address: { marginTop: 2, fontSize: 14, color: "#333", textAlign: "center" },
+  distance: { color: "#666" },
+
+  typeRow: {
+    marginTop: 2,
+    flexDirection: "row",
+    justifyContent: "center",
+    alignItems: "baseline",
+    gap: 6,
+  },
+  typeLabel: { color: "#666", fontSize: 13 },
+  typeFallback: { color: TEXT, fontWeight: "700", fontSize: 13 },
+
+  indicatorsRow: {
+    marginTop: 8,
+    flexDirection: "row",
+    justifyContent: "center",
+    gap: 8,
+    flexWrap: "wrap",
+  },
+  indicator: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  indicatorOn: { backgroundColor: "#ecfdf5", borderColor: "#a7f3d0" },
+  indicatorOff: { backgroundColor: "#fef2f2", borderColor: "#fecaca" },
+  indicatorTextOn: { color: "#065f46", fontWeight: "700", fontSize: 12 },
+  indicatorTextOff: { color: "#7f1d1d", fontWeight: "700", fontSize: 12 },
+
+  summary: { marginTop: 6, color: "#444", fontSize: 14, textAlign: "center" },
+  budget: { marginTop: 6, fontSize: 14, color: TEXT, fontWeight: "700", textAlign: "center" },
+
+  // comments box
+  commentsBox: {
+    marginTop: 10,
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: "#f5f7ff",
+    borderWidth: 1,
+    borderColor: "#e5e7eb",
+    gap: 8,
+  },
+  commentsTitle: { color: TEXT, fontWeight: "800", fontSize: 14, textAlign: "left" },
+  commentRow: { flexDirection: "row", gap: 10, alignItems: "flex-start" },
+  avatar: {
+    width: 28,
+    height: 28,
+    borderRadius: 999,
+    backgroundColor: "#e0e7ff",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  avatarText: { color: "#3730a3", fontWeight: "800", fontSize: 12 },
+  commentName: { color: TEXT, fontWeight: "800", fontSize: 12 },
+  commentText: { color: "#333", fontSize: 12, marginTop: 2 },
+  noComments: { color: "#666", fontSize: 12, textAlign: "left" },
+
+  // toast
+  toast: {
+    position: "absolute",
+    left: 16,
+    right: 16,
+    bottom: 24,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    backgroundColor: "rgba(17,17,17,0.92)",
+    alignItems: "center",
+  },
+  toastText: { color: "#fff", fontWeight: "700" },
 });
-
-router.post("/session/:id/feedback", async (req, res) => {
-  try {
-    const me = await getAuthedUserOr404(req.user.uid, res); if (!me) return;
-    const { restaurantId, action } = req.body || {};
-    if (!restaurantId || !action) return res.status(400).json({ error: "restaurantId and action required" });
-
-    const s = await prisma.groupSwipeSession.findUnique({
-      where: { id: req.params.id },
-      select: { id: true, status: true, aUserId: true, bUserId: true, context: true },
-    });
-    if (!s) return res.status(404).json({ error: "Session not found" });
-    if (s.status !== "active") return res.status(400).json({ error: "Session not active" });
-    if (s.aUserId !== me.id && s.bUserId !== me.id) return res.status(403).json({ error: "Not in this session" });
-
-    // don’t allow swiping beyond deck
-    const pool = await getOrBuildSessionPool(s);
-    const countForUser = await prisma.groupSwipeEvent.count({ where: { sessionId: s.id, userId: me.id } });
-    if (countForUser >= pool.length) return res.status(400).json({ error: "no_more_items" });
-
-    const position = countForUser + 1;
-    jlog("[group] feedback", { sessionId: s.id, userId: me.id, restaurantId, action, position });
-
-    await prisma.groupSwipeEvent.create({
-      data: { sessionId: s.id, userId: me.id, restaurantId, action, position },
-    });
-
-    await maybeFinalizeSession(s.id);
-    res.json({ ok: true });
-  } catch (err) { console.error("[group/session/feedback] error:", err); res.status(500).json({ error: "failed to record feedback" }); }
-});
-
-// ─────────────────────── Matches list ───────────────────────
-
-router.get("/matches", async (req, res) => {
-  try {
-    const me = await getAuthedUserOr404(req.user.uid, res); if (!me) return;
-    const rows = await prisma.groupMatch.findMany({
-      where: { OR: [{ hostUserId: me.id }, { friendUserId: me.id }] },
-      orderBy: { createdAt: "desc" },
-      select: {
-        id: true, sessionId: true, createdAt: true, comment: true,
-        winnerRestaurantId: true, top1RestaurantId: true, top2RestaurantId: true,
-        top3RestaurantId: true, superStarRestaurantId: true,
-      },
-    });
-
-    const ids = new Set();
-    for (const r of rows) [r.winnerRestaurantId, r.top1RestaurantId, r.top2RestaurantId, r.top3RestaurantId, r.superStarRestaurantId]
-      .filter(Boolean).forEach((id) => ids.add(id));
-
-    const restos = await prisma.restaurant.findMany({
-      where: { id: { in: Array.from(ids) } },
-      select: {
-        id: true, name: true, formattedAddress: true, priceLevel: true, primaryType: true,
-        primaryTypeDisplayName: true, types: true, editorialSummary: true,
-      },
-    });
-    const byId = new Map(restos.map((r) => [r.id, r]));
-
-    const mapResto = (r) => r && ({
-      id: r.id, name: r.name, address: r.formattedAddress ?? null,
-      priceLevel: r.priceLevel ?? null,
-      primaryType: r.primaryTypeDisplayName || r.primaryType || null,
-      types: r.types ?? null,
-      editorialSummary: r.editorialSummary ?? null,
-      editorial_summary: r.editorialSummary ?? null,
-      photoUrl: null,
-    });
-
-    res.json({
-      matches: rows.map((m) => ({
-        id: m.id, sessionId: m.sessionId, createdAt: m.createdAt, userComment: m.comment ?? null,
-        winner: mapResto(byId.get(m.winnerRestaurantId)) || mapResto(byId.get(m.top1RestaurantId)),
-        top1: mapResto(byId.get(m.top1RestaurantId)),
-        top2: mapResto(byId.get(m.top2RestaurantId)),
-        top3: mapResto(byId.get(m.top3RestaurantId)),
-        superStar: mapResto(byId.get(m.superStarRestaurantId)),
-        isGroup: true,
-      })),
-    });
-  } catch (err) { console.error("[group/matches] error:", err); res.status(500).json({ error: "failed to load group matches" }); }
-});
-
-module.exports = router;
