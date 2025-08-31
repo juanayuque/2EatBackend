@@ -1,9 +1,14 @@
-// routes/me.js (or similar)
+// routes/me.js
 const express = require("express");
 const prisma = require("../src/prisma");
 const verifyFirebaseToken = require("../middleware/auth");
 
 const router = express.Router();
+
+// optional unauthenticated ping for quick checks
+router.get("/__ping", (_req, res) => res.json({ ok: true, via: "me", ts: Date.now() }));
+
+// protect the endpoints below
 router.use(verifyFirebaseToken);
 
 function readLatLng(req) {
@@ -16,8 +21,9 @@ function readLatLng(req) {
   return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : null;
 }
 
-router.post("/me/geo", async (req, res) => {
-    console.log("[me/geo] hit", { ua: req.headers['user-agent'], at: new Date().toISOString() });
+// NOTE: path is "/geo", not "/me/geo" (because index mounts at "/api/me")
+router.post("/geo", async (req, res) => {
+  console.log("[me/geo] hit", { ua: req.headers["user-agent"], at: new Date().toISOString() });
   try {
     const me = await prisma.user.findUnique({ where: { firebaseUid: req.user.uid } });
     if (!me) return res.status(404).json({ error: "User not found" });
@@ -25,7 +31,6 @@ router.post("/me/geo", async (req, res) => {
     const coords = readLatLng(req);
     if (!coords) return res.status(400).json({ error: "lat/lng required" });
 
-    // Optional: ignore updates that move <100m or within 2 minutes, etc.
     await prisma.user.update({
       where: { id: me.id },
       data: {
