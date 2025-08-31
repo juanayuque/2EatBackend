@@ -10,7 +10,7 @@ router.use(verifyFirebaseToken);
 
 // ─────────────────────────── Config ───────────────────────────
 const SWIPE_LIMIT = 15;
-const DESIRED_MIN_POOL = 10; // loosenable
+const DESIRED_MIN_POOL = 10; // lower to loosen
 const RADIUS_KM_DEFAULT = 5;
 
 // ─────────────────────────── Utils ───────────────────────────
@@ -117,18 +117,23 @@ function expandUserCuisineKeywords(prefs) {
 
 // ─────────────────────────── Pool builder ───────────────────────────
 async function fetchUserPrefs(userId) {
+  // ⬇️ match your schema (no `preferences` JSON on User)
   const u = await prisma.user.findUnique({
     where: { id: userId },
     select: {
       id: true, displayName: true, username: true, email: true,
-      preferences: true, // JSON
+      searchDistance: true, // Int?
+      budgetMax: true,      // Int?
+      dietaryNeeds: true,   // String[]
+      preferredCuisines: true, // String[]
     },
   });
-  const prefs = (u?.preferences || {});
-  const preferredCuisines = Array.isArray(prefs.preferredCuisines) ? prefs.preferredCuisines : [];
-  const distance = prefs.distance ?? null;
-  const budgetMax = prefs.budgetMax ?? null;
-  const dietaryNeeds = Array.isArray(prefs.dietaryNeeds) ? prefs.dietaryNeeds : [];
+
+  const preferredCuisines = Array.isArray(u?.preferredCuisines) ? u.preferredCuisines : [];
+  const distance = (typeof u?.searchDistance === "number" ? u.searchDistance : null);
+  const budgetMax = (typeof u?.budgetMax === "number" ? u.budgetMax : null);
+  const dietaryNeeds = Array.isArray(u?.dietaryNeeds) ? u.dietaryNeeds : [];
+
   return {
     id: u?.id,
     name: labelOfUser(u),
@@ -148,7 +153,6 @@ function cuisineMatches(r, needles) {
     if (primary.includes(kk)) return true;
     if (primaryDN.includes(kk)) return true;
     if (types.some((t) => t.includes(kk))) return true;
-    // name fallback
     if (String(r.name || "").toLowerCase().includes(kk)) return true;
   }
   return false;
@@ -156,6 +160,7 @@ function cuisineMatches(r, needles) {
 
 async function fetchForUserAt({ user, loc, want, radiusKm }) {
   if (!loc) return [];
+
   // rough bounding box first to limit rows (faster than full table)
   const dLat = radiusKm / 111; // ~111km per degree
   const dLng = radiusKm / (111 * Math.cos(deg2rad(loc.lat || 0)));
@@ -168,7 +173,6 @@ async function fetchForUserAt({ user, loc, want, radiusKm }) {
     where.priceLevel = { lte: user.prefs.budgetMax };
   }
 
-  // pull a slice; we'll filter/sort in JS
   const rows = await prisma.restaurant.findMany({
     where,
     select: {
@@ -181,20 +185,29 @@ async function fetchForUserAt({ user, loc, want, radiusKm }) {
     take: 200,
   });
 
+  // normalize Decimal -> number
+  const rowsNorm = rows.map((r) => ({
+    ...r,
+    latitude: (r.latitude == null ? null : Number(r.latitude)),
+    longitude: (r.longitude == null ? null : Number(r.longitude)),
+  }));
+
   const needles = expandUserCuisineKeywords(user.prefs?.preferredCuisines || []);
-  const filtered = rows
+  const maxDist = (user.prefs?.distance ?? radiusKm) || radiusKm;
+
+  const filtered = rowsNorm
     .map((r) => {
       const dist = (r.latitude != null && r.longitude != null)
         ? haversineKm({ lat: r.latitude, lng: r.longitude }, loc)
         : 9999;
       return { ...r, _dist: dist };
     })
-    .filter((r) => r._dist <= (user.prefs?.distance ?? radiusKm))
+    .filter((r) => r._dist <= maxDist)
     .filter((r) => cuisineMatches(r, needles));
 
   filtered.sort((a, b) => a._dist - b._dist);
   const pick = filtered.slice(0, want).map((r) => ({
-    id: r.id, name: r.name, from: user.tag || "?", // tag set by caller
+    id: r.id, name: r.name, from: user.tag || "?",
   }));
   return pick;
 }
@@ -476,7 +489,7 @@ router.post("/accept", async (req, res) => {
           startedById: me.id,
           aUserId: gr.fromUserId,
           bUserId: gr.toUserId,
-          context: {}, // locA/locB, poolIds, metaById
+          context: {},
         },
       });
     });
@@ -668,7 +681,6 @@ router.get("/session/:id/state", async (req, res) => {
 
     let next = null;
     if (s2.status === "active") {
-      // stable index based on YOUR count
       const idx = youCount;
       if (idx < poolIds.length) {
         const id = poolIds[idx];
@@ -682,12 +694,14 @@ router.get("/session/:id/state", async (req, res) => {
           },
         });
         if (r) {
-          // compute distance from YOUR loc if available
+          const rLat = (r.latitude == null ? null : Number(r.latitude));
+          const rLng = (r.longitude == null ? null : Number(r.longitude));
+
           const myKey = (s2.aUserId === me.id) ? "locA" : "locB";
           const myLoc = s2.context?.[myKey] || null;
           let distance = null;
-          if (myLoc && r.latitude != null && r.longitude != null) {
-            distance = haversineKm(myLoc, { lat: r.latitude, lng: r.longitude });
+          if (myLoc && rLat != null && rLng != null) {
+            distance = haversineKm(myLoc, { lat: rLat, lng: rLng });
           }
           next = {
             id: r.id,
@@ -706,7 +720,7 @@ router.get("/session/:id/state", async (req, res) => {
           log("nextCard", {
             sessionId: s2.id,
             userId: me.id,
-            youCount,
+            countForUser: youCount,
             idx,
             restaurant: { id: r.id, name: r.name },
             from: metaById?.[r.id]?.from || null,
