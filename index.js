@@ -105,8 +105,11 @@ app.use("/api/users", (req, _res, next) => {
 const locationRoutes = require("./routes/location");
 const geocodeRoutes = require("./routes/geocode");
 const friendsRouter = require("./routes/friends");
-const recsRouter = require("./routes/recs");                
-const recsDiscoveryRouter = require("./routes/recsDiscovery");
+const recsRouter = require("./routes/recs");
+const recsDiscoveryRouter = require("./routes/recsDiscovery"); 
+
+
+let recsRoutes = require("./routes/recsDiscovery");
 
 // Basic mounts
 app.use("/api", locationRoutes);
@@ -116,7 +119,8 @@ app.use("/api/friends", friendsRouter);
 app.use("/api/group", require("./routes/groupmatches"));
 app.use("/api/group", require("./routes/group"));
 app.use("/api/group", require("./routes/grouprequests"));
-app.use("/api/recs", recsRouter);  
+
+app.use("/api/recs", recsRouter);          
 app.use("/api/recs", recsDiscoveryRouter);
 
 
