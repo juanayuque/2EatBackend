@@ -20,7 +20,7 @@ const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 const places = createPlacesService({ prisma, googleApiKey: GOOGLE_API_KEY });
 
 const MAX_SWIPES = Number(process.env.GROUP_MAX_SWIPES || 15);
-const END_ON_SUPERSTAR = process.env.END_ON_SUPERSTAR === "1");
+const END_ON_SUPERSTAR = process.env.END_ON_SUPERSTAR === "1";
 
 function log(tag, obj = {}) {
   try {
