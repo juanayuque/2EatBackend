@@ -1,140 +1,110 @@
 // src/group/pool.js
-// Group-specific pool helpers. Builds a combined pool for A & B and
-// serves the "next" card deterministically for a given user.
+//
+// Group pool builder: composes A + B user pools, tags items with source,
+// de-dupes, and caches per session.
+//
+// Depends on the generic single-user pool:
+//   src/recs/pool.js -> ensurePreferredPool({ prisma, lat, lng, user, desiredMin })
 
-'use strict';
+const { ensurePreferredPool } = require("../recs/pool");
 
-const { ensurePreferredPool } = require('../recs/pool');
+const poolCache = new Map();           // sessionId -> { items, ids, fromMap, at }
+const TTL_MS = 5 * 60 * 1000;          // 5 minutes cache
 
-// in-proc cache: { [sessionId]: { ids: string[], fromById: Map<string,'A'|'B'|null>, builtAt: number } }
-const POOLS = new Map();
-const CACHE_MS = 10 * 60 * 1000; // 10 minutes
+function logIf(log, ...args) { try { log && log(...args); } catch (_) {} }
+function isFresh(entry) { return entry && Array.isArray(entry.items) && (Date.now() - entry.at) < TTL_MS; }
 
-function getCached(sessionId) {
-  const ent = POOLS.get(sessionId);
-  if (!ent) return null;
-  if (Date.now() - ent.builtAt > CACHE_MS) {
-    POOLS.delete(sessionId);
-    return null;
-  }
-  return ent;
-}
+/**
+ * Build a combined pool for two users at two locations.
+ * Returns { items: [{...restaurant, from: "A"|"B"}], ids: string[], fromMap: { [id]: "A"|"B" } }
+ */
+async function buildGroupPool({ prisma, aUser, bUser, locA, locB, want = 12, log }) {
+  const wantPerUser = Math.max(3, Math.ceil(want / 2));
 
-async function buildPool({ prisma, places, session, want = 20 }) {
-  // session.context holds locations like { locA: {lat,lng}, locB: {lat,lng} }
-  const ctx = session.context || {};
-  const locA = ctx.locA || ctx.a || null;
-  const locB = ctx.locB || ctx.b || null;
+  const listA = locA
+    ? await ensurePreferredPool({
+        prisma,
+        lat: locA.lat,
+        lng: locA.lng,
+        user: aUser,
+        desiredMin: wantPerUser,
+      })
+    : [];
 
-  // Load users A & B
-  const [aUser, bUser] = await Promise.all([
-    session.aUserId ? prisma.user.findUnique({ where: { id: session.aUserId } }) : null,
-    session.bUserId ? prisma.user.findUnique({ where: { id: session.bUserId } }) : null,
-  ]);
+  const listB = locB
+    ? await ensurePreferredPool({
+        prisma,
+        lat: locB.lat,
+        lng: locB.lng,
+        user: bUser,
+        desiredMin: wantPerUser,
+      })
+    : [];
 
-  // Pull up to half from each side (fallback to whichever has results)
-  const half = Math.max(1, Math.floor(want / 2));
+  logIf(log, "[group] pool(A-picked)", listA.slice(0, wantPerUser).map(r => ({ id: r.id, name: r.name })));
+  logIf(log, "[group] pool(B-picked)", listB.slice(0, wantPerUser).map(r => ({ id: r.id, name: r.name })));
 
-  let aPool = [];
-  if (aUser && locA) {
-    aPool = await ensurePreferredPool({
-      places,
-      lat: Number(locA.lat),
-      lng: Number(locA.lng),
-      user: aUser,
-      desiredMin: half,
-    });
-  }
+  // De-dupe + tag with source
+  const seen = new Set();
+  const combined = [];
 
-  let bPool = [];
-  if (bUser && locB) {
-    bPool = await ensurePreferredPool({
-      places,
-      lat: Number(locB.lat),
-      lng: Number(locB.lng),
-      user: bUser,
-      desiredMin: half,
-    });
-  }
-
-  // Tag and combine, preserving order by each side
-  const fromById = new Map();
-  const out = [];
-
-  function pushSide(arr, tag) {
-    for (const r of arr) {
-      if (!fromById.has(r.id)) {
-        fromById.set(r.id, tag); // remember original source
-        out.push(r.id);
-      }
+  function push(list, srcTag) {
+    for (const r of list) {
+      if (combined.length >= want) break;
+      if (seen.has(r.id)) continue;
+      seen.add(r.id);
+      combined.push({ ...r, from: srcTag });
     }
   }
 
-  pushSide(aPool, 'A');
-  pushSide(bPool, 'B');
+  // Stage 1: take up to half from A then B
+  push(listA, "A");
+  push(listB, "B");
 
-  // If one side was empty, you still get something (just one sided).
-  // Cap to desired size (or leave full — up to you)
-  const ids = out.slice(0, want);
+  // Stage 2: fill remaining from leftovers
+  if (combined.length < want) push(listA.slice(combined.length), "A");
+  if (combined.length < want) push(listB.slice(combined.length), "B");
 
-  return { ids, fromById };
+  const ids = combined.map(x => x.id);
+  const fromMap = Object.fromEntries(combined.map(x => [x.id, x.from]));
+
+  logIf(log, "[group] pool(combined)", { total: combined.length, ids });
+
+  return { items: combined, ids, fromMap };
 }
 
 /**
- * Public: Build or reuse a session pool (IDs + origin map)
+ * Cached builder keyed by sessionId.
  */
-async function getOrBuildSessionPool({ prisma, places, sessionId, want = 20 }) {
-  if (!sessionId) throw new Error('sessionId required');
-
-  // cached?
-  const cached = getCached(sessionId);
-  if (cached) return cached;
-
-  // fetch session basics needed: user ids + context
-  const session = await prisma.groupSwipeSession.findUnique({
-    where: { id: sessionId },
-    select: { id: true, aUserId: true, bUserId: true, context: true },
-  });
-  if (!session) throw new Error('session not found');
-
-  const { ids, fromById } = await buildPool({ prisma, places, session, want });
-  const ent = { ids, fromById, builtAt: Date.now() };
-  POOLS.set(sessionId, ent);
-  return ent;
+async function getOrBuildSessionPool({
+  sessionId,
+  prisma,
+  aUser,
+  bUser,
+  locA,
+  locB,
+  want = 12,
+  force = false,
+  log,
+}) {
+  if (!sessionId) throw new Error("sessionId required");
+  const cached = poolCache.get(sessionId);
+  if (!force && isFresh(cached)) {
+    logIf(log, "[group] pool(cache-hit)", { sessionId, poolCount: cached.items.length });
+    return cached;
+  }
+  const built = await buildGroupPool({ prisma, aUser, bUser, locA, locB, want, log });
+  const entry = { ...built, at: Date.now() };
+  poolCache.set(sessionId, entry);
+  return entry;
 }
 
-/**
- * Public: Given user + session, return the next restaurant (and origin tag)
- * Deterministic: index = (# events for this user)
- */
-async function nextCardForUser({ prisma, sessionId, userId, places, want = 20 }) {
-  if (!sessionId || !userId) throw new Error('sessionId & userId required');
-
-  // count swipes for *this* user in this session
-  const [s, pool] = await Promise.all([
-    prisma.groupSwipeSession.findUnique({
-      where: { id: sessionId },
-      include: { events: { select: { userId: true, restaurantId: true, position: true } } },
-    }),
-    getOrBuildSessionPool({ prisma, places, sessionId, want }),
-  ]);
-  if (!s) throw new Error('session not found');
-
-  const userEvents = (s.events || []).filter(e => e.userId === userId);
-  const idx = userEvents.length; // 0-based
-  const id = pool.ids[idx] || null;
-  if (!id) return { idx, restaurant: null, from: null };
-
-  const from = pool.fromById.get(id) || null;
-  const r = await prisma.restaurant.findUnique({
-    where: { id },
-    select: { id: true, name: true },
-  });
-
-  return { idx, restaurant: r, from };
+function clearPool(sessionId) {
+  poolCache.delete(sessionId);
 }
 
 module.exports = {
+  buildGroupPool,
   getOrBuildSessionPool,
-  nextCardForUser,
+  clearPool,
 };
