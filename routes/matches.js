@@ -58,7 +58,7 @@ router.get("/", async (req, res) => {
         editorial_summary: r.editorialSummary || null,
         photoUrl: photoFor(r.photos),
         websiteUri: r.websiteUri,
-        nationalPhoneNumber: r.nationalPhoneNumber,
+        internationalPhoneNumber: r.internationalPhoneNumber,
       };
     }
 
