@@ -3,7 +3,11 @@ const express = require("express");
 const prisma = require("../src/prisma");
 const verifyFirebaseToken = require("../middleware/auth");
 // Make sure you have a places service available here.
-const places = require("../src/services/placesService"); // adjust if you attach it differently
+const { createPlacesService } = require("../src/places");
+const places = createPlacesService({
+  prisma,
+  googleApiKey: process.env.GOOGLE_PLACES_API_KEY || process.env.PLACES_API_KEY,
+});
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
@@ -66,14 +70,14 @@ router.post("/discover-now", async (req, res) => {
 
     // fast DB existence check
     async function notInDb(ids) {
-      if (!ids.length) return ids;
-      const rows = await prisma.restaurant.findMany({
-        where: { id: { in: ids } }, // assumes DB uses Google place id as Restaurant.id
-        select: { id: true },
-      });
-      const existing = new Set(rows.map((r) => r.id));
-      return ids.filter((id) => !existing.has(id));
-    }
+  if (!ids.length) return ids;
+  const rows = await prisma.restaurant.findMany({
+    where: { googlePlaceId: { in: ids.map(String) } },
+    select: { googlePlaceId: true },
+  });
+  const existing = new Set(rows.map(r => String(r.googlePlaceId)));
+  return ids.filter(id => !existing.has(String(id)));
+}
 
     for (const c of centers) {
       if (newIds.size >= maxNew) break;
@@ -157,5 +161,7 @@ router.post("/discover-now", async (req, res) => {
     res.status(500).json({ error: "discover-now failed" });
   }
 });
+
+
 
 module.exports = router;
