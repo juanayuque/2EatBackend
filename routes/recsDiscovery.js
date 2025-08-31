@@ -3,7 +3,7 @@ const express = require("express");
 const prisma = require("../src/prisma");
 const verifyFirebaseToken = require("../middleware/auth");
 // Make sure you have a places service available here.
-const { createPlacesService } = require("../src/places");
+const { createPlacesService } = require("../src/services");
 const places = createPlacesService({
   prisma,
   googleApiKey: process.env.GOOGLE_PLACES_API_KEY || process.env.PLACES_API_KEY,
