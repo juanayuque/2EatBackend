@@ -1,7 +1,7 @@
 "use strict";
 
 const prisma = require("../prisma");
-const { haversineKm, expandUserCuisineKeywords } = require("./utils");
+const { haversineKm, expandUserCuisineKeywords } = require("./utils.js");
 
 const RADIUS_KM_DEFAULT = Number(process.env.GROUP_RADIUS_KM || 5);
 

@@ -6,7 +6,8 @@ const verifyFirebaseToken = require("../middleware/auth");
 
 const { maybeFinalizeSession, nextCardForUser, SWIPE_LIMIT, getSessionCounts } = require("../src/group/service");
 const { getOrBuildSessionPool } = require("../src/group/pool");
-const { labelOfUser, usernameOfUser } = require("../src/group/utils");
+const { labelOfUser, usernameOfUser } = require("../src/group/utils.js");
+const group = require("../src/group/service");
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
