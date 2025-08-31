@@ -247,24 +247,26 @@ model Photo {
 
 // ───────────────────────── Group swiping ─────────────────────────
 model GroupSwipeSession {
-  id        String    @id @default(cuid())
-  status    String    @default("active") // "active" | "completed"
-  startedAt DateTime  @default(now())
-  endedAt   DateTime?
-  context   Json?
+  id           String   @id @default(cuid())
+  status       String   @default("active")
+  startedAt    DateTime @default(now())
+  endedAt      DateTime?
+  context      Json?
 
-  // ⬇ made optional to allow migrating existing rows
-  startedById String?
-  aUserId     String?
-  bUserId     String?
+  startedById  String?
+  aUserId      String?
+  bUserId      String?
 
-  startedBy User? @relation("GroupSessionsStarter", fields: [startedById], references: [id])
-  aUser     User? @relation("GroupSessionsA", fields: [aUserId], references: [id])
-  bUser     User? @relation("GroupSessionsB", fields: [bUserId], references: [id])
+  // NEW: per-user swipe counters
+  aSwipes      Int      @default(0) @map("a_swipes")
+  bSwipes      Int      @default(0) @map("b_swipes")
 
-  // Back-relations
-  events GroupSwipeEvent[]
-  match  GroupMatch?
+  startedBy    User?    @relation("GroupSessionsStarter", fields: [startedById], references: [id])
+  aUser        User?    @relation("GroupSessionsA",       fields: [aUserId],     references: [id])
+  bUser        User?    @relation("GroupSessionsB",       fields: [bUserId],     references: [id])
+
+  events       GroupSwipeEvent[]
+  match        GroupMatch?
 
   @@index([aUserId])
   @@index([bUserId])
