@@ -47,13 +47,18 @@ const devLanRegex =
   /^https?:\/\/((10\.\d{1,3}\.\d{1,3}\.\d{1,3})|(192\.168\.\d{1,3}\.\d{1,3})|(172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}))(:\d+)?$/;
 
 const corsOptions = {
-  origin(origin, cb) { /* …as you have… */ },
-  methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
-  allowedHeaders: ["Authorization", "Content-Type", "X-Geo-Lat", "X-Geo-Lng", "X-Requested-With", "Accept"],
+  origin(origin, cb) {
+    // Requests without an Origin (mobile apps, curl, server-to-server) should pass.
+    if (!origin) return cb(null, true);
+    if (allowSet.has(origin)) return cb(null, true);
+    if (devLocalRegex.test(origin) || devLanRegex.test(origin)) return cb(null, true);
+    return cb(new Error("Not allowed by CORS"));
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Authorization", "Content-Type"],
   credentials: true,
-  optionsSuccessStatus: 204,
+  optionsSuccessStatus: 204, // 204 avoids some browser preflight quirks.
 };
-
 
 // Register CORS before any routes so preflight covers everything.
 app.use(cors(corsOptions));
@@ -111,11 +116,7 @@ app.use("/api/friends", friendsRouter);
 app.use("/api/group", require("./routes/groupmatches"));
 app.use("/api/group", require("./routes/group"));
 app.use("/api/group", require("./routes/grouprequests"));
-app.use(
-  "/api/me",
-  (req, _res, next) => { console.log("me-router hit:", req.method, req.url); next(); },
-  meRouter
-);
+app.use("/api/me", meRouter);
 
 
 
