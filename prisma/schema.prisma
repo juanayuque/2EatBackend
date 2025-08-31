@@ -148,6 +148,11 @@ model User {
   dietaryNeeds      String[] @map("dietary_needs")
   preferredCuisines String[] @map("preferred_cuisines")
 
+  lastLat       Decimal?  @db.Decimal(10, 7)
+  lastLng       Decimal?  @db.Decimal(10, 7)
+  lastGeoAt     DateTime?
+  lastGeoSource String?   // 'device' | 'ip' | 'manual' etc.
+
   // Solo relations
   sessions   SwipeSession[]
   events     SwipeEvent[]
