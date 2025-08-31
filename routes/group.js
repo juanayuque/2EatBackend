@@ -1,55 +1,78 @@
 // routes/group.js
-const express = require("express");
-const prisma = require("../src/prisma");
-const verifyFirebaseToken = require("../middleware/auth");
-const { createPlacesService } = require("../src/services/placesService");
+'use strict';
 
-// session-aware helpers
+const express = require('express');
+const prisma = require('../src/prisma');
+const verifyFirebaseToken = require('../middleware/auth');
+
+// Import pool helpers directly (primary path)
+const poolMod = require('../src/group/pool');
+// Import service utils (counts/finalize/save loc)
 const {
-  getOrBuildSessionPool,
-  nextCardForUser,
   storeLocationForUser,
   getSessionCounts,
   maybeFinalizeSession,
-} = require("../src/group/service");
+} = require('../src/group/service');
+
+// Resolve helpers with a safe fallback (in case someone re-exports later)
+const getOrBuildSessionPool =
+  typeof poolMod?.getOrBuildSessionPool === 'function'
+    ? poolMod.getOrBuildSessionPool
+    : (poolMod && typeof poolMod === 'function' ? poolMod : null);
+
+const nextCardForUser =
+  typeof poolMod?.nextCardForUser === 'function'
+    ? poolMod.nextCardForUser
+    : null;
+
+// Config
+const MAX_SWIPES = Number(process.env.GROUP_MAX_SWIPES || 15);
+const END_ON_SUPERSTAR = process.env.END_ON_SUPERSTAR === '1';
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
 
-const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
-const places = createPlacesService({ prisma, googleApiKey: GOOGLE_API_KEY });
-
-const MAX_SWIPES = Number(process.env.GROUP_MAX_SWIPES || 15);
-const END_ON_SUPERSTAR = process.env.END_ON_SUPERSTAR === "1";
-
-function log(tag, obj = {}) {
-  try {
-    console.log(`[group] ${tag}`, JSON.stringify(obj, null, 2));
-  } catch {
-    console.log(`[group] ${tag}`, obj);
-  }
-}
-
+// ───────────────────────── helpers ─────────────────────────
 async function authedUser(firebaseUid) {
   return prisma.user.findUnique({ where: { firebaseUid } });
 }
 
-// ───────────────────────── Sessions list (for meta) ─────────────────────────
-// Used by the TSX to get partner name and initial counts.
-router.get("/sessions", async (req, res) => {
+function pickPairIds(session) {
+  // Schema has aUserId/bUserId (your posted schema). If older fields exist in your DB,
+  // we DO NOT select them here to avoid Prisma errors on unknown fields.
+  return { aId: session.aUserId || null, bId: session.bUserId || null };
+}
+
+function partnerOf(session, meId) {
+  const { aId, bId } = pickPairIds(session);
+  if (meId === aId) return bId;
+  if (meId === bId) return aId;
+  return null;
+}
+
+function keyFor(session, meId) {
+  const { aId, bId } = pickPairIds(session);
+  if (meId === aId) return 'locA';
+  if (meId === bId) return 'locB';
+  return null;
+}
+
+// ─────────────────────── list sessions ─────────────────────
+router.get('/sessions', async (req, res) => {
   try {
     const me = await authedUser(req.user.uid);
-    if (!me) return res.status(404).json({ error: "User not found" });
+    if (!me) return res.status(404).json({ error: 'User not found' });
 
-    const sessions = await prisma.groupSwipeSession.findMany({
+    const rows = await prisma.groupSwipeSession.findMany({
       where: {
-        status: "active",
+        status: 'active',
         OR: [{ aUserId: me.id }, { bUserId: me.id }],
       },
-      orderBy: { startedAt: "desc" },
+      orderBy: { startedAt: 'desc' },
       select: {
         id: true,
         status: true,
+        startedAt: true,
         aUserId: true,
         bUserId: true,
         aUser: { select: { id: true, displayName: true, username: true } },
@@ -57,84 +80,83 @@ router.get("/sessions", async (req, res) => {
       },
     });
 
+    // Compute counts per session
     const out = [];
-    for (const s of sessions) {
-      const { aCount, bCount } = await getSessionCounts({ prisma, session: s });
-      const youAreA = s.aUserId === me.id;
-      const youCount = youAreA ? aCount : bCount;
-      const partnerCount = youAreA ? bCount : aCount;
-      const partner = youAreA ? s.bUser : s.aUser;
+    for (const s of rows) {
+      const { youCount, partnerCount } = await getSessionCounts({
+        sessionId: s.id,
+        currentUserId: me.id,
+      });
+      const partnerId = partnerOf(s, me.id);
+      const partner =
+        partnerId === s.aUser?.id ? s.aUser :
+        partnerId === s.bUser?.id ? s.bUser : null;
 
       out.push({
         id: s.id,
         status: s.status,
-        partner: {
-          id: partner?.id || null,
-          name: partner?.displayName || partner?.username || "Friend",
-          username: partner?.username || null,
-        },
+        startedAt: s.startedAt,
+        partner: partner
+          ? { id: partner.id, name: partner.displayName || 'Friend', username: partner.username || null }
+          : { id: partnerId, name: 'Friend', username: null },
         youCount,
         partnerCount,
         limit: MAX_SWIPES,
       });
     }
 
-    res.set("Cache-Control", "no-store");
     res.json({ sessions: out });
   } catch (err) {
-    console.error("[group/sessions] error:", err);
-    res.status(500).json({ error: "sessions failed" });
+    console.error('[group/sessions] error:', err);
+    res.status(500).json({ error: 'sessions failed' });
   }
 });
 
-// ───────────────────────── Set per-user location into session ─────────────────────────
-// Client calls this when each participant opens the session (stores locA/locB).
-router.post("/session/:id/start", async (req, res) => {
+// ───────────────────── set/join (location) ──────────────────
+// Client hits this when the screen opens to register its lat/lng.
+// We compute locA/locB based on who the caller is.
+router.post('/session/:id/start', async (req, res) => {
   try {
     const me = await authedUser(req.user.uid);
-    if (!me) return res.status(404).json({ error: "User not found" });
+    if (!me) return res.status(404).json({ error: 'User not found' });
 
-    const sessionId = String(req.params.id || "");
+    const sessionId = String(req.params.id || '');
     const { lat, lng } = req.body || {};
-    if (typeof lat !== "number" || typeof lng !== "number") {
-      return res.status(400).json({ error: "lat/lng required" });
+    if (typeof lat !== 'number' || typeof lng !== 'number') {
+      return res.status(400).json({ error: 'lat,lng required' });
     }
 
-    const session = await prisma.groupSwipeSession.findUnique({
+    const s = await prisma.groupSwipeSession.findUnique({
       where: { id: sessionId },
       select: { id: true, status: true, aUserId: true, bUserId: true, context: true },
     });
-    if (!session) return res.status(404).json({ error: "session not found" });
-    if (session.status !== "active") return res.status(410).json({ error: "session not active" });
-    if (![session.aUserId, session.bUserId].includes(me.id)) {
-      return res.status(403).json({ error: "not a participant" });
-    }
+    if (!s) return res.status(404).json({ error: 'Session not found' });
 
-    await storeLocationForUser({
-      prisma,
-      session,
-      userId: me.id,
-      lat,
-      lng,
-      logger: (t, o) => log(t, o),
-    });
+    const k = keyFor(s, me.id);
+    if (!k) return res.status(403).json({ error: 'Not a participant' });
+
+    await storeLocationForUser({ sessionId, userId: me.id, key: k, lat, lng });
 
     res.json({ ok: true });
   } catch (err) {
-    console.error("[group/start] error:", err);
-    res.status(500).json({ error: "start failed" });
+    console.error('[group/start] error:', err);
+    res.status(500).json({ error: 'start failed' });
   }
 });
 
-// ───────────────────────── Live state (poll) ─────────────────────────
-// Returns counts, limit, and the *next card* for the caller as `next`.
-router.get("/session/:id/state", async (req, res) => {
+// ───────────────────────── state ────────────────────────────
+// Returns live counts + the *current* card for this user (as `next`)
+router.get('/session/:id/state', async (req, res) => {
   try {
-    const me = await authedUser(req.user.uid);
-    if (!me) return res.status(404).json({ error: "User not found" });
+    if (!getOrBuildSessionPool || !nextCardForUser) {
+      throw new Error('pool helpers not loaded (check src/group/pool.js exports)');
+    }
 
-    const sessionId = String(req.params.id || "");
-    const session = await prisma.groupSwipeSession.findUnique({
+    const me = await authedUser(req.user.uid);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+
+    const sessionId = String(req.params.id || '');
+    const s = await prisma.groupSwipeSession.findUnique({
       where: { id: sessionId },
       select: {
         id: true,
@@ -144,127 +166,96 @@ router.get("/session/:id/state", async (req, res) => {
         context: true,
       },
     });
-    if (!session) return res.status(404).json({ error: "session not found" });
-    if (![session.aUserId, session.bUserId].includes(me.id)) {
-      return res.status(403).json({ error: "not a participant" });
-    }
+    if (!s) return res.status(404).json({ error: 'Session not found' });
 
-    // Ensure pooled list exists (or fetch from cache)
-    const pool = await getOrBuildSessionPool({
+    // finalize opportunistically
+    const status = await maybeFinalizeSession({
+      sessionId,
+      maxSwipes: MAX_SWIPES,
+      endOnSuperstar: END_ON_SUPERSTAR,
+    });
+
+    // counts
+    const { youCount, partnerCount } = await getSessionCounts({
+      sessionId,
+      currentUserId: me.id,
+    });
+
+    // Build/ensure a pool if we have both locations; otherwise we’ll still try with whichever exists.
+    const ctx = (s.context && typeof s.context === 'object') ? s.context : {};
+    const locA = ctx.locA || null;
+    const locB = ctx.locB || null;
+
+    // Fetch both users (for combined prefs inside pool builder)
+    const [userA, userB] = await Promise.all([
+      s.aUserId ? prisma.user.findUnique({ where: { id: s.aUserId } }) : null,
+      s.bUserId ? prisma.user.findUnique({ where: { id: s.bUserId } }) : null,
+    ]);
+
+    const want = 10; // per user; pool builder can use 2*want
+    await getOrBuildSessionPool({
       prisma,
-      places,
-      session,
-      want: 10,
-      logger: (t, o) => log(t, o),
+      sessionId,
+      want,
+      aUser: userA,
+      bUser: userB,
+      locA,
+      locB,
     });
 
-    // counts & who you are
-    const { aCount, bCount } = await getSessionCounts({ prisma, session });
-    const youAreA = session.aUserId === me.id;
-    const youCount = youAreA ? aCount : bCount;
-    const partnerCount = youAreA ? bCount : aCount;
+    // Current card for this user
+    const card = await nextCardForUser({ prisma, sessionId, userId: me.id });
 
-    // compute your next card deterministically from your count
-    const { next } = await nextCardForUser({
-      prisma,
-      session,
-      userId: me.id,
-      logger: (t, o) => log(t, o),
-    });
-
-    // maybe complete if both are done or no next left for both
-    await maybeFinalizeSession({ prisma, session, logger: (t, o) => log(t, o) });
-
-    // Fetch fresh status (in case finalized above)
-    const fresh = await prisma.groupSwipeSession.findUnique({
-      where: { id: sessionId },
-      select: { status: true, context: true },
-    });
-
-    const ctx = fresh?.context || {};
-    const hasLocA = !!ctx.locA;
-    const hasLocB = !!ctx.locB;
-
-    res.set("Cache-Control", "no-store");
-    res.json({
-      status: fresh?.status || session.status,
+    res.set('Cache-Control', 'no-store');
+    return res.json({
+      status,
       youCount,
       partnerCount,
       limit: MAX_SWIPES,
-      hasLocA,
-      hasLocB,
-      next: next || null, // what your TSX uses to set the current card
+      next: card || null, // { id, name, ... client-facing fields, from: "A"|"B"|"both"|null }
     });
   } catch (err) {
-    console.error("[group/session/state] error:", err);
-    res.status(500).json({ error: "state failed" });
+    console.error('[group/session/state] error:', err);
+    res.status(500).json({ error: 'state failed' });
   }
 });
 
-// ───────────────────────── Feedback (LIKE/PASS/SUPERSTAR) ─────────────────────────
-// Idempotent: if the same restaurant+action from this user already exists, we no-op.
-router.post("/session/:id/feedback", async (req, res) => {
+// ─────────────────────── feedback ───────────────────────────
+// Records the action and relies on polling state to deliver the *next* card.
+router.post('/session/:id/feedback', async (req, res) => {
   try {
     const me = await authedUser(req.user.uid);
-    if (!me) return res.status(404).json({ error: "User not found" });
+    if (!me) return res.status(404).json({ error: 'User not found' });
 
-    const sessionId = String(req.params.id || "");
+    const sessionId = String(req.params.id || '');
     let { restaurantId, action } = req.body || {};
-    action = String(action || "").toUpperCase();
+    action = String(action || '').toUpperCase();
 
-    if (!restaurantId || !["LIKE", "PASS", "SUPERSTAR"].includes(action)) {
-      return res.status(400).json({ error: "restaurantId + valid action required" });
+    if (!restaurantId || !['LIKE', 'PASS', 'SUPERSTAR'].includes(action)) {
+      return res.status(400).json({ error: 'restaurantId & action required' });
     }
 
     const s = await prisma.groupSwipeSession.findUnique({
       where: { id: sessionId },
-      include: { events: { orderBy: { createdAt: "asc" } } },
+      include: { events: { orderBy: { createdAt: 'asc' } } },
     });
-    if (!s) return res.status(404).json({ error: "session not found" });
-    if (![s.aUserId, s.bUserId].includes(me.id)) {
-      return res.status(403).json({ error: "not a participant" });
-    }
-    if (s.status !== "active") {
+    if (!s) return res.status(404).json({ error: 'Session not found' });
+    if (s.status !== 'active') {
       return res.status(410).json({ ok: false, sessionCompleted: true });
     }
-
-    log("feedback", {
-      sessionId,
-      userId: me.id,
-      restaurantId,
-      action,
-      position: s.events.length + 1,
-    });
-
-    // Strong idempotency: skip if an identical (sessionId, userId, restaurantId, action) exists
-    const already = await prisma.groupSwipeEvent.findFirst({
-      where: { sessionId, userId: me.id, restaurantId, action },
-      select: { id: true },
-    });
-    if (already) {
-      return res.json({
-        ok: true,
-        duplicate: true,
-        shouldRerank: false,
-        shouldSuggestMatch: false,
-        sessionCompleted: false,
-      });
+    const { aId, bId } = pickPairIds(s);
+    if (me.id !== aId && me.id !== bId) {
+      return res.status(403).json({ error: 'Not a participant' });
     }
 
-    // Also guard against repeat of the very last event (common with double taps)
+    // Idempotency (prevents rapid dupes when UI double-submits)
     const last = s.events[s.events.length - 1];
     if (last && last.userId === me.id && last.restaurantId === restaurantId && last.action === action) {
-      return res.json({
-        ok: true,
-        duplicate: true,
-        shouldRerank: false,
-        shouldSuggestMatch: false,
-        sessionCompleted: false,
-      });
+      return res.json({ ok: true, duplicate: true, sessionCompleted: false });
     }
 
-    let sessionCompleted = false;
     const position = s.events.length + 1;
+    let sessionCompleted = false;
 
     await prisma.$transaction(async (tx) => {
       await tx.groupSwipeEvent.create({
@@ -277,24 +268,20 @@ router.post("/session/:id/feedback", async (req, res) => {
       });
 
       const reached = (updated.totalSwipes ?? position) >= MAX_SWIPES;
-      const endNow = reached || (END_ON_SUPERSTAR && action === "SUPERSTAR");
+      const endNow = reached || (END_ON_SUPERSTAR && action === 'SUPERSTAR');
       if (endNow) {
         await tx.groupSwipeSession.update({
           where: { id: sessionId },
-          data: { status: "completed", endedAt: new Date() },
+          data: { status: 'completed', endedAt: new Date() },
         });
         sessionCompleted = true;
       }
     });
 
-    const nextCount = (s.totalSwipes ?? s.events.length) + 1;
-    const shouldRerank = nextCount % 5 === 0;
-    const shouldSuggestMatch = sessionCompleted || nextCount >= MAX_SWIPES;
-
-    res.json({ ok: true, shouldRerank, shouldSuggestMatch, sessionCompleted });
+    res.json({ ok: true, sessionCompleted });
   } catch (err) {
-    console.error("[group/session/feedback] error:", err);
-    res.status(500).json({ error: "feedback failed" });
+    console.error('[group/feedback] error:', err);
+    res.status(500).json({ error: 'feedback failed' });
   }
 });
 
