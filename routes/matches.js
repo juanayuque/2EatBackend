@@ -57,6 +57,8 @@ router.get("/", async (req, res) => {
         editorialSummary: r.editorialSummary || null,
         editorial_summary: r.editorialSummary || null,
         photoUrl: photoFor(r.photos),
+        websiteUri: r.websiteUri,
+        nationalPhoneNumber: r.nationalPhoneNumber,
       };
     }
 
