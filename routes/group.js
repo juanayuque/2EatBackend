@@ -360,6 +360,8 @@ function computeGroupOutcome(events = [], { superstarWins = true } = {}) {
   };
 }
 
+// routes/group.js  — replace the whole /session/:sessionId/feedback handler
+
 router.post("/session/:sessionId/feedback", async (req, res) => {
   try {
     const me = await authedUser(req.user.uid);
@@ -380,68 +382,76 @@ router.post("/session/:sessionId/feedback", async (req, res) => {
     if (!s) return res.status(400).json({ error: "Invalid session" });
     if (s.status !== "active") return res.status(410).json({ ok: false, sessionCompleted: true });
 
-    // Idempotency
-    const last = s.events[s.events.length - 1];
-    if (last && last.restaurantId === restaurantId && last.action === action) {
-      return res.json({
-        ok: true,
-        duplicate: true,
-        shouldRerank: false,
-        shouldSuggestMatch: false,
-        sessionCompleted: s.status !== "active",
-      });
-    }
-    if (s.events.some((e) => e.restaurantId === restaurantId && e.action === action)) {
-      return res.json({
-        ok: true,
-        duplicate: true,
-        shouldRerank: false,
-        shouldSuggestMatch: false,
-        sessionCompleted: s.status !== "active",
-      });
-    }
-
     const isA = s.aUserId && me.id === s.aUserId;
     const isB = s.bUserId && me.id === s.bUserId;
+    if (!isA && !isB) return res.status(403).json({ error: "Not a participant" });
+
+    // ── idempotency must be per-user ─────────────────────────────────────
+    const last = s.events[s.events.length - 1];
+    if (last && last.userId === me.id && last.restaurantId === restaurantId && last.action === action) {
+      return res.json({
+        ok: true, duplicate: true, shouldRerank: false, shouldSuggestMatch: false,
+        sessionCompleted: s.status !== "active",
+      });
+    }
+    const alreadyMe = s.events.some(
+      (e) => e.userId === me.id && e.restaurantId === restaurantId && e.action === action
+    );
+    if (alreadyMe) {
+      return res.json({
+        ok: true, duplicate: true, shouldRerank: false, shouldSuggestMatch: false,
+        sessionCompleted: s.status !== "active",
+      });
+    }
+
+    // Count *my* swipes so far to compute a per-user position
+    const youCountBefore = s.events.filter((e) => e.userId === me.id).length;
 
     let sessionCompleted = false;
-    let aSwipes = 0, bSwipes = 0;
+    let aSwipes = s.aSwipes ?? 0;
+    let bSwipes = s.bSwipes ?? 0;
 
     await prisma.$transaction(async (tx) => {
-      // record event
-      const position = (s.events?.length || 0) + 1;
+      // ── per-user position ─────────────────────────────────────────────
+      const position = youCountBefore + 1;
+
+      // Record this swipe
       await tx.groupSwipeEvent.create({
         data: { sessionId, userId: me.id, restaurantId, action, position },
       });
 
-      // bump counters
-      const inc =
-        isA ? { aSwipes: { increment: 1 } } :
-        isB ? { bSwipes: { increment: 1 } } : {};
-      if (Object.keys(inc).length) {
-        await tx.groupSwipeSession.update({ where: { id: sessionId }, data: inc });
+      // Increment *your* counter
+      if (isA) {
+        const up = await tx.groupSwipeSession.update({
+          where: { id: sessionId },
+          data: { aSwipes: { increment: 1 } },
+          select: { aSwipes: true, bSwipes: true },
+        });
+        aSwipes = up.aSwipes; bSwipes = up.bSwipes;
+      } else {
+        const up = await tx.groupSwipeSession.update({
+          where: { id: sessionId },
+          data: { bSwipes: { increment: 1 } },
+          select: { aSwipes: true, bSwipes: true },
+        });
+        aSwipes = up.aSwipes; bSwipes = up.bSwipes;
       }
-
-      // fresh session + events
-      const fresh = await tx.groupSwipeSession.findUnique({
-        where: { id: sessionId },
-        include: { events: { orderBy: { position: "asc" } } },
-      });
-
-      aSwipes = fresh?.aSwipes ?? 0;
-      bSwipes = fresh?.bSwipes ?? 0;
 
       const reachedCap = aSwipes >= MAX_SWIPES && bSwipes >= MAX_SWIPES;
       const endNow = reachedCap || (END_ON_SUPERSTAR && action === "SUPERSTAR");
 
       if (endNow) {
-        // compute outcome & persist GroupMatch
+        // Fresh events ordered by per-user position (position asc)
+        const fresh = await tx.groupSwipeSession.findUnique({
+          where: { id: sessionId },
+          include: { events: { orderBy: { position: "asc" } } },
+        });
+
         const { winnerId, superStarId, top1, top2, top3 } = computeGroupOutcome(
           fresh?.events || [],
           { superstarWins: END_ON_SUPERSTAR }
         );
 
-        // figure host/friend for your schema
         const hostUserId = fresh?.startedById || fresh?.aUserId || fresh?.bUserId || null;
         let friendUserId = null;
         if (hostUserId === fresh?.aUserId) friendUserId = fresh?.bUserId || null;
@@ -479,12 +489,11 @@ router.post("/session/:sessionId/feedback", async (req, res) => {
       }
     });
 
-    // optional: clear any cached pool now that we’re done
-    try { clearPool(sessionId); } catch {}
+    // clear pool once done
+    try { if (sessionCompleted) clearPool(sessionId); } catch {}
 
     const combinedNext = (aSwipes ?? 0) + (bSwipes ?? 0);
     const shouldRerank = combinedNext % 5 === 0;
-    // we already finalize on complete, so only suggest match while in-progress
     const shouldSuggestMatch = false;
 
     return res.json({ ok: true, shouldRerank, shouldSuggestMatch, sessionCompleted });
@@ -493,6 +502,7 @@ router.post("/session/:sessionId/feedback", async (req, res) => {
     res.status(500).json({ error: "feedback failed" });
   }
 });
+
 
 
 module.exports = router;
