@@ -39,6 +39,8 @@ function shapeResto(r) {
     editorialSummary: r.editorialSummary ?? r.editorial_summary ?? null,
     editorial_summary: r.editorial_summary ?? r.editorialSummary ?? null,
     photoUrl: toPhotoUrlFromRestaurant(r),
+    websiteUri: r.websiteUri,
+    internationalPhoneNumber: r.internationalPhoneNumber,
   };
 }
 
