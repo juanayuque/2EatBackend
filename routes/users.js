@@ -41,20 +41,26 @@ function normalizeDistance(v) {
   return Number.isInteger(n) ? n : undefined;
 }
 
+// New: safe display name coercion
+function toDisplayName(v) {
+  if (v === null) return null;                // explicit clear
+  if (typeof v !== "string") return undefined;
+  const s = v.trim();
+  if (!s) return null;                        // treat empty as clear
+  return s.slice(0, 80);                      // keep it sane
+}
+
+const GENDERS = new Set(["MALE", "FEMALE", "NON_BINARY", "PREFER_NOT_TO_SAY"]);
+
 /* ───────────────────────────────── routes ───────────────────────────────── */
 
-// Simple reachability probe under /api/users/*
-router.get("/__ping", (_req, res) =>
-  res.json({ ok: true, via: "users.js", ts: Date.now() })
-);
+router.get("/__ping", (_req, res) => res.json({ ok: true, via: "users.js", ts: Date.now() }));
 
-// Everything below requires a valid Firebase ID token.
 router.use(verifyFirebaseToken);
 
-// Minimal account snapshot for the client header/profile settings page.
+// Minimal account snapshot
 router.get("/me", async (req, res) => {
   const uid = req.user.uid;
-
   const user = await prisma.user.findUnique({
     where: { firebaseUid: uid },
     select: {
@@ -66,22 +72,20 @@ router.get("/me", async (req, res) => {
       emailVerified: true,
       // preferences subset
       searchDistance: true,
-      budgetMax: true,           // ← numeric column (0–100)
+      budgetMax: true,
       dietaryNeeds: true,
       preferredCuisines: true,
       createdAt: true,
       updatedAt: true,
     },
   });
-
   res.json({ user });
 });
 
-// Syncs basic profile fields from the Firebase token so the DB stays current.
+// Sync basic profile fields from Firebase token
 router.post("/sync-profile", async (req, res) => {
   try {
     const { uid, email, name, picture, email_verified } = req.user;
-
     const user = await prisma.user.upsert({
       where: { firebaseUid: uid },
       update: {
@@ -100,7 +104,6 @@ router.post("/sync-profile", async (req, res) => {
       },
       select: { id: true, firebaseUid: true, email: true },
     });
-
     res.json({ ok: true, user });
   } catch (err) {
     console.error("User sync failed:", err);
@@ -108,15 +111,15 @@ router.post("/sync-profile", async (req, res) => {
   }
 });
 
-// Reads preference fields used by the Preferences screen.
+// Read preferences (now also returns displayName so you can prefill)
 router.get("/preferences", async (req, res) => {
   const uid = req.user.uid;
-
   const prefs = await prisma.user.findUnique({
     where: { firebaseUid: uid },
     select: {
+      displayName: true,        // ← added
       searchDistance: true,
-      budgetMax: true,           // ← numeric (0–100); null if unset
+      budgetMax: true,
       dietaryNeeds: true,
       preferredCuisines: true,
       age: true,
@@ -128,6 +131,7 @@ router.get("/preferences", async (req, res) => {
   res.json({
     preferences:
       prefs ?? {
+        displayName: null,
         searchDistance: null,
         budgetMax: null,
         dietaryNeeds: [],
@@ -138,41 +142,39 @@ router.get("/preferences", async (req, res) => {
   });
 });
 
-// Saves preferences. Accepts numeric budgetMax; no enum mapping is performed.
+// Save preferences (+ displayName support for onboarding)
 router.post("/preferences", async (req, res) => {
   try {
     const uid = req.user.uid;
     const {
-      searchDistance,        // number | "Unlimited" | null
-      dietaryNeeds,          // string[]
-      preferredCuisines,     // string[]
-      budgetMax,             // number 0–100 | null
-      age,                   // number | null
-      gender,                // "MALE" | "FEMALE" | "NON_BINARY" | "PREFER_NOT_TO_SAY" | null
+      displayName,            // ← string | null
+      searchDistance,         // number | "Unlimited" | null
+      dietaryNeeds,           // string[]
+      preferredCuisines,      // string[]
+      budgetMax,              // number 0–100 | null
+      age,                    // number | null
+      gender,                 // "MALE" | "FEMALE" | "NON_BINARY" | "PREFER_NOT_TO_SAY" | null
     } = req.body || {};
 
-    // Build a minimal update object with only validated keys.
+    // Build a minimal update with only validated keys.
     const data = {
-      // distances: null means unlimited; undefined means “leave unchanged”
+      ...(toDisplayName(displayName) !== undefined && { displayName: toDisplayName(displayName) }),
+
       ...(normalizeDistance(searchDistance) !== undefined && {
         searchDistance: normalizeDistance(searchDistance),
       }),
 
-      // budget: clamp to 0–100; null clears it
       ...(toBudgetMax(budgetMax) !== undefined && { budgetMax: toBudgetMax(budgetMax) }),
 
-      // arrays
       ...(toStringArray(dietaryNeeds) && { dietaryNeeds: toStringArray(dietaryNeeds) }),
-      ...(toStringArray(preferredCuisines) && {
-        preferredCuisines: toStringArray(preferredCuisines),
-      }),
+      ...(toStringArray(preferredCuisines) && { preferredCuisines: toStringArray(preferredCuisines) }),
 
-      // simple scalars
       ...(toNullableInt(age) !== undefined && { age: toNullableInt(age) }),
-      ...(typeof gender === "string" || gender === null ? { gender } : {}),
+      ...((typeof gender === "string" && GENDERS.has(gender)) || gender === null
+        ? { gender }
+        : {}),
     };
 
-    // Remove any properties that remain undefined (keeps partial updates clean).
     Object.keys(data).forEach((k) => data[k] === undefined && delete data[k]);
 
     const saved = await prisma.user.upsert({
@@ -184,6 +186,7 @@ router.post("/preferences", async (req, res) => {
         ...data,
       },
       select: {
+        displayName: true,
         searchDistance: true,
         budgetMax: true,
         dietaryNeeds: true,
@@ -202,4 +205,3 @@ router.post("/preferences", async (req, res) => {
 });
 
 module.exports = router;
-
