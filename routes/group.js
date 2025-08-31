@@ -8,6 +8,8 @@ router.use(verifyFirebaseToken);
 
 // ─────────────────────────── Config ───────────────────────────
 const SWIPE_LIMIT = 15; // 15 swipes per user to finish
+// /api/group/next can read this from session.context.desiredMinPool.
+const DESIRED_MIN_POOL_HINT = Number(process.env.GROUP_MIN_POOL || 12);
 
 // ─────────────────────────── Helpers ───────────────────────────
 async function getAuthedUserOr404(firebaseUid, res) {
@@ -250,13 +252,13 @@ router.post("/request", async (req, res) => {
   }
 });
 
-/** POST /api/group/accept { requestId } → { ok } */
+/** POST /api/group/accept { requestId, lat?, lng? } → { ok } */
 router.post("/accept", async (req, res) => {
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
     if (!me) return;
 
-    const requestId = req.body?.requestId;
+    const { requestId, lat, lng } = req.body || {};
     if (!requestId) return res.status(400).json({ error: "requestId required" });
 
     const gr = await prisma.groupRequest.findUnique({
@@ -280,13 +282,20 @@ router.post("/accept", async (req, res) => {
         },
         data: { status: "ACCEPTED" },
       });
+
+      // Seed context with optional lat/lng and a looser min-pool hint
+      const ctx = {};
+      if (typeof lat === "number" && isFinite(lat)) ctx.lat = lat;
+      if (typeof lng === "number" && isFinite(lng)) ctx.lng = lng;
+      ctx.desiredMinPool = DESIRED_MIN_POOL_HINT;
+
       await tx.groupSwipeSession.create({
         data: {
           status: "active",
           startedById: me.id,
           aUserId: gr.fromUserId,
           bUserId: gr.toUserId,
-          context: {},
+          context: ctx,
         },
       });
     });
@@ -303,7 +312,7 @@ router.post("/decline", async (req, res) => {
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
     if (!me) return;
-  const requestId = req.body?.requestId;
+    const requestId = req.body?.requestId;
     if (!requestId) return res.status(400).json({ error: "requestId required" });
 
     const gr = await prisma.groupRequest.findUnique({
@@ -348,6 +357,49 @@ router.post("/cancel", async (req, res) => {
 });
 
 // ─────────────────────────── Sessions (“Ready”) ───────────────────────────
+
+/**
+ * NEW: POST /api/group/session/:id/start
+ * Body: { lat: number, lng: number }
+ * Writes/updates geolocation (and desiredMinPool hint) into session.context.
+ * Either participant can call this any time (e.g., when rejoining).
+ */
+router.post("/session/:id/start", async (req, res) => {
+  try {
+    const me = await getAuthedUserOr404(req.user.uid, res);
+    if (!me) return;
+    const { lat, lng } = req.body || {};
+    if (typeof lat !== "number" || typeof lng !== "number") {
+      return res.status(400).json({ error: "lat and lng required" });
+    }
+
+    const s = await prisma.groupSwipeSession.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, aUserId: true, bUserId: true, context: true },
+    });
+    if (!s) return res.status(404).json({ error: "Session not found" });
+    if (s.aUserId !== me.id && s.bUserId !== me.id) {
+      return res.status(403).json({ error: "Not in this session" });
+    }
+
+    const nextContext = {
+      ...(s.context || {}),
+      lat,
+      lng,
+      desiredMinPool: DESIRED_MIN_POOL_HINT,
+    };
+
+    await prisma.groupSwipeSession.update({
+      where: { id: s.id },
+      data: { context: nextContext },
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[group/session/start] error:", err);
+    res.status(500).json({ error: "failed to set session context" });
+  }
+});
 
 /** GET /api/group/sessions → active sessions for the authed user (finalizes any finished) */
 router.get("/sessions", async (req, res) => {
@@ -551,7 +603,7 @@ router.get("/matches", async (req, res) => {
       const top3 = m.top3RestaurantId ? byId.get(m.top3RestaurantId) : null;
       const superStar = m.superStarRestaurantId ? byId.get(m.superStarRestaurantId) : null;
 
-      return {
+    return {
         id: m.id,
         sessionId: m.sessionId,
         createdAt: m.createdAt,
@@ -572,6 +624,5 @@ router.get("/matches", async (req, res) => {
     res.status(500).json({ error: "failed to load group matches" });
   }
 });
-
 
 module.exports = router;
