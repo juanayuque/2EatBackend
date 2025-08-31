@@ -1,49 +1,15 @@
-// scripts/backfillGroupMatches.js
-// Usage:
-//   node scripts/backfillGroupMatches.js                # backfill all missing
-//   SESSION_ID=cmez... node scripts/backfillGroupMatches.js   # backfill one
-//
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
+// ...top unchanged
 
-function computeGroupOutcome(events) {
-  let lastSuper = null;
-  const byId = new Map(); // id -> { likes, posSum, firstPos }
+function participantsFromSessionOrEvents(s) {
+  // Gather distinct userIds from the swipe events (order preserved)
+  const evUsers = Array.from(new Set((s.events || []).map(e => e.userId)));
 
-  (events || []).forEach((e, idx) => {
-    const id = e.restaurantId;
-    const pos = Number(e.position ?? idx + 1);
-    const rec = byId.get(id) || { likes: 0, posSum: 0, firstPos: null };
+  // Prefer existing columns first
+  let host = s.startedById || s.aUserId || s.bUserId || evUsers[0] || null;
+  // Friend = the “other” participant if we can find one
+  let friend = evUsers.find(id => id !== host) || (s.aUserId && s.aUserId !== host ? s.aUserId : null) || (s.bUserId && s.bUserId !== host ? s.bUserId : null) || null;
 
-    if (e.action === "LIKE" || e.action === "SUPERSTAR") {
-      rec.likes += 1;
-      rec.posSum += pos;
-      if (rec.firstPos == null) rec.firstPos = pos;
-    }
-    if (e.action === "SUPERSTAR") lastSuper = id;
-
-    byId.set(id, rec);
-  });
-
-  // rank: likes desc -> posSum asc -> firstPos asc
-  const rows = Array.from(byId.entries());
-  rows.sort((a, b) => {
-    const A = a[1], B = b[1];
-    if (B.likes !== A.likes) return B.likes - A.likes;
-    if ((A.posSum ?? 0) !== (B.posSum ?? 0)) return A.posSum - B.posSum;
-    return (A.firstPos ?? 1e9) - (B.firstPos ?? 1e9);
-  });
-
-  const ordered = rows.map(([id]) => id);
-  const winnerId = lastSuper || ordered[0] || null;
-
-  return {
-    winnerId,
-    superStarId: lastSuper || null,
-    top1: ordered[0] || null,
-    top2: ordered[1] || null,
-    top3: ordered[2] || null,
-  };
+  return { hostUserId: host, friendUserId: friend };
 }
 
 async function backfillOne(sessionId) {
@@ -51,37 +17,26 @@ async function backfillOne(sessionId) {
     where: { id: sessionId },
     include: { events: { orderBy: { createdAt: 'asc' } } },
   });
-  if (!s) {
-    console.log(`❌ no session ${sessionId}`);
-    return;
-  }
+  if (!s) return console.log(`❌ no session ${sessionId}`);
+
   const existing = await prisma.groupMatch.findUnique({ where: { sessionId: s.id } });
-  if (existing) {
-    console.log(`↷ already has groupMatch ${existing.id} for session ${s.id}`);
-    return;
-  }
-  if (s.status !== 'completed') {
-    console.log(`↷ session ${s.id} not completed (status=${s.status}), skipping`);
-    return;
-  }
-  if (!s.events.length) {
-    console.log(`↷ session ${s.id} has 0 events, skipping`);
+  if (existing) return console.log(`↷ already has groupMatch ${existing.id} for session ${s.id}`);
+  if (s.status !== 'completed') return console.log(`↷ session ${s.id} not completed, skipping`);
+  if (!s.events.length) return console.log(`↷ session ${s.id} has 0 events, skipping`);
+
+  const { hostUserId, friendUserId } = participantsFromSessionOrEvents(s);
+  if (!hostUserId || !friendUserId) {
+    console.log(`⚠️ session ${s.id} has insufficient participants (host=${hostUserId} friend=${friendUserId}), skipping`);
     return;
   }
 
   const outcome = computeGroupOutcome(s.events);
 
-  // derive host/friend same way as finalize route
-  const hostUserId = s.startedById || s.aUserId || s.bUserId;
-  let friendUserId = null;
-  if (hostUserId === s.aUserId) friendUserId = s.bUserId || null;
-  else if (hostUserId === s.bUserId) friendUserId = s.aUserId || null;
-  else friendUserId = s.aUserId || s.bUserId || null;
-
   await prisma.groupMatch.upsert({
     where: { sessionId: s.id },
     create: {
-      sessionId: s.id,
+      // IMPORTANT: nested relation in create (relationMode=prisma)
+      session: { connect: { id: s.id } },
       hostUserId,
       friendUserId,
       top1RestaurantId: outcome.top1,
@@ -105,42 +60,18 @@ async function backfillOne(sessionId) {
 
 async function main() {
   const only = process.env.SESSION_ID && String(process.env.SESSION_ID);
-  if (only) {
-    await backfillOne(only);
-    return;
-  }
+  if (only) return backfillOne(only);
 
-  // find completed sessions missing a match
+  // Prisma relation filter: sessions with NO match
   const sessions = await prisma.groupSwipeSession.findMany({
-    where: {
-      status: 'completed',
-      // no GroupMatch with same sessionId
-      NOT: { match: { isNot: null } }, // if you have relation named "match" on session
-    },
+    where: { status: 'completed', match: { is: null } },
     select: { id: true },
     orderBy: { endedAt: 'desc' },
-    take: 100,
-  }).catch(async () => {
-    // fallback if you don't have relation alias on the model:
-    const raw = await prisma.$queryRawUnsafe(`
-      SELECT s.id
-      FROM "GroupSwipeSession" s
-      LEFT JOIN "GroupMatch" gm ON gm."sessionId" = s.id
-      WHERE s.status = 'completed' AND gm.id IS NULL
-      ORDER BY s."endedAt" DESC
-      LIMIT 100
-    `);
-    return raw.map(r => ({ id: r.id }));
+    take: 200,
   });
 
   console.log(`Found ${sessions.length} sessions to backfill…`);
   for (const { id } of sessions) {
-    try { await backfillOne(id); } catch (e) {
-      console.error(`❌ failed ${id}`, e);
-    }
+    try { await backfillOne(id); } catch (e) { console.error(`❌ failed ${id}`, e); }
   }
 }
-
-main()
-  .catch(e => console.error(e))
-  .finally(async () => { await prisma.$disconnect(); });
