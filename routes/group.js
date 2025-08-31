@@ -7,9 +7,23 @@ const router = express.Router();
 router.use(verifyFirebaseToken);
 
 // ─────────────────────────── Config ───────────────────────────
-const SWIPE_LIMIT = 15; // 15 swipes per user to finish
-// /api/group/next can read this from session.context.desiredMinPool.
-const DESIRED_MIN_POOL_HINT = Number(process.env.GROUP_MIN_POOL || 12);
+const SWIPE_LIMIT = 15;                         // 15 swipes per user to finish
+const DESIRED_MIN_POOL_HINT = Number(process.env.GROUP_MIN_POOL || 12); // looser floor
+
+// Recs / helpers reused from solo flow
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL || "https://2eatapp.com";
+const RECS_SERVICE_URL =
+  process.env.RECS_SERVICE_URL || process.env.RECS_URL || "http://127.0.0.1:8000";
+
+const { createPlacesService } = require("../src/services/placesService");
+const { ensurePreferredPool } = require("../src/recs/pool");
+const { radiusFromUser } = require("../src/recs/filters");
+const { orderPoolDeterministic, mkSeed } = require("../src/recs/pagination");
+const { rankIdsWithinPage, buildUserFeatures, buildItemFeatures } = require("../src/recs/rank");
+const { haversineKm, asFloat } = require("../src/utils/geo");
+
+const places = createPlacesService({ prisma, googleApiKey: GOOGLE_API_KEY });
 
 // ─────────────────────────── Helpers ───────────────────────────
 async function getAuthedUserOr404(firebaseUid, res) {
@@ -33,7 +47,6 @@ function usernameOfUser(u) {
   return u?.username || null;
 }
 
-// Ensure the two users are friends (at least one direction row exists).
 async function assertAreFriendsOr400(meId, otherUserId, res) {
   const friend = await prisma.friend.findFirst({
     where: { userId: meId, friendId: otherUserId },
@@ -50,61 +63,186 @@ async function assertAreFriendsOr400(meId, otherUserId, res) {
   return true;
 }
 
-// Progress counters for a session
-async function getSessionCounts(sessionId, aUserId, bUserId) {
-  const rows = await prisma.groupSwipeEvent.groupBy({
-    by: ["userId"],
-    where: { sessionId },
-    _count: { _all: true },
-  });
-  const byUser = new Map(rows.map((r) => [r.userId, r._count._all]));
-  const a = byUser.get(aUserId) || 0;
-  const b = byUser.get(bUserId) || 0;
-  return { aCount: a, bCount: b, limit: SWIPE_LIMIT };
+// Merge prefs conservatively so both can eat/enjoy
+function combinedUser(u1, u2) {
+  const uniq = (arr) => Array.from(new Set((arr || []).filter(Boolean)));
+  const minOr = (a, b) => (a == null ? b ?? null : b == null ? a ?? null : Math.min(a, b));
+  return {
+    id: `${u1.id}+${u2.id}`,
+    firebaseUid: u1.firebaseUid,
+    searchDistance: minOr(u1.searchDistance ?? 5, u2.searchDistance ?? 5),
+    budgetMax: minOr(u1.budgetMax ?? null, u2.budgetMax ?? null),
+    dietaryNeeds: uniq([...(u1.dietaryNeeds || []), ...(u2.dietaryNeeds || [])]),
+    preferredCuisines: uniq([...(u1.preferredCuisines || []), ...(u2.preferredCuisines || [])]),
+    displayName: `${u1.displayName || "You"} & ${u2.displayName || "Friend"}`,
+  };
 }
 
-// Build a top3 + winner from the session’s events
-async function rankTop3(sessionId) {
-  // Score: LIKE = 1, SUPERSTAR = 3, PASS = 0. Bonus if both users liked.
-  const events = await prisma.groupSwipeEvent.findMany({
+function noStore(res) {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+}
+
+// Build (or reuse cached) 20-item pool = 10 near A + 10 near B
+async function ensureSessionPool(session) {
+  let ctx = session.context || {};
+  const seed = ctx.seed || mkSeed(session.id);
+
+  // Already cached?
+  if (Array.isArray(ctx.poolIds) && ctx.poolIds.length >= 10) {
+    return { ids: ctx.poolIds, seed, ctx };
+  }
+
+  // Load users + any stored locations
+  const s = await prisma.groupSwipeSession.findUnique({
+    where: { id: session.id },
+    include: {
+      aUser: true,
+      bUser: true,
+    },
+  });
+  if (!s) return { ids: [], seed, ctx };
+
+  const duo = combinedUser(s.aUser, s.bUser);
+  const radiusKm = radiusFromUser(duo);
+  const want = Math.max(10, DESIRED_MIN_POOL_HINT);
+
+  const locA = ctx.locA && typeof ctx.locA.lat === "number" && typeof ctx.locA.lng === "number" ? ctx.locA : null;
+  const locB = ctx.locB && typeof ctx.locB.lat === "number" && typeof ctx.locB.lng === "number" ? ctx.locB : null;
+
+  // If neither location is known, leave empty (client should call /session/:id/start)
+  if (!locA && !locB) return { ids: [], seed, ctx };
+
+  // Pull candidates at each location using combined prefs
+  async function pullAt(loc) {
+    const pool = await ensurePreferredPool({
+      places,
+      lat: loc.lat,
+      lng: loc.lng,
+      user: duo,
+      desiredMin: want,
+    });
+    // Deterministic order before slicing, so both users see the same subset
+    const ordered = orderPoolDeterministic(pool, session.id, seed);
+    return ordered.slice(0, 10).map((r) => r.id);
+  }
+
+  let idsA = [];
+  let idsB = [];
+  if (locA) idsA = await pullAt(locA);
+  if (locB) idsB = await pullAt(locB);
+
+  // Merge + dedupe, preserve relative order but then globally re-order deterministically
+  const merged = Array.from(new Set([...idsA, ...idsB]));
+  if (merged.length === 0) return { ids: [], seed, ctx };
+
+  // Reorder deterministically using fetched rows
+  const rows = await prisma.restaurant.findMany({
+    where: { id: { in: merged } },
+    select: { id: true },
+  });
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const existing = merged.map((id) => ({ id })).filter((r) => byId.has(r.id));
+  const det = orderPoolDeterministic(existing, session.id, seed).map((x) => x.id);
+
+  // Cache on session
+  ctx = { ...ctx, seed, poolIds: det, radiusKm };
+  await prisma.groupSwipeSession.update({
+    where: { id: session.id },
+    data: { context: ctx },
+  });
+
+  return { ids: det, seed, ctx };
+}
+
+// Next card for a given user = pool[index equal to user's swipe count]
+async function nextCardForUser(session, userId) {
+  const { ids } = await ensureSessionPool(session);
+  if (!ids.length) return null;
+
+  const countForUser = await prisma.groupSwipeEvent.count({
+    where: { sessionId: session.id, userId },
+  });
+  if (countForUser >= SWIPE_LIMIT) return null;
+
+  const idx = Math.min(countForUser, ids.length - 1);
+  const id = ids[idx];
+
+  const r = await prisma.restaurant.findUnique({
+    where: { id },
+    include: { photos: { take: 1 } },
+  });
+  if (!r) return null;
+
+  const photoName = r.photos?.[0]?.name || null;
+  const photoUrl = photoName
+    ? `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(photoName)}&w=1200`
+    : null;
+
+  return {
+    id: r.id,
+    name: r.name,
+    address: r.formattedAddress,
+    priceLevel: r.priceLevel ?? null,
+    photoUrl,
+    primaryType: r.primaryType,
+    types: r.types,
+    editorialSummary: r.editorialSummary || null,
+  };
+}
+
+// Build Top3 + Winner with LightFM; fallback to heuristic
+async function rankTop3WithRecs(sessionId) {
+  const s = await prisma.groupSwipeSession.findUnique({
+    where: { id: sessionId },
+    include: { aUser: true, bUser: true },
+  });
+  if (!s) return { top: [], winner: null };
+
+  const duo = combinedUser(s.aUser, s.bUser);
+
+  const evts = await prisma.groupSwipeEvent.findMany({
     where: { sessionId },
-    select: { restaurantId: true, userId: true, action: true, createdAt: true },
+    select: { restaurantId: true, userId: true, action: true },
+  });
+  const candidateIds = Array.from(new Set(evts.map((e) => e.restaurantId)));
+  if (!candidateIds.length) return { top: [], winner: null };
+
+  const restos = await prisma.restaurant.findMany({
+    where: { id: { in: candidateIds } },
+    include: { photos: { take: 1 } },
   });
 
-  if (events.length === 0) return { top: [], winner: null };
+  // Pick a distance reference — prefer both A and B, else any cached one
+  const ctx = (await prisma.groupSwipeSession.findUnique({ where: { id: sessionId }, select: { context: true } }))?.context || {};
+  const ref =
+    (ctx.locA && typeof ctx.locA.lat === "number" && ctx.locA) ||
+    (ctx.locB && typeof ctx.locB.lat === "number" && ctx.locB) ||
+    null;
+  const refLat = ref?.lat ?? 0;
+  const refLng = ref?.lng ?? 0;
 
-  const score = new Map(); // rid -> { s, likedBy:Set, last:Date }
-  for (const e of events) {
-    let entry = score.get(e.restaurantId);
-    if (!entry) entry = { s: 0, likedBy: new Set(), last: e.createdAt };
-    if (e.action === "LIKE") entry.s += 1;
-    if (e.action === "SUPERSTAR") entry.s += 3;
-    if (e.action === "LIKE" || e.action === "SUPERSTAR") entry.likedBy.add(e.userId);
-    if (e.createdAt > entry.last) entry.last = e.createdAt;
-    score.set(e.restaurantId, entry);
+  const items = buildItemFeatures(restos, refLat, refLng);
+  const interactions = evts.map((e) => ({ userId: e.userId, itemId: e.restaurantId, action: e.action }));
+  const userFeatures = buildUserFeatures(duo);
+
+  let ranked = [];
+  try {
+    ranked = await rankIdsWithinPage({
+      rankUrl: RECS_SERVICE_URL,
+      userId: duo.id,
+      userFeatures,
+      items,
+      interactions,
+    });
+  } catch {
+    // fallback: simple scoring like before
+    const weight = (a) => (a === "SUPERSTAR" ? 3 : a === "LIKE" ? 1 : 0);
+    const m = new Map();
+    for (const e of evts) m.set(e.restaurantId, (m.get(e.restaurantId) || 0) + weight(e.action));
+    ranked = Array.from(candidateIds).sort((a, b) => (m.get(b) || 0) - (m.get(a) || 0));
   }
 
-  // If nobody liked anything, fallback to “most recent exposures”
-  let items = Array.from(score.entries()).map(([rid, v]) => ({
-    restaurantId: rid,
-    s: v.s + (v.likedBy.size >= 2 ? 2 : 0), // tiny boost if both liked
-    likedByCount: v.likedBy.size,
-    last: v.last,
-  }));
-
-  const allZero = items.every((i) => i.s === 0);
-  items.sort((a, b) => {
-    if (b.s !== a.s) return b.s - a.s;
-    if (b.likedByCount !== a.likedByCount) return b.likedByCount - a.likedByCount;
-    return b.last - a.last;
-  });
-
-  if (allZero) {
-    // use recency only
-    items.sort((a, b) => b.last - a.last);
-  }
-
-  const top = items.slice(0, 3).map((i) => i.restaurantId);
+  const top = ranked.slice(0, 3);
   const winner = top[0] || null;
   return { top, winner };
 }
@@ -121,7 +259,6 @@ async function maybeFinalizeSession(sessionId) {
   const { aCount, bCount } = await getSessionCounts(s.id, s.aUserId, s.bUserId);
   if (aCount < SWIPE_LIMIT || bCount < SWIPE_LIMIT) return { finalized: false };
 
-  // already have a match?
   const existing = await prisma.groupMatch.findUnique({ where: { sessionId: s.id } });
   if (existing) {
     await prisma.groupSwipeSession.update({
@@ -131,9 +268,9 @@ async function maybeFinalizeSession(sessionId) {
     return { finalized: true, matchId: existing.id };
   }
 
-  const { top, winner } = await rankTop3(s.id);
-  // We require at least 1 candidate to finalize; if not, just mark completed
+  const { top, winner } = await rankTop3WithRecs(s.id);
   const [top1, top2, top3] = [top[0] || null, top[1] || null, top[2] || null];
+
   await prisma.$transaction(async (tx) => {
     await tx.groupSwipeSession.update({
       where: { id: s.id },
@@ -142,7 +279,7 @@ async function maybeFinalizeSession(sessionId) {
     await tx.groupMatch.create({
       data: {
         sessionId: s.id,
-        hostUserId: s.aUserId,     // semantic: creator vs friend is flexible here
+        hostUserId: s.aUserId,
         friendUserId: s.bUserId,
         top1RestaurantId: top1 || "",
         top2RestaurantId: top2 || null,
@@ -160,6 +297,7 @@ async function maybeFinalizeSession(sessionId) {
 
 /** GET /api/group/requests → { incoming: [...], outgoing: [...] } */
 router.get("/requests", async (req, res) => {
+  noStore(res);
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
     if (!me) return;
@@ -183,7 +321,6 @@ router.get("/requests", async (req, res) => {
       fromName: labelOfUser(r.fromUser),
       fromUsername: usernameOfUser(r.fromUser),
     }));
-
     const outgoing = outgoingRows.map((r) => ({
       id: r.id,
       toUserId: r.toUserId,
@@ -252,13 +389,13 @@ router.post("/request", async (req, res) => {
   }
 });
 
-/** POST /api/group/accept { requestId, lat?, lng? } → { ok } */
+/** POST /api/group/accept { requestId } → { ok } */
 router.post("/accept", async (req, res) => {
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
     if (!me) return;
 
-    const { requestId, lat, lng } = req.body || {};
+    const requestId = req.body?.requestId;
     if (!requestId) return res.status(400).json({ error: "requestId required" });
 
     const gr = await prisma.groupRequest.findUnique({
@@ -269,7 +406,6 @@ router.post("/accept", async (req, res) => {
     if (gr.toUserId !== me.id) return res.status(403).json({ error: "Not your request" });
     if (gr.status !== "PENDING") return res.status(400).json({ error: "Request is not pending" });
 
-    // mark accepted + create an active session
     await prisma.$transaction(async (tx) => {
       await tx.groupRequest.update({ where: { id: gr.id }, data: { status: "ACCEPTED" } });
       await tx.groupRequest.updateMany({
@@ -282,20 +418,13 @@ router.post("/accept", async (req, res) => {
         },
         data: { status: "ACCEPTED" },
       });
-
-      // Seed context with optional lat/lng and a looser min-pool hint
-      const ctx = {};
-      if (typeof lat === "number" && isFinite(lat)) ctx.lat = lat;
-      if (typeof lng === "number" && isFinite(lng)) ctx.lng = lng;
-      ctx.desiredMinPool = DESIRED_MIN_POOL_HINT;
-
       await tx.groupSwipeSession.create({
         data: {
           status: "active",
           startedById: me.id,
           aUserId: gr.fromUserId,
           bUserId: gr.toUserId,
-          context: ctx,
+          context: {}, // locations come from /session/:id/start per user
         },
       });
     });
@@ -358,64 +487,20 @@ router.post("/cancel", async (req, res) => {
 
 // ─────────────────────────── Sessions (“Ready”) ───────────────────────────
 
-/**
- * NEW: POST /api/group/session/:id/start
- * Body: { lat: number, lng: number }
- * Writes/updates geolocation (and desiredMinPool hint) into session.context.
- * Either participant can call this any time (e.g., when rejoining).
- */
-router.post("/session/:id/start", async (req, res) => {
-  try {
-    const me = await getAuthedUserOr404(req.user.uid, res);
-    if (!me) return;
-    const { lat, lng } = req.body || {};
-    if (typeof lat !== "number" || typeof lng !== "number") {
-      return res.status(400).json({ error: "lat and lng required" });
-    }
-
-    const s = await prisma.groupSwipeSession.findUnique({
-      where: { id: req.params.id },
-      select: { id: true, aUserId: true, bUserId: true, context: true },
-    });
-    if (!s) return res.status(404).json({ error: "Session not found" });
-    if (s.aUserId !== me.id && s.bUserId !== me.id) {
-      return res.status(403).json({ error: "Not in this session" });
-    }
-
-    const nextContext = {
-      ...(s.context || {}),
-      lat,
-      lng,
-      desiredMinPool: DESIRED_MIN_POOL_HINT,
-    };
-
-    await prisma.groupSwipeSession.update({
-      where: { id: s.id },
-      data: { context: nextContext },
-    });
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("[group/session/start] error:", err);
-    res.status(500).json({ error: "failed to set session context" });
-  }
-});
-
 /** GET /api/group/sessions → active sessions for the authed user (finalizes any finished) */
 router.get("/sessions", async (req, res) => {
+  noStore(res);
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
     if (!me) return;
 
-    // Fetch active sessions where I am A or B
     const rows = await prisma.groupSwipeSession.findMany({
-      where: {
-        status: "active",
-        OR: [{ aUserId: me.id }, { bUserId: me.id }],
-      },
+      where: { status: "active", OR: [{ aUserId: me.id }, { bUserId: me.id }] },
       orderBy: { startedAt: "desc" },
       select: {
-        id: true, aUserId: true, bUserId: true,
+        id: true,
+        aUserId: true,
+        bUserId: true,
         aUser: { select: { id: true, displayName: true, username: true, email: true } },
         bUser: { select: { id: true, displayName: true, username: true, email: true } },
       },
@@ -423,15 +508,13 @@ router.get("/sessions", async (req, res) => {
 
     const sessions = [];
     for (const s of rows) {
-      // eager finalize if done
       await maybeFinalizeSession(s.id);
 
-      // re-check status
-      const nowRow = await prisma.groupSwipeSession.findUnique({
+      const now = await prisma.groupSwipeSession.findUnique({
         where: { id: s.id },
         select: { status: true },
       });
-      if (nowRow?.status !== "active") continue;
+      if (now?.status !== "active") continue;
 
       const partner = s.aUserId === me.id ? s.bUser : s.aUser;
       const { aCount, bCount, limit } = await getSessionCounts(s.id, s.aUserId, s.bUserId);
@@ -458,38 +541,101 @@ router.get("/sessions", async (req, res) => {
   }
 });
 
-/** GET /api/group/session/:id/state → { status, youCount, partnerCount, limit } (also finalizes if done) */
+/** POST /api/group/session/:id/start { lat, lng } — store caller's location in context */
+router.post("/session/:id/start", async (req, res) => {
+  try {
+    const me = await getAuthedUserOr404(req.user.uid, res);
+    if (!me) return;
+
+    const { lat, lng } = req.body || {};
+    if (typeof lat !== "number" || typeof lng !== "number") {
+      return res.status(400).json({ error: "lat,lng required" });
+    }
+
+    const s = await prisma.groupSwipeSession.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, aUserId: true, bUserId: true, context: true },
+    });
+    if (!s) return res.status(404).json({ error: "Session not found" });
+    if (s.aUserId !== me.id && s.bUserId !== me.id) return res.status(403).json({ error: "Not in this session" });
+
+    const ctx = s.context || {};
+    const key = s.aUserId === me.id ? "locA" : "locB";
+    ctx[key] = { lat, lng };
+    if (!ctx.seed) ctx.seed = mkSeed(s.id);
+
+    await prisma.groupSwipeSession.update({ where: { id: s.id }, data: { context: ctx } });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[group/session/start] error:", err);
+    res.status(500).json({ error: "failed to save location" });
+  }
+});
+
+/** GET /api/group/session/:id/state → progress + next card (and result when done) */
 router.get("/session/:id/state", async (req, res) => {
+  noStore(res);
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
     if (!me) return;
 
     const s = await prisma.groupSwipeSession.findUnique({
       where: { id: req.params.id },
-      select: { id: true, status: true, aUserId: true, bUserId: true },
+      select: { id: true, status: true, aUserId: true, bUserId: true, context: true },
     });
     if (!s) return res.status(404).json({ error: "Session not found" });
     if (s.aUserId !== me.id && s.bUserId !== me.id) return res.status(403).json({ error: "Not in this session" });
 
-    // maybe finalize
     await maybeFinalizeSession(s.id);
     const after = await prisma.groupSwipeSession.findUnique({
       where: { id: s.id },
-      select: { id: true, status: true, aUserId: true, bUserId: true },
+      select: { id: true, status: true, aUserId: true, bUserId: true, context: true },
     });
 
-    const { aCount, bCount, limit } = await getSessionCounts(s.id, after.aUserId, after.bUserId);
+    const { aCount, bCount, limit } = await getSessionCounts(after.id, after.aUserId, after.bUserId);
     const you = after.aUserId === me.id ? aCount : bCount;
     const them = after.aUserId === me.id ? bCount : aCount;
 
-    res.json({ status: after.status, youCount: you, partnerCount: them, limit });
+    if (after.status === "completed") {
+      // pull stored match to show result
+      const gm = await prisma.groupMatch.findUnique({ where: { sessionId: after.id } });
+      let top3 = [];
+      if (gm) {
+        const ids = [gm.top1RestaurantId, gm.top2RestaurantId, gm.top3RestaurantId].filter(Boolean);
+        const rows = await prisma.restaurant.findMany({ where: { id: { in: ids } }, select: { id: true, name: true, formattedAddress: true } });
+        const byId = new Map(rows.map((r) => [r.id, r]));
+        top3 = ids.map((id, i) => {
+          const r = byId.get(id);
+          return { id, name: r?.name || `Restaurant ${id.slice(0, 6)}`, address: r?.formattedAddress ?? null, rank: i + 1 };
+        });
+      }
+      return res.json({
+        status: after.status,
+        limit,
+        youCount: you,
+        partnerCount: them,
+        bothDone: true,
+        result: { top3 },
+      });
+    }
+
+    // Still active
+    const next = await nextCardForUser(after, me.id); // may be null if you've hit 15 or no pool yet
+    res.json({
+      status: after.status,
+      limit,
+      youCount: you,
+      partnerCount: them,
+      bothDone: you >= limit && them >= limit,
+      next, // {id,name,address,priceLevel,photoUrl,...} or null
+    });
   } catch (err) {
     console.error("[group/session/state] error:", err);
     res.status(500).json({ error: "failed to load state" });
   }
 });
 
-/** POST /api/group/session/:id/feedback { restaurantId, action } — logs a swipe and maybe finalizes */
+/** POST /api/group/session/:id/feedback { restaurantId, action } */
 router.post("/session/:id/feedback", async (req, res) => {
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
@@ -506,10 +652,15 @@ router.post("/session/:id/feedback", async (req, res) => {
     if (s.status !== "active") return res.status(400).json({ error: "Session not active" });
     if (s.aUserId !== me.id && s.bUserId !== me.id) return res.status(403).json({ error: "Not in this session" });
 
-    // position = count+1 for this user
     const countForUser = await prisma.groupSwipeEvent.count({
       where: { sessionId: s.id, userId: me.id },
     });
+
+    if (countForUser >= SWIPE_LIMIT) {
+      // Allow client to move to waiting state
+      await maybeFinalizeSession(s.id);
+      return res.json({ ok: true, reachedLimit: true });
+    }
 
     await prisma.groupSwipeEvent.create({
       data: {
@@ -521,7 +672,6 @@ router.post("/session/:id/feedback", async (req, res) => {
       },
     });
 
-    // maybe finalize
     await maybeFinalizeSession(s.id);
 
     res.json({ ok: true });
@@ -531,17 +681,31 @@ router.post("/session/:id/feedback", async (req, res) => {
   }
 });
 
-// --- ADD: list group matches for the authed user ----------------------------
+/** Legacy alias — POST /api/group/swipe { sessionId, restaurantId, action } */
+router.post("/swipe", async (req, res) => {
+  try {
+    const { sessionId, restaurantId, action } = req.body || {};
+    if (!sessionId) return res.status(400).json({ error: "sessionId required" });
+    req.params.id = sessionId;
+    return router.handle(
+      { ...req, method: "POST", url: `/session/${encodeURIComponent(sessionId)}/feedback`, body: { restaurantId, action } },
+      res
+    );
+  } catch (err) {
+    console.error("[group/swipe alias] error:", err);
+    res.status(500).json({ error: "failed to record feedback" });
+  }
+});
+
+// --- list group matches for the authed user (Your Matches — group tint) ---
 router.get("/matches", async (req, res) => {
+  noStore(res);
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
     if (!me) return;
 
-    // Fetch group matches where I'm host or friend
     const rows = await prisma.groupMatch.findMany({
-      where: {
-        OR: [{ hostUserId: me.id }, { friendUserId: me.id }],
-      },
+      where: { OR: [{ hostUserId: me.id }, { friendUserId: me.id }] },
       orderBy: { createdAt: "desc" },
       select: {
         id: true,
@@ -556,7 +720,6 @@ router.get("/matches", async (req, res) => {
       },
     });
 
-    // Collect restaurant IDs we need
     const ids = new Set();
     for (const r of rows) {
       [r.winnerRestaurantId, r.top1RestaurantId, r.top2RestaurantId, r.top3RestaurantId, r.superStarRestaurantId]
@@ -564,7 +727,6 @@ router.get("/matches", async (req, res) => {
         .forEach((id) => ids.add(id));
     }
 
-    // Load restaurants in one query
     const restos = await prisma.restaurant.findMany({
       where: { id: { in: Array.from(ids) } },
       select: {
@@ -576,47 +738,40 @@ router.get("/matches", async (req, res) => {
         primaryTypeDisplayName: true,
         types: true,
         editorialSummary: true,
+        photos: { take: 1 },
       },
     });
-    const byId = new Map(restos.map((r) => [r.id, r]));
+    const byId = new Map(
+      restos.map((r) => [
+        r.id,
+        {
+          id: r.id,
+          name: r.name,
+          address: r.formattedAddress ?? null,
+          priceLevel: r.priceLevel ?? null,
+          primaryType: r.primaryTypeDisplayName || r.primaryType || null,
+          types: r.types ?? null,
+          editorialSummary: r.editorialSummary ?? null,
+          editorial_summary: r.editorialSummary ?? null,
+          photoUrl: r.photos?.[0]?.name
+            ? `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(r.photos[0].name)}&w=1200`
+            : null,
+        },
+      ])
+    );
 
-    // Normalize to the List screen shape
-    function mapResto(r) {
-      if (!r) return null;
-      return {
-        id: r.id,
-        name: r.name,
-        address: r.formattedAddress ?? null,
-        priceLevel: r.priceLevel ?? null,
-        primaryType: r.primaryTypeDisplayName || r.primaryType || null,
-        types: r.types ?? null,
-        editorialSummary: r.editorialSummary ?? null,
-        editorial_summary: r.editorialSummary ?? null, // your UI checks either key
-        photoUrl: null, // optional: wire to your photos table if you want
-      };
-    }
-
-    const matches = rows.map((m) => {
-      const winner = m.winnerRestaurantId ? byId.get(m.winnerRestaurantId) : null;
-      const top1 = m.top1RestaurantId ? byId.get(m.top1RestaurantId) : null;
-      const top2 = m.top2RestaurantId ? byId.get(m.top2RestaurantId) : null;
-      const top3 = m.top3RestaurantId ? byId.get(m.top3RestaurantId) : null;
-      const superStar = m.superStarRestaurantId ? byId.get(m.superStarRestaurantId) : null;
-
-    return {
-        id: m.id,
-        sessionId: m.sessionId,
-        createdAt: m.createdAt,
-        userComment: m.comment ?? null,
-        winner: mapResto(winner) || mapResto(top1),
-        top1: mapResto(top1),
-        top2: mapResto(top2),
-        top3: mapResto(top3),
-        superStar: mapResto(superStar),
-        // optional: flag so you can tint differently client-side
-        isGroup: true,
-      };
-    });
+    const matches = rows.map((m) => ({
+      id: m.id,
+      sessionId: m.sessionId,
+      createdAt: m.createdAt,
+      userComment: m.comment ?? null,
+      winner: byId.get(m.winnerRestaurantId) || byId.get(m.top1RestaurantId) || null,
+      top1: byId.get(m.top1RestaurantId) || null,
+      top2: byId.get(m.top2RestaurantId) || null,
+      top3: byId.get(m.top3RestaurantId) || null,
+      superStar: byId.get(m.superStarRestaurantId) || null,
+      isGroup: true,
+    }));
 
     res.json({ matches });
   } catch (err) {
