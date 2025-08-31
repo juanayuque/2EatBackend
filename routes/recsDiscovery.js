@@ -3,7 +3,7 @@ const express = require("express");
 const prisma = require("../src/prisma");
 const verifyFirebaseToken = require("../middleware/auth");
 // Make sure you have a places service available here.
-const places = require("../src/places"); // adjust if you attach it differently
+const places = require("../src/services/placesService"); // adjust if you attach it differently
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
