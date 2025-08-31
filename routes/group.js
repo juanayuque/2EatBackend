@@ -10,7 +10,7 @@ router.use(verifyFirebaseToken);
 
 // ─────────────────────────── Config ───────────────────────────
 const SWIPE_LIMIT = 15;
-const DESIRED_MIN_POOL = 10; // lower to loosen
+const DESIRED_MIN_POOL = 10; // loosened pool target
 const RADIUS_KM_DEFAULT = 5;
 
 // ─────────────────────────── Utils ───────────────────────────
@@ -52,7 +52,7 @@ async function getAuthedUserOr404(firebaseUid, res) {
   return user;
 }
 
-// Ensure the two users are friends (at least one direction row exists).
+// Ensure the two users are friends.
 async function assertAreFriendsOr400(meId, otherUserId, res) {
   const friend = await prisma.friend.findFirst({
     where: { userId: meId, friendId: otherUserId },
@@ -117,15 +117,14 @@ function expandUserCuisineKeywords(prefs) {
 
 // ─────────────────────────── Pool builder ───────────────────────────
 async function fetchUserPrefs(userId) {
-  // ⬇️ match your schema (no `preferences` JSON on User)
   const u = await prisma.user.findUnique({
     where: { id: userId },
     select: {
       id: true, displayName: true, username: true, email: true,
-      searchDistance: true, // Int?
-      budgetMax: true,      // Int?
-      dietaryNeeds: true,   // String[]
-      preferredCuisines: true, // String[]
+      searchDistance: true,
+      budgetMax: true,
+      dietaryNeeds: true,
+      preferredCuisines: true,
     },
   });
 
@@ -143,7 +142,7 @@ async function fetchUserPrefs(userId) {
 
 function cuisineMatches(r, needles) {
   if (!needles?.length) return true; // if none, don't filter
-  const summary = String(r.editorialSummary || r.editorial_summary || "").toLowerCase();
+  const summary = String(r.editorialSummary || "").toLowerCase();
   const primary = String(r.primaryType || "").toLowerCase();
   const primaryDN = String(r.primaryTypeDisplayName || "").toLowerCase();
   const types = Array.isArray(r.types) ? r.types.map((t) => String(t).toLowerCase().replace(/_/g, " ")) : [];
@@ -161,8 +160,8 @@ function cuisineMatches(r, needles) {
 async function fetchForUserAt({ user, loc, want, radiusKm }) {
   if (!loc) return [];
 
-  // rough bounding box first to limit rows (faster than full table)
-  const dLat = radiusKm / 111; // ~111km per degree
+  // rough bounding box first to limit rows
+  const dLat = radiusKm / 111;
   const dLng = radiusKm / (111 * Math.cos(deg2rad(loc.lat || 0)));
 
   const where = {
@@ -179,8 +178,7 @@ async function fetchForUserAt({ user, loc, want, radiusKm }) {
       id: true, name: true, latitude: true, longitude: true,
       formattedAddress: true, priceLevel: true,
       primaryType: true, primaryTypeDisplayName: true, types: true,
-      editorialSummary: true, editorial_summary: true,
-      photoUrl: true,
+      editorialSummary: true,
     },
     take: 200,
   });
@@ -325,7 +323,6 @@ async function maybeFinalizeSession(sessionId) {
   const { aCount, bCount } = await getSessionCounts(s.id, s.aUserId, s.bUserId);
   if (aCount < SWIPE_LIMIT || bCount < SWIPE_LIMIT) return { finalized: false };
 
-  // already have a match?
   const existing = await prisma.groupMatch.findUnique({ where: { sessionId: s.id } });
   if (existing) {
     await prisma.groupSwipeSession.update({
@@ -361,7 +358,7 @@ async function maybeFinalizeSession(sessionId) {
 
 // ─────────────────────────── Requests ───────────────────────────
 
-/** GET /api/group/requests → { incoming: [...], outgoing: [...] } */
+/** GET /api/group/requests */
 router.get("/requests", async (req, res) => {
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
@@ -386,6 +383,7 @@ router.get("/requests", async (req, res) => {
       fromName: labelOfUser(r.fromUser),
       fromUsername: usernameOfUser(r.fromUser),
     }));
+
     const outgoing = outgoingRows.map((r) => ({
       id: r.id,
       toUserId: r.toUserId,
@@ -552,7 +550,7 @@ router.post("/cancel", async (req, res) => {
 
 // ─────────────────────────── Sessions ───────────────────────────
 
-/** GET /api/group/sessions → active sessions for the authed user (finalizes any finished) */
+/** GET /api/group/sessions */
 router.get("/sessions", async (req, res) => {
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
@@ -616,7 +614,7 @@ router.post("/session/:id/start", async (req, res) => {
     if (s.aUserId !== me.id && s.bUserId !== me.id) return res.status(403).json({ error: "Not in this session" });
 
     const { lat, lng } = req.body || {};
-    if (typeof lat !== "number" || typeof lng !== "number") return res.json({ ok: true }); // ignore bad payload
+    if (typeof lat !== "number" || typeof lng !== "number") return res.json({ ok: true });
 
     const key = (s.aUserId === me.id) ? "locA" : "locB";
     const ctx = s.context || {};
@@ -632,7 +630,7 @@ router.post("/session/:id/start", async (req, res) => {
   }
 });
 
-/** GET /api/group/session/:id/state → returns counts AND next card for you */
+/** GET /api/group/session/:id/state → counts + next card */
 router.get("/session/:id/state", async (req, res) => {
   try {
     const me = await getAuthedUserOr404(req.user.uid, res);
@@ -645,7 +643,7 @@ router.get("/session/:id/state", async (req, res) => {
     if (!s) return res.status(404).json({ error: "Session not found" });
     if (s.aUserId !== me.id && s.bUserId !== me.id) return res.status(403).json({ error: "Not in this session" });
 
-    // Update location if provided via headers
+    // Optional: capture geo via headers
     const latHdr = req.header("X-Geo-Lat");
     const lngHdr = req.header("X-Geo-Lng");
     if (latHdr && lngHdr && !Number.isNaN(Number(latHdr)) && !Number.isNaN(Number(lngHdr))) {
@@ -689,7 +687,7 @@ router.get("/session/:id/state", async (req, res) => {
           select: {
             id: true, name: true, formattedAddress: true, priceLevel: true,
             primaryType: true, primaryTypeDisplayName: true, types: true,
-            editorialSummary: true, editorial_summary: true, photoUrl: true,
+            editorialSummary: true,
             latitude: true, longitude: true,
           },
         });
@@ -712,8 +710,8 @@ router.get("/session/:id/state", async (req, res) => {
             primaryTypeDisplayName: r.primaryTypeDisplayName || null,
             types: r.types || null,
             editorialSummary: r.editorialSummary || null,
-            editorial_summary: r.editorial_summary || null,
-            photoUrl: r.photoUrl || null,
+            editorial_summary: r.editorialSummary || null, // UI fallback key
+            photoUrl: null, // not in schema; wire from Photos if needed
             distance,
             from: metaById?.[r.id]?.from || null,
           };
@@ -834,8 +832,6 @@ router.get("/matches", async (req, res) => {
         primaryTypeDisplayName: true,
         types: true,
         editorialSummary: true,
-        editorial_summary: true,
-        photoUrl: true,
       },
     });
     const byId = new Map(restos.map((r) => [r.id, r]));
@@ -850,8 +846,8 @@ router.get("/matches", async (req, res) => {
         primaryType: r.primaryTypeDisplayName || r.primaryType || null,
         types: r.types ?? null,
         editorialSummary: r.editorialSummary ?? null,
-        editorial_summary: r.editorialSummary ?? r.editorial_summary ?? null,
-        photoUrl: r.photoUrl ?? null,
+        editorial_summary: r.editorialSummary ?? null, // UI fallback
+        photoUrl: null,
       };
     };
 
