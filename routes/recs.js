@@ -546,4 +546,123 @@ router.get("/winner", async (req, res) => {
   }
 });
 
+router.post("/discover-now", async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const { lat, lng, maxNew = 20, preferredCuisines } = req.body || {};
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({ error: "lat/lng required" });
+    }
+
+    // Pull cuisines from DB if not provided
+    let cuisines = Array.isArray(preferredCuisines) && preferredCuisines.length
+      ? preferredCuisines
+      : [];
+    if (!cuisines.length) {
+      const u = await prisma.user.findUnique({
+        where: { firebaseUid: uid },
+        select: { preferredCuisines: true },
+      });
+      cuisines = Array.isArray(u?.preferredCuisines) ? u.preferredCuisines : [];
+    }
+
+    // If still empty, nothing to bias -> exit early
+    if (!cuisines.length) {
+      return res.json({ cuisinesUsed: [], found: 0, created: 0, attempts: 0 });
+    }
+
+    // Build cuisine-only text queries
+    const queries = Array.from(
+      new Set(
+        cuisines
+          .map(String)
+          .map((c) => c.trim())
+          .filter(Boolean)
+          .map((c) => `${c} restaurant`)
+      )
+    );
+
+    // Helpers for small offsets in km
+    const kmToDegLat = (km) => km / 111;                // ~111 km per 1° lat
+    const kmToDegLng = (km, atLat) => km / (111 * Math.cos((atLat * Math.PI) / 180));
+
+    // Candidate centers to try (base, +2km east, -2km west, +5km north)
+    const centers = [
+      { lat, lng, note: "origin" },
+      { lat, lng: lng + kmToDegLng(2, lat), note: "+2km east" },
+      { lat, lng: lng - kmToDegLng(2, lat), note: "-2km west" },
+      { lat: lat + kmToDegLat(5), lng, note: "+5km north" },
+    ];
+
+    const byId = new Map();
+    let attempts = 0;
+    let zeroGrowthRuns = 0;
+
+    console.log("[discover-now] cuisines:", cuisines);
+    console.log("[discover-now] queries:", queries);
+
+    for (const c of centers) {
+      if (byId.size >= maxNew) break;
+      const before = byId.size;
+
+      for (const q of queries) {
+        // Text Search around the center with small-ish radius
+        const chunk = await places.googlePlacesSearchText(q, {
+          lat: c.lat,
+          lng: c.lng,
+          radiusMeters: 3000,
+          maxPages: 2,
+        });
+        attempts++;
+
+        for (const p of chunk || []) {
+          if (p?.id && !byId.has(p.id)) byId.set(p.id, p);
+          if (byId.size >= maxNew) break;
+        }
+        if (byId.size >= maxNew) break;
+      }
+
+      const delta = byId.size - before;
+      console.log(`[discover-now] center ${c.note}: +${delta} (total=${byId.size})`);
+
+      if (delta === 0) {
+        zeroGrowthRuns++;
+        if (zeroGrowthRuns >= 3) {
+          console.log("[discover-now] no growth after 3 tries, stopping.");
+          break;
+        }
+      } else {
+        zeroGrowthRuns = 0; // reset if we found something
+      }
+    }
+
+    const discovered = Array.from(byId.values());
+    if (!discovered.length) {
+      return res.json({
+        cuisinesUsed: cuisines,
+        found: 0,
+        created: 0,
+        attempts,
+      });
+    }
+
+    // Persist
+    const created = await places.upsertPlacesBatch(discovered);
+
+    console.log(
+      `[discover-now] done. found=${discovered.length}, created=${created}, attempts=${attempts}`
+    );
+
+    return res.json({
+      cuisinesUsed: cuisines,
+      found: discovered.length,
+      created,
+      attempts,
+    });
+  } catch (err) {
+    console.error("discover-now failed:", err);
+    res.status(500).json({ error: "discover-now failed" });
+  }
+});
+
 module.exports = router;
