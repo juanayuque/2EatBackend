@@ -83,27 +83,48 @@ router.get("/me", async (req, res) => {
 });
 
 // Sync basic profile fields from Firebase token
+// Sync basic profile fields from Firebase token without stomping user-edited displayName
 router.post("/sync-profile", async (req, res) => {
   try {
     const { uid, email, name, picture, email_verified } = req.user;
-    const user = await prisma.user.upsert({
+
+    const existing = await prisma.user.findUnique({
       where: { firebaseUid: uid },
-      update: {
-        email: email ?? null,
-        displayName: name ?? null,
-        photoUrl: picture ?? null,
-        emailVerified: !!email_verified,
-        updatedAt: new Date(),
-      },
-      create: {
-        firebaseUid: uid,
-        email: email ?? null,
-        displayName: name ?? null,
-        photoUrl: picture ?? null,
-        emailVerified: !!email_verified,
-      },
+      select: { id: true, displayName: true },
+    });
+
+    if (!existing) {
+      // New user: seed displayName from token if present
+      const user = await prisma.user.create({
+        data: {
+          firebaseUid: uid,
+          email: email ?? null,
+          displayName: (typeof name === "string" && name.trim()) ? name.trim() : null,
+          photoUrl: picture ?? null,
+          emailVerified: !!email_verified,
+        },
+        select: { id: true, firebaseUid: true, email: true },
+      });
+      return res.json({ ok: true, user });
+    }
+
+    // Existing user: DO NOT overwrite displayName unless they don't have one yet
+    const updateData = {
+      email: email ?? null,
+      photoUrl: picture ?? null,
+      emailVerified: !!email_verified,
+      updatedAt: new Date(),
+    };
+    if (!existing.displayName && typeof name === "string" && name.trim()) {
+      updateData.displayName = name.trim();
+    }
+
+    const user = await prisma.user.update({
+      where: { firebaseUid: uid },
+      data: updateData,
       select: { id: true, firebaseUid: true, email: true },
     });
+
     res.json({ ok: true, user });
   } catch (err) {
     console.error("User sync failed:", err);
@@ -111,13 +132,14 @@ router.post("/sync-profile", async (req, res) => {
   }
 });
 
+
 // Read preferences (now also returns displayName so you can prefill)
 router.get("/preferences", async (req, res) => {
   const uid = req.user.uid;
   const prefs = await prisma.user.findUnique({
     where: { firebaseUid: uid },
     select: {
-      displayName: true,        // ← added
+      displayName: true,        
       searchDistance: true,
       budgetMax: true,
       dietaryNeeds: true,
