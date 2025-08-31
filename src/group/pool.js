@@ -1,156 +1,127 @@
-"use strict";
+// src/recs/pool.js
+//
+// Build a "preferred" pool near a lat/lng for ONE user.
+// No session reads/writes here. Safe to use from solo or group flows.
 
-const prisma = require("../prisma");
-const { haversineKm, expandUserCuisineKeywords } = require("./utils.js");
+const { haversineKm, asFloat } = require("../utils/geo");
 
-const RADIUS_KM_DEFAULT = Number(process.env.GROUP_RADIUS_KM || 5);
-
-const log = (tag, obj) => {
-  try { console.log(`[group] ${tag}`, JSON.stringify(obj, null, 2)); }
-  catch { console.log(`[group] ${tag}`, obj); }
+// crude mapping so "Chinese" matches Google place types like "chinese_restaurant"
+const CUISINE_KEYWORDS = {
+  indian: ["indian"],
+  chinese: ["chinese", "szechuan", "sichuan", "cantonese", "hunan", "hotpot", "noodle",],
+  italian: ["italian", "pizza", "pasta", "sicilian", "tuscan"],
+  japanese: ["japanese", "sushi", "ramen", "izakaya"],
+  thai: ["thai"],
+  mexican: ["mexican", "taqueria", "taco"],
+  korean: ["korean", "bbq"],
+  american: ["american", "burger", "bbq", "diner"],
+  vietnamese: ["vietnamese", "pho", "banh mi", "bahn mi"],
+  mediterranean: ["mediterranean", "greek", "turkish", "lebanese"],
+  "middle eastern": ["middle eastern", "lebanese", "turkish", "persian", "iranian"],
+  spanish: ["spanish", "tapas"],
+  french: ["french", "bistro", "brasserie"],
+  greek: ["greek"],
+  turkish: ["turkish"],
+  lebanese: ["lebanese"],
+  persian: ["persian", "iranian"],
+  "fast food": ["fast"],
+  fastfood: ["fast"],
 };
 
-async function fetchUserPrefs(userId) {
-  const u = await prisma.user.findUnique({
-    where: { id: userId },
-    select: {
-      id: true, displayName: true, username: true, email: true,
-      searchDistance: true, budgetMax: true, dietaryNeeds: true, preferredCuisines: true,
-    },
-  });
-  return {
-    id: u?.id,
-    name: u ? (u.displayName || u.username || (u.email?.split("@")[0]) || "Friend") : "Friend",
-    prefs: {
-      distance: (typeof u?.searchDistance === "number" ? u.searchDistance : null),
-      budgetMax: (typeof u?.budgetMax === "number" ? u.budgetMax : null),
-      dietaryNeeds: Array.isArray(u?.dietaryNeeds) ? u.dietaryNeeds : [],
-      preferredCuisines: Array.isArray(u?.preferredCuisines) ? u.preferredCuisines : [],
-    },
-  };
+function normalizeCuisine(c) {
+  return String(c || "").trim().toLowerCase();
 }
 
-function cuisineMatches(r, needles) {
-  if (!needles?.length) return true;
-  const summary = String(r.editorialSummary || "").toLowerCase();
-  const primary = String(r.primaryType || "").toLowerCase();
-  const primaryDN = String(r.primaryTypeDisplayName || "").toLowerCase();
-  const types = Array.isArray(r.types) ? r.types.map((t) => String(t).toLowerCase().replace(/_/g, " ")) : [];
-  const name = String(r.name || "").toLowerCase();
-  for (const k of needles) {
-    if (summary.includes(k) || primary.includes(k) || primaryDN.includes(k) || name.includes(k)) return true;
-    if (types.some((t) => t.includes(k))) return true;
-  }
-  return false;
+function typeMatchesCuisine(types = [], cuisine) {
+  const t = (types || []).map((x) => String(x).toLowerCase());
+  const key = normalizeCuisine(cuisine);
+  const aliases = CUISINE_ALIASES[key] || [key];
+  return aliases.some((a) => t.some((ty) => ty.includes(a)));
 }
 
-async function fetchForUserAt({ user, loc, want, radiusKm }) {
-  if (!loc) return [];
-  const dLat = radiusKm / 111;
-  const dLng = radiusKm / (111 * Math.cos((loc.lat || 0) * Math.PI / 180));
-  const where = {
-    latitude: { gte: (loc.lat - dLat), lte: (loc.lat + dLat) },
-    longitude: { gte: (loc.lng - dLng), lte: (loc.lng + dLng) },
-  };
-  if (user.prefs?.budgetMax != null) where.priceLevel = { lte: user.prefs.budgetMax };
+// VERY rough price mapping: if user budgets are low, prefer cheaper priceLevels
+function eligibleByBudget(priceLevel, budgetMax) {
+  if (budgetMax == null) return true;
+  // tweak as you like
+  if (budgetMax <= 15) return (priceLevel ?? 2) <= 1;
+  if (budgetMax <= 25) return (priceLevel ?? 2) <= 2;
+  if (budgetMax <= 40) return (priceLevel ?? 2) <= 3;
+  return true;
+}
 
+async function ensurePreferredPool({
+  places,          // created via createPlacesService({ prisma, googleApiKey })
+  lat,
+  lng,
+  user,
+  desiredMin = 20, // aim for at least this many
+}) {
+  const prisma = places?.prisma;
+  if (!prisma) throw new Error("ensurePreferredPool: places.prisma missing");
+
+  const radiusKm = Number(user?.searchDistance ?? 5);
+  const widenKm = Math.max(radiusKm, 3); // give ourselves some headroom
+
+  // 1) Pull a chunk from DB (cheap), then filter/sort in JS.
   const rows = await prisma.restaurant.findMany({
-    where,
     select: {
-      id: true, name: true, latitude: true, longitude: true,
-      formattedAddress: true, priceLevel: true,
-      primaryType: true, primaryTypeDisplayName: true, types: true,
-      editorialSummary: true,
+      id: true,
+      name: true,
+      latitude: true,
+      longitude: true,
+      types: true,
+      priceLevel: true,
+      servesVegetarianFood: true,
+      allowsDogs: true,
     },
-    take: 200,
+    take: 800, // adjust based on DB size
+    orderBy: { createdAt: "desc" },
   });
 
-  const needles = expandUserCuisineKeywords(user.prefs?.preferredCuisines || []);
-  const maxDist = (user.prefs?.distance ?? radiusKm) || radiusKm;
+  const withDist = rows
+    .map((r) => ({
+      ...r,
+      _dist: haversineKm(
+        { lat, lng },
+        { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }
+      ),
+    }))
+    .filter((r) => r._dist <= widenKm);
 
-  const filtered = rows
-    .map((r) => {
-      const rLat = Number(r.latitude); const rLng = Number(r.longitude);
-      const dist = haversineKm({ lat: rLat, lng: rLng }, loc);
-      return { ...r, _dist: dist };
-    })
-    .filter((r) => r._dist <= maxDist)
-    .filter((r) => cuisineMatches(r, needles));
+  // 2) Preference filters
+  const prefCuisines = Array.isArray(user?.preferredCuisines) ? user.preferredCuisines : [];
+  const wantsVeg = (user?.dietaryNeeds || []).some((d) =>
+    String(d).toLowerCase().includes("veget")
+  );
 
+  let filtered = withDist.filter((r) => eligibleByBudget(r.priceLevel, user?.budgetMax));
+  if (wantsVeg) filtered = filtered.filter((r) => r.servesVegetarianFood === true);
+
+  if (prefCuisines.length) {
+    const want = prefCuisines.map(normalizeCuisine);
+    const keep = new Set();
+    for (const r of filtered) {
+      if (want.some((c) => typeMatchesCuisine(r.types, c))) keep.add(r.id);
+    }
+    // If nothing matched cuisines, fall back to distance-only (so we still return something)
+    if (keep.size) filtered = filtered.filter((r) => keep.has(r.id));
+  }
+
+  // 3) Sort (distance first), then truncate
   filtered.sort((a, b) => a._dist - b._dist);
-  return filtered.slice(0, want).map((r) => ({ id: r.id, name: r.name, from: user.tag || "?" }));
-}
+  const base = filtered.slice(0, Math.max(desiredMin * 2, desiredMin));
 
-function sig(ctx, wantEach, radiusKm) {
-  const round = (n) => (typeof n === "number" ? Math.round(n * 1e6) / 1e6 : null);
-  const a = ctx?.locA ? { lat: round(ctx.locA.lat), lng: round(ctx.locA.lng) } : null;
-  const b = ctx?.locB ? { lat: round(ctx.locB.lat), lng: round(ctx.locB.lng) } : null;
-  return JSON.stringify({ a, b, wantEach, radiusKm });
-}
-
-/**
- * Returns { poolIds, metaById }
- * Rebuilds when:
- *  - no pool yet
- *  - meta missing or incomplete
- *  - locA/locB changed since last build (compared via ctx.poolSig)
- */
-async function getOrBuildSessionPool({ session, wantEach = 10, radiusKm = RADIUS_KM_DEFAULT }) {
-  const ctx = session.context || {};
-  const aUser = await fetchUserPrefs(session.aUserId);
-  const bUser = await fetchUserPrefs(session.bUserId);
-  aUser.tag = "A"; bUser.tag = "B";
-
-  const locA = ctx.locA || null;
-  const locB = ctx.locB || null;
-
-  const newSig = sig(ctx, wantEach, radiusKm);
-
-  log("pool(start)", { sessionId: session.id, want: wantEach, aUser, bUser, locA, locB });
-
-  // Fast path: accept cache only if signature matches AND meta covers all ids
-  if (Array.isArray(ctx.poolIds) && ctx.poolIds.length && ctx.poolSig === newSig && ctx.metaById) {
-    const covered = ctx.poolIds.every((id) => ctx.metaById[id]?.from);
-    if (covered) {
-      log("pool(cache-hit)", { sessionId: session.id, poolCount: ctx.poolIds.length });
-      return { poolIds: ctx.poolIds, metaById: ctx.metaById };
-    }
-  }
-
-  if (!locA && !locB) {
-    log("pool(no-locations)", { sessionId: session.id });
-    await prisma.groupSwipeSession.update({
-      where: { id: session.id },
-      data: { context: { ...ctx, poolIds: [], metaById: {}, poolSig: newSig } },
-    });
-    return { poolIds: [], metaById: {} };
-  }
-
-  const picks = [];
-  if (locA) picks.push(...await fetchForUserAt({ user: aUser, loc: locA, want: wantEach, radiusKm }));
-  if (locB) picks.push(...await fetchForUserAt({ user: bUser, loc: locB, want: wantEach, radiusKm }));
-
-  // Deduplicate, preserve first origin ("from")
-  const metaById = {};
-  const poolIds = [];
-  for (const p of picks) {
-    if (!metaById[p.id]) {
-      metaById[p.id] = { from: p.from };
-      poolIds.push(p.id);
-    }
-  }
-
-  log("pool(combined)", { sessionId: session.id, total: poolIds.length, ids: poolIds });
-
-  await prisma.groupSwipeSession.update({
-    where: { id: session.id },
-    data: { context: { ...ctx, poolIds, metaById, poolSig: newSig, builtAt: new Date().toISOString() } },
-  });
-
-  return { poolIds, metaById };
+  // 4) Hydrate to a consistent minimal shape expected by callers (id, name, …)
+  return base.map((r) => ({
+    id: r.id,
+    name: r.name,
+    latitude: r.latitude,
+    longitude: r.longitude,
+    types: r.types,
+    priceLevel: r.priceLevel,
+  }));
 }
 
 module.exports = {
-  getOrBuildSessionPool,
-  fetchUserPrefs,
+  ensurePreferredPool,
 };
