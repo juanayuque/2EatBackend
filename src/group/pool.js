@@ -4,6 +4,7 @@
 const { haversineKm, asFloat } = require("../utils/geo");
 
 const CACHE = new Map(); // sessionId -> { items, key, at }
+const isNum = (n) => Number.isFinite(Number(n));
 
 /** cuisine keywords (very rough matching against Google place 'types') */
 const CUISINE_KEYWORDS = {
@@ -57,7 +58,6 @@ function eligibleByBudget(priceLevel, budgetMax) {
 function requirementsFromUser(user) {
   const needs = (user?.dietaryNeeds || []).map(norm);
   const vegetarian = needs.some((d) => d.includes("veget"));
-  // You can extend these if you model pet/parking as user prefs later
   return { vegetarian, petFriendly: false, parking: false };
 }
 
@@ -68,18 +68,25 @@ function baseRadiusKmFromPrefs(aPrefs, bPrefs) {
   return Math.max(minBoth, 5);
 }
 
+/** Resolve coords: prefer locX; fallback to user's lastLat/lastLng */
+function resolveCoords(loc, user) {
+  if (loc && isNum(loc.lat) && isNum(loc.lng)) return { lat: Number(loc.lat), lng: Number(loc.lng) };
+  if (user && isNum(user.lastLat) && isNum(user.lastLng)) return { lat: Number(user.lastLat), lng: Number(user.lastLng) };
+  return null;
+}
+
 /**
  * Build a DB-only pool for a single anchor (loc + prefs).
  */
 async function buildForUser({ prisma, lat, lng, prefs, want = 12, baseRadiusKm = 10, fromTag = "A", log = () => {} }) {
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return [];
+  if (!isNum(lat) || !isNum(lng)) return [];
 
   log?.(`[pool] user=${fromTag} lat=${lat} lng=${lng} baseRadiusKm=${baseRadiusKm} desiredMin=${want}`);
 
   const reqRaw = requirementsFromUser({ dietaryNeeds: prefs?.dietaryNeeds || [] });
   log?.("[pool] requirements(raw)= ", reqRaw);
 
-  // We only filter vegetarian at DB-level (if field exists as boolean); pet/parking are computed client-side
+  // We only filter vegetarian at DB-level (if field exists as boolean)
   const applyDB = [];
   if (reqRaw.vegetarian) applyDB.push("servesVegetarianFood=true");
   log?.("[pool] requirements(DB filter applied)= ", applyDB.length ? applyDB.join(", ") : "(none)");
@@ -124,32 +131,29 @@ async function buildForUser({ prisma, lat, lng, prefs, want = 12, baseRadiusKm =
       .filter((r) => r._dist <= radiusKm)
       .filter((r) => eligibleByBudget(r.priceLevel, prefs?.budgetMax));
 
-    // vegetarian (strict if requested)
     const afterReq = reqRaw.vegetarian ? within.filter((r) => r.servesVegetarianFood === true) : within;
 
     // cuisine match (if any keywords)
     let afterCuisine = afterReq;
     if (cuisineKeywords.length) {
-      afterCuisine = afterReq.filter((r) => typeMatchesKeywords(r.types, cuisineKeywords));
-      if (!afterCuisine.length) {
-        log?.("[pool] (STRICT) skipped: no cuisine keywords match; trying FLEX without cuisine");
-        afterCuisine = afterReq; // flex fallback if too strict
-      } else {
+      const strict = afterReq.filter((r) => typeMatchesKeywords(r.types, cuisineKeywords));
+      if (strict.length) {
         log?.(`[pool] (STRICT) ---- radiusKm=${radiusKm}km ----`);
+        afterCuisine = strict;
+      } else {
+        log?.("[pool] (STRICT) skipped: no cuisine keywords match; trying FLEX without cuisine");
       }
     } else {
       log?.("[pool] (STRICT) skipped: no cuisine keywords");
       log?.(`[pool] (FLEX) ---- radiusKm=${radiusKm}km ----`);
     }
 
-    // order by distance asc
     afterCuisine.sort((a, b) => a._dist - b._dist);
 
     best = afterCuisine.slice(0, Math.max(want * 2, want));
     if (best.length >= want) break; // good enough
   }
 
-  // shape
   return best.map((r) => ({
     id: r.id,
     name: r.name,
@@ -161,9 +165,7 @@ async function buildForUser({ prisma, lat, lng, prefs, want = 12, baseRadiusKm =
   }));
 }
 
-/**
- * Interleave two arrays A/B and dedupe by id (keep first occurrence, prefer A).
- */
+/** Interleave two arrays A/B and dedupe by id (keep first occurrence, prefer A). */
 function combineAB(aList, bList) {
   const out = [];
   const seen = new Set();
@@ -183,65 +185,66 @@ function combineAB(aList, bList) {
   return out;
 }
 
-/**
- * Build the combined group pool (DB only), cache by sessionId + inputs key.
- */
+/** Build the combined group pool (DB only), cache by sessionId + inputs key. */
 async function buildGroupPool({
   prisma,
   sessionId,
-  aUser, // { id, prefs, tag: "A" }
-  bUser, // { id, prefs, tag: "B" }
+  aUser, // { id, prefs, tag: "A", lastLat?, lastLng? }
+  bUser, // { id, prefs, tag: "B", lastLat?, lastLng? }
   locA,  // { lat, lng } | null
   locB,  // { lat, lng } | null
   want = 12,
   log = () => {},
 }) {
+  const coordsA = resolveCoords(locA, aUser);
+  const coordsB = resolveCoords(locB, bUser);
+
+  if (!coordsA && !coordsB) {
+    log?.("[pool] no coords for A or B — pool empty");
+    return { sessionId, items: [] };
+  }
+
   const baseRadiusKm = baseRadiusKmFromPrefs(aUser?.prefs, bUser?.prefs);
-  const make = async () => {
-    const aList = locA
-      ? await buildForUser({
-          prisma,
-          lat: locA.lat,
-          lng: locA.lng,
-          prefs: aUser?.prefs || {},
-          want,
-          baseRadiusKm,
-          fromTag: "A",
-          log,
-        })
-      : [];
-    const bList = locB
-      ? await buildForUser({
-          prisma,
-          lat: locB.lat,
-          lng: locB.lng,
-          prefs: bUser?.prefs || {},
-          want,
-          baseRadiusKm,
-          fromTag: "B",
-          log,
-        })
-      : [];
 
-    const combined = combineAB(aList, bList);
-    log?.("[pool] combined counts A/B/total = ", aList.length, bList.length, combined.length);
+  const aList = coordsA
+    ? await buildForUser({
+        prisma,
+        lat: coordsA.lat,
+        lng: coordsA.lng,
+        prefs: aUser?.prefs || {},
+        want,
+        baseRadiusKm,
+        fromTag: "A",
+        log,
+      })
+    : [];
 
-    return combined.slice(0, Math.max(want * 2, want)); // keep a bit extra
-  };
+  const bList = coordsB
+    ? await buildForUser({
+        prisma,
+        lat: coordsB.lat,
+        lng: coordsB.lng,
+        prefs: bUser?.prefs || {},
+        want,
+        baseRadiusKm,
+        fromTag: "B",
+        log,
+      })
+    : [];
 
-  const items = await make();
-  return { sessionId, items };
+  const combined = combineAB(aList, bList);
+  log?.("[pool] combined counts A/B/total = ", aList.length, bList.length, combined.length);
+
+  return { sessionId, items: combined.slice(0, Math.max(want * 2, want)) };
 }
 
-/**
- * Simple memo: invalidate when locA/locB/prefs change via a key hash.
- */
+/** Stronger memo: include coords + prefs so we invalidate when they change. */
 function mkKey({ aUser, bUser, locA, locB, want }) {
+  const ra = resolveCoords(locA, aUser);
+  const rb = resolveCoords(locB, bUser);
   return JSON.stringify({
-    a: { id: aUser?.id, prefs: aUser?.prefs },
-    b: { id: bUser?.id, prefs: bUser?.prefs },
-    locA,
-    locB,
+    a: { id: aUser?.id, prefs: aUser?.prefs, lat: ra?.lat ?? null, lng: ra?.lng ?? null },
+    b: { id: bUser?.id, prefs: bUser?.prefs, lat: rb?.lat ?? null, lng: rb?.lng ?? null },
     want,
   });
 }
@@ -261,6 +264,40 @@ async function getOrBuildSessionPool({ sessionId, prisma, aUser, bUser, locA, lo
   return built;
 }
 
+/* ----------  deterministic per-user ordering of the same union ---------- */
+
+function hashStr(str) {
+  let h = 2166136261 >>> 0; // FNV-1a
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0;
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * Return a stable, user-specific shuffle of the same items.
+ * `userKey` should be "A" or "B" (or any deterministic per-user string).
+ */
+function orderPoolDeterministic(items, sessionId, userKey = "A") {
+  const seed = hashStr(`${sessionId}:${userKey}`);
+  const rand = mulberry32(seed);
+  return [...items]
+    .map((x) => ({ x, k: rand() }))
+    .sort((a, b) => a.k - b.k)
+    .map((o) => o.x);
+}
+
 function clearPool(sessionId) {
   CACHE.delete(sessionId);
 }
@@ -268,5 +305,6 @@ function clearPool(sessionId) {
 module.exports = {
   getOrBuildSessionPool,
   buildGroupPool,
+  orderPoolDeterministic, 
   clearPool,
 };

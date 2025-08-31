@@ -4,7 +4,7 @@ const express = require("express");
 const prisma = require("../src/prisma");
 const verifyFirebaseToken = require("../middleware/auth");
 
-const { getOrBuildSessionPool, clearPool } = require("../src/group/pool");
+const { getOrBuildSessionPool, clearPool, orderPoolDeterministic, } = require("../src/group/pool");
 const { haversineKm, asFloat } = require("../src/utils/geo");
 
 const router = express.Router();
@@ -184,7 +184,7 @@ router.post("/session/:id/start", async (req, res) => {
 });
 
 
-// Current state + next card for *me* (stable based on my own counter)
+// GET /session/:id/state
 router.get("/session/:id/state", async (req, res) => {
   try {
     const me = await authedUser(req.user.uid);
@@ -194,7 +194,7 @@ router.get("/session/:id/state", async (req, res) => {
     const session = await prisma.groupSwipeSession.findUnique({
       where: { id: sessionId },
       include: {
-        events: { orderBy: { createdAt: "asc" } }, // for logging / fallback only
+        events: { orderBy: { createdAt: "asc" } },
         aUser: true,
         bUser: true,
         startedBy: true,
@@ -202,23 +202,17 @@ router.get("/session/:id/state", async (req, res) => {
     });
     if (!session) return res.status(404).json({ error: "Session not found" });
 
-    // Determine A/B and use per-user counters for stability (fallback to event counts if missing)
-    const myTag = tagForUserId(session, me.id); // "A" | "B" | null
-    const aSw = session.aSwipes ?? 0;
-    const bSw = session.bSwipes ?? 0;
+    const allEvents = session.events || [];
+    const youCount = allEvents.filter((e) => e.userId === me.id).length;
+    const partnerCount = allEvents.length - youCount;
 
-    const youCount =
-      myTag === "A" ? aSw : myTag === "B" ? bSw : session.events.filter((e) => e.userId === me.id).length;
-    const partnerCount =
-      myTag === "A" ? bSw : myTag === "B" ? aSw : session.events.length - youCount;
-
-    // Completed? Just return counters and no next.
+    // if completed, short-circuit
     if (session.status !== "active") {
       return res.json({
         status: session.status,
         youCount,
         partnerCount,
-        limit: MAX_SWIPES, // per-user cap exposed to UI
+        limit: MAX_SWIPES,
         next: null,
       });
     }
@@ -226,62 +220,64 @@ router.get("/session/:id/state", async (req, res) => {
     const { userA, userB } = userABFromSession(session);
     const aPrefs = prefsFromUser(userA);
     const bPrefs = prefsFromUser(userB);
+    const youTag = tagForUserId(session, me.id) || "A"; // "A" or "B"
 
     const locA = extractLoc(session.context, "locA");
     const locB = extractLoc(session.context, "locB");
 
-    // Build (or reuse) the combined pool from DB only
+    // build/reuse the shared UNION pool
     const pool = await getOrBuildSessionPool({
       sessionId,
       prisma,
-      aUser: { id: userA?.id, name: userA?.displayName || userA?.username || null, prefs: aPrefs, tag: "A" },
-      bUser: { id: userB?.id, name: userB?.displayName || userB?.username || null, prefs: bPrefs, tag: "B" },
+      aUser: {
+        id: userA?.id,
+        name: userA?.displayName || userA?.username || null,
+        prefs: aPrefs,
+        tag: "A",
+        lastLat: userA?.lastLat,
+        lastLng: userA?.lastLng,
+      },
+      bUser: {
+        id: userB?.id,
+        name: userB?.displayName || userB?.username || null,
+        prefs: bPrefs,
+        tag: "B",
+        lastLat: userB?.lastLat,
+        lastLng: userB?.lastLng,
+      },
       locA,
       locB,
-      want: 24, // you logged plenty—bump page size to match your needs
+      want: MAX_SWIPES * 2, // build a bit more than we show
       log: console.log,
     });
 
-    // Your personal index through the common pool is your counter.
+    // Create the per-user view (same set, different order), cap to MAX_SWIPES
+    const ordered = orderPoolDeterministic(pool.items, sessionId, youTag).slice(0, MAX_SWIPES);
+
     const idx = youCount;
-    const nextItem = idx < pool.items.length ? pool.items[idx] : null;
+    const nextBase = idx < ordered.length ? ordered[idx] : null;
 
-    let nextPayload = null;
-
-    if (nextItem) {
-      // Hydrate details (including first photo name) for the single card
+    let next = null;
+    if (nextBase) {
+      // hydrate minimal display (photo)
       const r = await prisma.restaurant.findUnique({
-        where: { id: nextItem.id },
+        where: { id: nextBase.id },
         include: { photos: { take: 1 } },
       });
-
-      // Decide which location to measure from for *you*
-      const myLoc = myTag === "A" ? locA : myTag === "B" ? locB : null;
-      let distance = null;
-      if (myLoc && r?.latitude != null && r?.longitude != null) {
-        distance = haversineKm(
-          myLoc,
-          { lat: asFloat(r.latitude), lng: asFloat(r.longitude) }
-        );
-      }
-
       const photoName = r?.photos?.[0]?.name || null;
       const photoUrl = photoName
         ? `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(photoName)}&w=1200`
-        : null; // <-- uses your existing photo proxy
+        : null;
 
-      nextPayload = {
-        id: nextItem.id,
-        name: r?.name || nextItem.name || "",
-        from: nextItem.from || null, // "A" | "B"
-        address: r?.formattedAddress || null,
-        priceLevel: r?.priceLevel ?? null,
-        primaryType: r?.primaryType || null,
-        types: r?.types || [],
-        editorialSummary: r?.editorialSummary || null,
-        editorial_summary: r?.editorialSummary || null, // backward compat if UI expects it
+      next = {
+        id: r?.id || nextBase.id,
+        name: r?.name || nextBase.name,
+        from: nextBase.from || null,
         photoUrl,
-        distance,
+        priceLevel: r?.priceLevel ?? nextBase.priceLevel ?? null,
+        primaryType: r?.primaryType || null,
+        types: r?.types || nextBase.types || [],
+        editorialSummary: r?.editorialSummary || null,
         servesVegetarianFood: r?.servesVegetarianFood ?? null,
         allowsDogs: r?.allowsDogs ?? null,
         hasParking:
@@ -295,8 +291,8 @@ router.get("/session/:id/state", async (req, res) => {
         userId: me.id,
         countForUser: youCount,
         idx,
-        restaurant: { id: nextPayload.id, name: nextPayload.name },
-        from: nextPayload.from || null,
+        restaurant: { id: next.id, name: next.name },
+        from: next.from || null,
       });
     } else {
       console.log("[group] state(no-next)", {
@@ -304,7 +300,7 @@ router.get("/session/:id/state", async (req, res) => {
         youCount,
         partnerCount,
         limit: MAX_SWIPES,
-        poolSize: pool.items.length,
+        poolSize: ordered.length,
       });
     }
 
@@ -314,7 +310,7 @@ router.get("/session/:id/state", async (req, res) => {
       youCount,
       partnerCount,
       limit: MAX_SWIPES,
-      next: nextPayload, // now fully hydrated with photoUrl and details
+      next,
     });
   } catch (err) {
     console.error("[group/session/state] error:", err);
@@ -322,7 +318,7 @@ router.get("/session/:id/state", async (req, res) => {
   }
 });
 
-// Record feedback and bump the correct per-user counter
+// POST /session/:sessionId/feedback
 router.post("/session/:sessionId/feedback", async (req, res) => {
   try {
     const me = await authedUser(req.user.uid);
@@ -343,53 +339,38 @@ router.post("/session/:sessionId/feedback", async (req, res) => {
     if (!s) return res.status(400).json({ error: "Invalid session" });
     if (s.status !== "active") return res.status(410).json({ ok: false, sessionCompleted: true });
 
-    // Idempotency: if last event matches exactly, no-op
+    // Idempotency (exact last)
     const last = s.events[s.events.length - 1];
-    if (last && last.restaurantId === restaurantId && last.action === action) {
-      return res.json({
-        ok: true,
-        duplicate: true,
-        shouldRerank: false,
-        shouldSuggestMatch: false,
-        sessionCompleted: false,
-      });
+    if (last && last.restaurantId === restaurantId && last.action === action && last.userId === me.id) {
+      return res.json({ ok: true, duplicate: true, shouldRerank: false, shouldSuggestMatch: false, sessionCompleted: false });
     }
-    // Optional: if same restaurant+action exists anywhere, skip
-    if (s.events.some((e) => e.restaurantId === restaurantId && e.action === action)) {
-      return res.json({
-        ok: true,
-        duplicate: true,
-        shouldRerank: false,
-        shouldSuggestMatch: false,
-        sessionCompleted: false,
-      });
+    // Optional: if same user+restaurant+action exists anywhere, skip
+    if (s.events.some(e => e.userId === me.id && e.restaurantId === restaurantId && e.action === action)) {
+      return res.json({ ok: true, duplicate: true, shouldRerank: false, shouldSuggestMatch: false, sessionCompleted: false });
     }
 
-    // Who is swiping? (A or B)
     const isA = s.aUserId && me.id === s.aUserId;
     const isB = s.bUserId && me.id === s.bUserId;
 
     const position = s.events.length + 1;
     let sessionCompleted = false;
-    let aSwipes, bSwipes;
+    let aSwipes = 0, bSwipes = 0;
 
     await prisma.$transaction(async (tx) => {
       await tx.groupSwipeEvent.create({
         data: { sessionId, userId: me.id, restaurantId, action, position },
       });
 
-      // Increment the right side
       const inc = isA
         ? { aSwipes: { increment: 1 } }
         : isB
           ? { bSwipes: { increment: 1 } }
-          : {}; // if neither, don't bump counters (shouldn't happen for host/guest)
+          : {};
 
       if (Object.keys(inc).length) {
         await tx.groupSwipeSession.update({ where: { id: sessionId }, data: inc });
       }
 
-      // Read fresh counters
       const fresh = await tx.groupSwipeSession.findUnique({
         where: { id: sessionId },
         select: { aSwipes: true, bSwipes: true },
@@ -397,10 +378,8 @@ router.post("/session/:sessionId/feedback", async (req, res) => {
       aSwipes = fresh?.aSwipes ?? 0;
       bSwipes = fresh?.bSwipes ?? 0;
 
-      // Completion logic:
-      // end when BOTH users hit the per-user cap, or on SUPERSTAR if configured
-      const reachedCap = aSwipes >= MAX_SWIPES && bSwipes >= MAX_SWIPES;
-      const endNow = reachedCap || (END_ON_SUPERSTAR && action === "SUPERSTAR");
+      const bothDone = (aSwipes >= MAX_SWIPES) && (bSwipes >= MAX_SWIPES);
+      const endNow = bothDone || (END_ON_SUPERSTAR && action === "SUPERSTAR");
 
       if (endNow) {
         await tx.groupSwipeSession.update({
@@ -411,9 +390,12 @@ router.post("/session/:sessionId/feedback", async (req, res) => {
       }
     });
 
-    const combinedNext = (aSwipes ?? 0) + (bSwipes ?? 0);
-    const shouldRerank = combinedNext % 5 === 0;
-    const shouldSuggestMatch = sessionCompleted || aSwipes >= MAX_SWIPES || bSwipes >= MAX_SWIPES;
+    // Rerank cadence per-user every 5
+    const youSwipes = isA ? aSwipes : isB ? bSwipes : (s.events.filter(e => e.userId === me.id).length);
+    const shouldRerank = youSwipes > 0 && youSwipes % 5 === 0;
+
+    // Suggest match only when BOTH done (change this if you want a per-user prompt)
+    const shouldSuggestMatch = sessionCompleted || ((aSwipes >= MAX_SWIPES) && (bSwipes >= MAX_SWIPES));
 
     return res.json({ ok: true, shouldRerank, shouldSuggestMatch, sessionCompleted });
   } catch (err) {
