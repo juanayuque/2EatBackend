@@ -29,169 +29,119 @@ function liteUser(u) {
   };
 }
 
-// GET /api/group/requests?box=inbox|outbox|all  (default: inbox)
+// 
+
 router.get("/requests", async (req, res) => {
   try {
-    const me = await authedUser(req.user.uid);
+    const me = await prisma.user.findUnique({
+      where: { firebaseUid: req.user.uid },
+      select: { id: true },
+    });
     if (!me) return res.status(404).json({ error: "User not found" });
 
-    const box = String(req.query.box || "inbox").toLowerCase();
-    const where =
-      box === "outbox"
-        ? { fromUserId: me.id }
-        : box === "all"
-          ? { OR: [{ fromUserId: me.id }, { toUserId: me.id }] }
-          : { toUserId: me.id };
-
-    const rows = await prisma.groupRequest.findMany({
-      where,
+    const pending = await prisma.groupRequest.findMany({
+      where: { status: "PENDING", OR: [{ toUserId: me.id }, { fromUserId: me.id }] },
       orderBy: { createdAt: "desc" },
       include: {
-        fromUser: { select: { id: true, displayName: true, username: true, photoUrl: true } },
-        toUser:   { select: { id: true, displayName: true, username: true, photoUrl: true } },
+        fromUser: { select: { id: true, displayName: true, username: true } },
+        toUser: { select: { id: true, displayName: true, username: true } },
       },
       take: 50,
     });
 
-    res.json({
-      requests: rows.map(r => ({
+    const incoming = pending
+      .filter((r) => r.toUserId === me.id)
+      .map((r) => ({
         id: r.id,
-        status: r.status,
-        createdAt: r.createdAt,
-        updatedAt: r.updatedAt,
-        from: liteUser(r.fromUser),
-        to: liteUser(r.toUser),
-      })),
-    });
-  } catch (err) {
-    console.error("[groupRequests/list] error:", err);
-    res.status(500).json({ error: "failed" });
-  }
-});
-
-// POST /api/group/requests  { toUserId }
-router.post("/requests", async (req, res) => {
-  try {
-    const me = await authedUser(req.user.uid);
-    if (!me) return res.status(404).json({ error: "User not found" });
-
-    const toUserId = String(req.body?.toUserId || "");
-    if (!toUserId) return res.status(400).json({ error: "toUserId required" });
-    if (toUserId === me.id) return res.status(400).json({ error: "cannot invite yourself" });
-
-    // Upsert-ish: if a pending exists either direction, reuse it
-    const existing = await prisma.groupRequest.findFirst({
-      where: {
-        OR: [
-          { fromUserId: me.id, toUserId },
-          { fromUserId: toUserId, toUserId: me.id },
-        ],
-        status: STATUS.PENDING,
-      },
-    });
-
-    const reqRow =
-      existing ||
-      (await prisma.groupRequest.create({
-        data: { fromUserId: me.id, toUserId, status: STATUS.PENDING },
+        fromUserId: r.fromUserId,
+        fromName: r.fromUser.displayName || r.fromUser.username || "Friend",
+        fromUsername: r.fromUser.username || null,
       }));
 
-    res.json({ ok: true, requestId: reqRow.id, status: reqRow.status });
+    const outgoing = pending
+      .filter((r) => r.fromUserId === me.id)
+      .map((r) => ({
+        id: r.id,
+        toUserId: r.toUserId,
+        toName: r.toUser.displayName || r.toUser.username || "Friend",
+        toUsername: r.toUser.username || null,
+      }));
+
+    res.json({ incoming, outgoing });
   } catch (err) {
-    // handle unique constraint politely
-    if (err?.code === "P2002") {
-      return res.status(409).json({ error: "request already exists" });
-    }
-    console.error("[groupRequests/create] error:", err);
+    console.error("[group/requests] error:", err);
     res.status(500).json({ error: "failed" });
   }
 });
 
-// POST /api/group/requests/:id/accept
-router.post("/requests/:id/accept", async (req, res) => {
-  try {
-    const me = await authedUser(req.user.uid);
-    if (!me) return res.status(404).json({ error: "User not found" });
 
-    const id = String(req.params.id || "");
-    const r = await prisma.groupRequest.findUnique({ where: { id } });
+// POST /api/group/request
+router.post("/request", async (req, res) => {
+  try {
+    const me = await prisma.user.findUnique({ where: { firebaseUid: req.user.uid }, select: { id: true } });
+    if (!me) return res.status(404).json({ error: "User not found" });
+    const friendId = String(req.body?.friendId || "");
+    if (!friendId) return res.status(400).json({ error: "friendId required" });
+    const r = await prisma.groupRequest.create({
+      data: { fromUserId: me.id, toUserId: friendId, status: "PENDING" },
+    });
+    res.json({ ok: true, requestId: r.id });
+  } catch (err) {
+    if (err?.code === "P2002") return res.status(409).json({ error: "already requested" });
+    console.error("[group/request] error:", err);
+    res.status(500).json({ error: "failed" });
+  }
+});
+
+// POST /api/group/accept
+router.post("/accept", async (req, res) => {
+  try {
+    const me = await prisma.user.findUnique({ where: { firebaseUid: req.user.uid }, select: { id: true } });
+    if (!me) return res.status(404).json({ error: "User not found" });
+    const requestId = String(req.body?.requestId || "");
+    const r = await prisma.groupRequest.findUnique({ where: { id: requestId } });
     if (!r) return res.status(404).json({ error: "not found" });
     if (r.toUserId !== me.id) return res.status(403).json({ error: "not your inbox item" });
-    if (r.status !== STATUS.PENDING) return res.status(409).json({ error: "not pending" });
+    if (r.status !== "PENDING") return res.status(409).json({ error: "not pending" });
 
     await prisma.$transaction(async (tx) => {
-      // mark accepted
-      await tx.groupRequest.update({ where: { id }, data: { status: STATUS.ACCEPTED } });
-      // ensure 2-way Friend rows
-      await tx.friend.upsert({
-        where: { userId_friendId: { userId: r.fromUserId, friendId: r.toUserId } },
-        create: { userId: r.fromUserId, friendId: r.toUserId },
-        update: {},
-      });
-      await tx.friend.upsert({
-        where: { userId_friendId: { userId: r.toUserId, friendId: r.fromUserId } },
-        create: { userId: r.toUserId, friendId: r.fromUserId },
-        update: {},
-      });
-      // optionally: close any opposite pending
-      await tx.groupRequest.updateMany({
-        where: {
-          OR: [
-            { fromUserId: r.toUserId, toUserId: r.fromUserId },
-            { fromUserId: r.fromUserId, toUserId: r.toUserId },
-          ],
-          status: STATUS.PENDING,
-          NOT: { id },
+      await tx.groupRequest.update({ where: { id: requestId }, data: { status: "ACCEPTED" } });
+      // create an active session between inviter(invite from) and me
+      await tx.groupSwipeSession.create({
+        data: {
+          status: "active",
+          startedById: r.fromUserId,
+          aUserId: r.fromUserId,
+          bUserId: r.toUserId,
+          context: {}, // locations will be filled by /session/:id/start
         },
-        data: { status: STATUS.CANCELED },
       });
     });
 
-    res.json({ ok: true, status: STATUS.ACCEPTED });
+    res.json({ ok: true });
   } catch (err) {
-    console.error("[groupRequests/accept] error:", err);
+    console.error("[group/accept] error:", err);
     res.status(500).json({ error: "failed" });
   }
 });
 
-// POST /api/group/requests/:id/decline
-router.post("/requests/:id/decline", async (req, res) => {
+// POST /api/group/cancel
+router.post("/cancel", async (req, res) => {
   try {
-    const me = await authedUser(req.user.uid);
+    const me = await prisma.user.findUnique({ where: { firebaseUid: req.user.uid }, select: { id: true } });
     if (!me) return res.status(404).json({ error: "User not found" });
-
-    const id = String(req.params.id || "");
-    const r = await prisma.groupRequest.findUnique({ where: { id } });
-    if (!r) return res.status(404).json({ error: "not found" });
-    if (r.toUserId !== me.id) return res.status(403).json({ error: "not your inbox item" });
-    if (r.status !== STATUS.PENDING) return res.status(409).json({ error: "not pending" });
-
-    await prisma.groupRequest.update({ where: { id }, data: { status: STATUS.DECLINED } });
-    res.json({ ok: true, status: STATUS.DECLINED });
-  } catch (err) {
-    console.error("[groupRequests/decline] error:", err);
-    res.status(500).json({ error: "failed" });
-  }
-});
-
-// POST /api/group/requests/:id/cancel  (sender can cancel)
-router.post("/requests/:id/cancel", async (req, res) => {
-  try {
-    const me = await authedUser(req.user.uid);
-    if (!me) return res.status(404).json({ error: "User not found" });
-
-    const id = String(req.params.id || "");
-    const r = await prisma.groupRequest.findUnique({ where: { id } });
+    const requestId = String(req.body?.requestId || "");
+    const r = await prisma.groupRequest.findUnique({ where: { id: requestId } });
     if (!r) return res.status(404).json({ error: "not found" });
     if (r.fromUserId !== me.id) return res.status(403).json({ error: "not your outbox item" });
-    if (r.status !== STATUS.PENDING) return res.status(409).json({ error: "not pending" });
-
-    await prisma.groupRequest.update({ where: { id }, data: { status: STATUS.CANCELED } });
-    res.json({ ok: true, status: STATUS.CANCELED });
+    if (r.status !== "PENDING") return res.status(409).json({ error: "not pending" });
+    await prisma.groupRequest.update({ where: { id: requestId }, data: { status: "CANCELED" } });
+    res.json({ ok: true });
   } catch (err) {
-    console.error("[groupRequests/cancel] error:", err);
+    console.error("[group/cancel] error:", err);
     res.status(500).json({ error: "failed" });
   }
 });
+
 
 module.exports = router;

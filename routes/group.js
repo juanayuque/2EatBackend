@@ -69,30 +69,61 @@ function tagForUserId(session, uid) {
 
 // ───────────────────────── endpoints ─────────────────────────
 
-// List my recent group sessions
+// routes/group.js 
+
 router.get("/sessions", async (req, res) => {
   try {
-    const me = await authedUser(req.user.uid);
+    const me = await prisma.user.findUnique({
+      where: { firebaseUid: req.user.uid },
+      select: { id: true, displayName: true, username: true },
+    });
     if (!me) return res.status(404).json({ error: "User not found" });
 
-    const sessions = await prisma.groupSwipeSession.findMany({
+    const rows = await prisma.groupSwipeSession.findMany({
       where: {
+        status: "active",
         OR: [{ startedById: me.id }, { aUserId: me.id }, { bUserId: me.id }],
       },
-      orderBy: { startedAt: "asc" }, // or "desc", your call
-      take: 10,
-      select: {
-        id: true,
-        status: true,
-        startedAt: true,
-        endedAt: true,
-        startedById: true,
-        aUserId: true,
-        bUserId: true,
-        aSwipes: true,
-        bSwipes: true,
+      orderBy: { startedAt: "desc" },
+      include: {
+        aUser: { select: { id: true, displayName: true, username: true } },
+        bUser: { select: { id: true, displayName: true, username: true } },
+        startedBy: { select: { id: true } },
+        events: { select: { userId: true }, orderBy: { createdAt: "asc" } },
       },
+      take: 20,
     });
+
+    const sessions = rows.map((s) => {
+      // figure out my partner
+      const meIsA = s.aUser?.id === me.id;
+      const meIsB = s.bUser?.id === me.id;
+      const partner =
+        meIsA ? s.bUser :
+        meIsB ? s.aUser :
+        // fallback if only startedBy set:
+        s.aUser?.id && s.aUser?.id !== me.id ? s.aUser :
+        s.bUser?.id && s.bUser?.id !== me.id ? s.bUser :
+        null;
+
+      // counts
+      const youCount = s.events.filter((e) => e.userId === me.id).length;
+      const partnerCount = partner ? s.events.filter((e) => e.userId === partner.id).length : 0;
+
+      return {
+        id: s.id,
+        partner: partner && {
+          id: partner.id,
+          name: partner.displayName || partner.username || "Friend",
+          username: partner.username || null,
+        },
+        youCount,
+        partnerCount,
+        limit: MAX_SWIPES,
+      };
+    })
+    // only return sessions where we could resolve a partner (UI expects it)
+    .filter((x) => !!x.partner);
 
     res.json({ sessions });
   } catch (err) {
@@ -100,6 +131,7 @@ router.get("/sessions", async (req, res) => {
     res.status(500).json({ error: "failed" });
   }
 });
+
 
 // Save a location for A or B (locA / locB) into session.context
 router.post("/session/:id/start", async (req, res) => {
