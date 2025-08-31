@@ -29,7 +29,21 @@ function liteUser(u) {
   };
 }
 
-// 
+/** any active session between the two users, regardless of order */
+function activeSessionWhere(aId, bId) {
+  return {
+    status: "active",
+    OR: [
+      { AND: [{ aUserId: aId }, { bUserId: bId }] },
+      { AND: [{ aUserId: bId }, { bUserId: aId }] },
+      // if you sometimes only have startedById set early:
+      { AND: [{ startedById: aId }, { OR: [{ aUserId: bId }, { bUserId: bId }] }] },
+      { AND: [{ startedById: bId }, { OR: [{ aUserId: aId }, { bUserId: aId }] }] },
+    ],
+  };
+}
+
+/* ─────────────────────────────── List pending ─────────────────────────────── */
 
 router.get("/requests", async (req, res) => {
   try {
@@ -40,7 +54,7 @@ router.get("/requests", async (req, res) => {
     if (!me) return res.status(404).json({ error: "User not found" });
 
     const pending = await prisma.groupRequest.findMany({
-      where: { status: "PENDING", OR: [{ toUserId: me.id }, { fromUserId: me.id }] },
+      where: { status: STATUS.PENDING, OR: [{ toUserId: me.id }, { fromUserId: me.id }] },
       orderBy: { createdAt: "desc" },
       include: {
         fromUser: { select: { id: true, displayName: true, username: true } },
@@ -74,46 +88,99 @@ router.get("/requests", async (req, res) => {
   }
 });
 
-
-// POST /api/group/request
+/* ─────────────────────────────── Create/Upsert ────────────────────────────── */
+/** POST /api/group/request  body: { friendId } */
 router.post("/request", async (req, res) => {
   try {
-    const me = await prisma.user.findUnique({ where: { firebaseUid: req.user.uid }, select: { id: true } });
+    const me = await prisma.user.findUnique({
+      where: { firebaseUid: req.user.uid },
+      select: { id: true },
+    });
     if (!me) return res.status(404).json({ error: "User not found" });
+
     const friendId = String(req.body?.friendId || "");
     if (!friendId) return res.status(400).json({ error: "friendId required" });
-    const r = await prisma.groupRequest.create({
-      data: { fromUserId: me.id, toUserId: friendId, status: "PENDING" },
+    if (friendId === me.id) return res.status(400).json({ error: "cannot request self" });
+
+    // 1) block if an active session already exists between us
+    const active = await prisma.groupSwipeSession.findFirst({
+      where: activeSessionWhere(me.id, friendId),
+      select: { id: true },
     });
-    res.json({ ok: true, requestId: r.id });
+    if (active) {
+      return res.status(409).json({ error: "already active session", code: "already_active" });
+    }
+
+    // 2) block if a pending request exists in either direction
+    const pending = await prisma.groupRequest.findFirst({
+      where: {
+        status: STATUS.PENDING,
+        OR: [
+          { fromUserId: me.id, toUserId: friendId },
+          { fromUserId: friendId, toUserId: me.id },
+        ],
+      },
+      select: { id: true },
+    });
+    if (pending) {
+      return res.status(409).json({ error: "already pending", code: "already_pending" });
+    }
+
+    // 3) otherwise *re-use* the A→B record via upsert (satisfy @@unique([fromUserId,toUserId]))
+    const row = await prisma.groupRequest.upsert({
+      where: { fromUserId_toUserId: { fromUserId: me.id, toUserId: friendId } },
+      update: { status: STATUS.PENDING, updatedAt: new Date() },
+      create: { fromUserId: me.id, toUserId: friendId, status: STATUS.PENDING },
+      select: { id: true },
+    });
+
+    return res.json({ ok: true, requestId: row.id });
   } catch (err) {
-    if (err?.code === "P2002") return res.status(409).json({ error: "already requested" });
     console.error("[group/request] error:", err);
-    res.status(500).json({ error: "failed" });
+    // Fallback message; upsert should avoid P2002 anyway
+    return res.status(500).json({ error: "failed" });
   }
 });
 
-// POST /api/group/accept
+/* ─────────────────────────────── Accept ───────────────────────────────────── */
+/** POST /api/group/accept  body: { requestId } */
 router.post("/accept", async (req, res) => {
   try {
-    const me = await prisma.user.findUnique({ where: { firebaseUid: req.user.uid }, select: { id: true } });
+    const me = await prisma.user.findUnique({
+      where: { firebaseUid: req.user.uid },
+      select: { id: true },
+    });
     if (!me) return res.status(404).json({ error: "User not found" });
+
     const requestId = String(req.body?.requestId || "");
     const r = await prisma.groupRequest.findUnique({ where: { id: requestId } });
     if (!r) return res.status(404).json({ error: "not found" });
     if (r.toUserId !== me.id) return res.status(403).json({ error: "not your inbox item" });
-    if (r.status !== "PENDING") return res.status(409).json({ error: "not pending" });
+
+    if (r.status !== STATUS.PENDING) {
+      return res.status(409).json({ error: "not pending" });
+    }
+
+    // guard: if somehow an active session already exists, don’t create another
+    const already = await prisma.groupSwipeSession.findFirst({
+      where: activeSessionWhere(r.fromUserId, r.toUserId),
+      select: { id: true },
+    });
+    if (already) {
+      // still mark request accepted for cleanliness
+      await prisma.groupRequest.update({ where: { id: r.id }, data: { status: STATUS.ACCEPTED } });
+      return res.status(409).json({ error: "already active", code: "already_active" });
+    }
 
     await prisma.$transaction(async (tx) => {
-      await tx.groupRequest.update({ where: { id: requestId }, data: { status: "ACCEPTED" } });
-      // create an active session between inviter(invite from) and me
+      await tx.groupRequest.update({ where: { id: requestId }, data: { status: STATUS.ACCEPTED } });
       await tx.groupSwipeSession.create({
         data: {
           status: "active",
           startedById: r.fromUserId,
           aUserId: r.fromUserId,
           bUserId: r.toUserId,
-          context: {}, // locations will be filled by /session/:id/start
+          context: {}, // /session/:id/start will fill coords
         },
       });
     });
@@ -125,23 +192,28 @@ router.post("/accept", async (req, res) => {
   }
 });
 
-// POST /api/group/cancel
+/* ─────────────────────────────── Cancel ───────────────────────────────────── */
+/** POST /api/group/cancel  body: { requestId } */
 router.post("/cancel", async (req, res) => {
   try {
-    const me = await prisma.user.findUnique({ where: { firebaseUid: req.user.uid }, select: { id: true } });
+    const me = await prisma.user.findUnique({
+      where: { firebaseUid: req.user.uid },
+      select: { id: true },
+    });
     if (!me) return res.status(404).json({ error: "User not found" });
+
     const requestId = String(req.body?.requestId || "");
     const r = await prisma.groupRequest.findUnique({ where: { id: requestId } });
     if (!r) return res.status(404).json({ error: "not found" });
     if (r.fromUserId !== me.id) return res.status(403).json({ error: "not your outbox item" });
-    if (r.status !== "PENDING") return res.status(409).json({ error: "not pending" });
-    await prisma.groupRequest.update({ where: { id: requestId }, data: { status: "CANCELED" } });
+    if (r.status !== STATUS.PENDING) return res.status(409).json({ error: "not pending" });
+
+    await prisma.groupRequest.update({ where: { id: requestId }, data: { status: STATUS.CANCELED } });
     res.json({ ok: true });
   } catch (err) {
     console.error("[group/cancel] error:", err);
     res.status(500).json({ error: "failed" });
   }
 });
-
 
 module.exports = router;
