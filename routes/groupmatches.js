@@ -21,8 +21,10 @@ function toPhotoUrlFromRestaurant(r) {
     r?.photoName ||
     r?.photos?.[0]?.name ||
     null;
-  // IMPORTANT: absolute URL so RN Web <Image> loads from backend, not localhost.
-  return name ? `${PUBLIC}/api/photo?name=${encodeURIComponent(name)}&maxWidthPx=1200` : null;
+  if (!name) return null;
+  const qs = new URLSearchParams({ name, w: "1200" });
+  // use the known-mounted recs photo proxy
+  return `${PUBLIC}/api/recs/photo?${qs.toString()}`;
 }
 
 function shapeResto(r) {
