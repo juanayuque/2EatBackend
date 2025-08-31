@@ -93,6 +93,8 @@ router.use(verifyFirebaseToken);
 
 // Start: creates/fetches active session and stores context (lat,lng,seed,radius)
 // No filtering, no discovery, no rank warmup here.
+// routes/recs.js (replace just the /start handler)
+
 router.post("/start", async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -103,6 +105,17 @@ router.post("/start", async (req, res) => {
 
     const user = await prisma.user.findUnique({ where: { firebaseUid: uid } });
     if (!user) return res.status(404).json({ error: "User not found. Sync profile first." });
+
+    // Persist last-known geo on the user (non-controversial + quick)
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        lastLat: lat,
+        lastLng: lng,
+        lastGeoAt: new Date(),
+        lastGeoSource: "recs-start", // helpful for debugging
+      },
+    });
 
     let session = null;
     if (!forceNew) {
@@ -136,6 +149,7 @@ router.post("/start", async (req, res) => {
     res.status(500).json({ error: "start failed" });
   }
 });
+
 
 // Next: returns a page of items using an opaque cursor. First call after /start
 // can omit lat/lng because they are stored in session.context.

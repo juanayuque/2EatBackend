@@ -105,12 +105,6 @@ app.use("/api/users", (req, _res, next) => {
 const locationRoutes = require("./routes/location");
 const geocodeRoutes = require("./routes/geocode");
 const friendsRouter = require("./routes/friends");
-const meRouter = require("./routes/me");
-app.use(
-  "/api/me",
-  (req, _res, next) => { console.log("me-router hit:", req.method, req.url); next(); },
-  meRouter
-);
 
 let recsRoutes = require("./routes/recs");
 
