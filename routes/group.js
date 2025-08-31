@@ -8,7 +8,7 @@ router.use(verifyFirebaseToken);
 
 // ─────────────────────────── Config ───────────────────────────
 const SWIPE_LIMIT = 15; // 15 swipes per user to finish
-const DESIRED_MIN_POOL_HINT = Number(process.env.GROUP_MIN_POOL || 12); // looser floor
+const DESIRED_MIN_POOL_HINT = Number(process.env.GROUP_MIN_POOL || 12); // loosened floor
 
 // Recs / helpers reused from solo flow
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
@@ -62,9 +62,8 @@ async function assertAreFriendsOr400(meId, otherUserId, res) {
   return true;
 }
 
-// ⬅️⬅️ Missing before: restore getSessionCounts and place it BEFORE any usage
+// count per user (explicit & robust)
 async function getSessionCounts(sessionId, aUserId, bUserId) {
-  // count per user; groupBy also works, but two counts are simple and robust
   const [a, b] = await Promise.all([
     prisma.groupSwipeEvent.count({ where: { sessionId, userId: aUserId } }),
     prisma.groupSwipeEvent.count({ where: { sessionId, userId: bUserId } }),
@@ -72,11 +71,11 @@ async function getSessionCounts(sessionId, aUserId, bUserId) {
   return { aCount: a, bCount: b, limit: SWIPE_LIMIT };
 }
 
-// Merge prefs conservatively so both can eat/enjoy
+// merge prefs for filters/radius (conservative)
 function combinedUser(u1, u2) {
   const uniq = (arr) => Array.from(new Set((arr || []).filter(Boolean)));
   const minOr = (a, b) => (a == null ? b ?? null : b == null ? a ?? null : Math.min(a, b));
-  return {
+  const obj = {
     id: `${u1.id}+${u2.id}`,
     firebaseUid: u1.firebaseUid,
     searchDistance: minOr(u1.searchDistance ?? 5, u2.searchDistance ?? 5),
@@ -85,9 +84,31 @@ function combinedUser(u1, u2) {
     preferredCuisines: uniq([...(u1.preferredCuisines || []), ...(u2.preferredCuisines || [])]),
     displayName: `${u1.displayName || "You"} & ${u2.displayName || "Friend"}`,
   };
+  return obj;
 }
 function noStore(res) {
   res.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+}
+
+// Pretty-print helpers for logs
+function briefUser(u) {
+  return {
+    id: u?.id,
+    name: u?.displayName || u?.username || (u?.email ? u.email.split("@")[0] : "User"),
+    prefs: {
+      distance: u?.searchDistance ?? null,
+      budgetMax: u?.budgetMax ?? null,
+      dietaryNeeds: (u?.dietaryNeeds || []).slice(0, 6),
+      preferredCuisines: (u?.preferredCuisines || []).slice(0, 12),
+    },
+  };
+}
+function briefLoc(x) {
+  if (!x || typeof x.lat !== "number" || typeof x.lng !== "number") return null;
+  return { lat: Number(x.lat.toFixed(5)), lng: Number(x.lng.toFixed(5)) };
+}
+function briefRestos(arr, max = 10) {
+  return (arr || []).slice(0, max).map((r) => (typeof r === "string" ? r : `${r.name || r.id}(${r.id})`));
 }
 
 // Build (or reuse cached) 20-item pool = 10 near A + 10 near B
@@ -97,6 +118,10 @@ async function ensureSessionPool(session) {
 
   // Already cached?
   if (Array.isArray(ctx.poolIds) && ctx.poolIds.length >= 10) {
+    console.info("[group] pool(cache-hit)", {
+      sessionId: session.id,
+      poolCount: ctx.poolIds.length,
+    });
     return { ids: ctx.poolIds, seed, ctx };
   }
 
@@ -105,7 +130,10 @@ async function ensureSessionPool(session) {
     where: { id: session.id },
     include: { aUser: true, bUser: true },
   });
-  if (!s) return { ids: [], seed, ctx };
+  if (!s) {
+    console.warn("[group] pool(session-missing)", { sessionId: session.id });
+    return { ids: [], seed, ctx };
+  }
 
   const duo = combinedUser(s.aUser, s.bUser);
   const radiusKm = radiusFromUser(duo);
@@ -114,9 +142,22 @@ async function ensureSessionPool(session) {
   const locA = ctx.locA && typeof ctx.locA.lat === "number" && typeof ctx.locA.lng === "number" ? ctx.locA : null;
   const locB = ctx.locB && typeof ctx.locB.lat === "number" && typeof ctx.locB.lng === "number" ? ctx.locB : null;
 
-  if (!locA && !locB) return { ids: [], seed, ctx };
+  console.info("[group] pool(start)", {
+    sessionId: session.id,
+    want,
+    radiusKm,
+    aUser: briefUser(s.aUser),
+    bUser: briefUser(s.bUser),
+    locA: briefLoc(locA),
+    locB: briefLoc(locB),
+  });
 
-  async function pullAt(loc) {
+  if (!locA && !locB) {
+    console.warn("[group] pool(no-locations)", { sessionId: session.id });
+    return { ids: [], seed, ctx };
+  }
+
+  async function pullAt(loc, tag) {
     const pool = await ensurePreferredPool({
       places,
       lat: loc.lat,
@@ -124,24 +165,42 @@ async function ensureSessionPool(session) {
       user: duo,
       desiredMin: want,
     });
-    // Deterministic order before slicing
     const ordered = orderPoolDeterministic(pool, session.id, seed);
-    return ordered.slice(0, 10).map((r) => r.id);
+    const slice = ordered.slice(0, 10);
+
+    console.info("[group] pool(side)", {
+      sessionId: session.id,
+      side: tag,
+      near: briefLoc(loc),
+      returned: pool.length,
+      taking: slice.length,
+      sample: briefRestos(slice, 8),
+    });
+
+    return slice.map((r) => r.id);
   }
 
   let idsA = [];
   let idsB = [];
-  if (locA) idsA = await pullAt(locA);
-  if (locB) idsB = await pullAt(locB);
+  if (locA) idsA = await pullAt(locA, "A");
+  if (locB) idsB = await pullAt(locB, "B");
 
   const merged = Array.from(new Set([...idsA, ...idsB]));
-  if (!merged.length) return { ids: [], seed, ctx };
+  if (!merged.length) {
+    console.warn("[group] pool(empty-merged)", { sessionId: session.id });
+    return { ids: [], seed, ctx };
+  }
 
-  // Reorder deterministically using objects with id
   const det = orderPoolDeterministic(merged.map((id) => ({ id })), session.id, seed).map((x) => x.id);
 
   ctx = { ...ctx, seed, poolIds: det, radiusKm };
   await prisma.groupSwipeSession.update({ where: { id: session.id }, data: { context: ctx } });
+
+  console.info("[group] pool(merged)", {
+    sessionId: session.id,
+    mergedCount: det.length,
+    sample: det.slice(0, 10),
+  });
 
   return { ids: det, seed, ctx };
 }
@@ -163,12 +222,23 @@ async function nextCardForUser(session, userId) {
     where: { id },
     include: { photos: { take: 1 } },
   });
-  if (!r) return null;
+  if (!r) {
+    console.warn("[group] nextCard(restaurant-missing)", { sessionId: session.id, idx, id });
+    return null;
+  }
 
   const photoName = r.photos?.[0]?.name || null;
   const photoUrl = photoName
     ? `${BACKEND_PUBLIC_URL}/api/recs/photo?name=${encodeURIComponent(photoName)}&w=1200`
     : null;
+
+  console.info("[group] nextCard", {
+    sessionId: session.id,
+    userId,
+    countForUser,
+    idx,
+    restaurant: { id: r.id, name: r.name },
+  });
 
   return {
     id: r.id,
@@ -197,6 +267,10 @@ async function rankTop3WithRecs(sessionId) {
     select: { restaurantId: true, userId: true, action: true },
   });
   const candidateIds = Array.from(new Set(evts.map((e) => e.restaurantId)));
+  console.info("[group] rank(candidates)", {
+    sessionId,
+    count: candidateIds.length,
+  });
   if (!candidateIds.length) return { top: [], winner: null };
 
   const restos = await prisma.restaurant.findMany({
@@ -229,7 +303,15 @@ async function rankTop3WithRecs(sessionId) {
       items,
       interactions,
     });
-  } catch {
+    console.info("[group] rank(lightfm)", {
+      sessionId,
+      topSample: ranked.slice(0, 5),
+    });
+  } catch (e) {
+    console.warn("[group] rank(lightfm-fallback)", {
+      sessionId,
+      reason: e?.message || "rank service error",
+    });
     const weight = (a) => (a === "SUPERSTAR" ? 3 : a === "LIKE" ? 1 : 0);
     const m = new Map();
     for (const e of evts) m.set(e.restaurantId, (m.get(e.restaurantId) || 0) + weight(e.action));
@@ -238,6 +320,7 @@ async function rankTop3WithRecs(sessionId) {
 
   const top = ranked.slice(0, 3);
   const winner = top[0] || null;
+  console.info("[group] rank(result)", { sessionId, top, winner });
   return { top, winner };
 }
 
@@ -259,6 +342,7 @@ async function maybeFinalizeSession(sessionId) {
       where: { id: s.id },
       data: { status: "completed", endedAt: new Date() },
     });
+    console.info("[group] finalize(existing)", { sessionId: s.id, matchId: existing.id });
     return { finalized: true, matchId: existing.id };
   }
 
@@ -284,6 +368,7 @@ async function maybeFinalizeSession(sessionId) {
     });
   });
 
+  console.info("[group] finalize(created)", { sessionId: s.id, winner: winner || top1 });
   return { finalized: true };
 }
 
@@ -423,6 +508,7 @@ router.post("/accept", async (req, res) => {
       });
     });
 
+    console.info("[group] accept→session(created)", { requestId, by: me.id });
     res.json({ ok: true });
   } catch (err) {
     console.error("[group/accept] error:", err);
@@ -447,6 +533,7 @@ router.post("/decline", async (req, res) => {
     if (gr.status !== "PENDING") return res.status(400).json({ error: "Request is not pending" });
 
     await prisma.groupRequest.update({ where: { id: gr.id }, data: { status: "DECLINED" } });
+    console.info("[group] decline", { requestId, by: me.id });
     res.json({ ok: true });
   } catch (err) {
     console.error("[group/decline] error:", err);
@@ -472,6 +559,7 @@ router.post("/cancel", async (req, res) => {
     if (gr.status !== "PENDING") return res.status(400).json({ error: "Request is not pending" });
 
     await prisma.groupRequest.update({ where: { id: gr.id }, data: { status: "CANCELED" } });
+    console.info("[group] cancel", { requestId, by: me.id });
     res.json({ ok: true });
   } catch (err) {
     console.error("[group/cancel] error:", err);
@@ -559,6 +647,13 @@ router.post("/session/:id/start", async (req, res) => {
     if (!ctx.seed) ctx.seed = mkSeed(s.id);
 
     await prisma.groupSwipeSession.update({ where: { id: s.id }, data: { context: ctx } });
+
+    console.info("[group] start(loc-saved)", {
+      sessionId: s.id,
+      who: key,
+      loc: briefLoc({ lat, lng }),
+    });
+
     res.json({ ok: true });
   } catch (err) {
     console.error("[group/session/start] error:", err);
@@ -616,6 +711,19 @@ router.get("/session/:id/state", async (req, res) => {
     }
 
     const next = await nextCardForUser(after, me.id);
+    if (!next) {
+      const hasLocA = !!(after.context && after.context.locA);
+      const hasLocB = !!(after.context && after.context.locB);
+      console.info("[group] state(no-next)", {
+        sessionId: after.id,
+        youCount: you,
+        partnerCount: them,
+        limit,
+        hasLocA,
+        hasLocB,
+      });
+    }
+
     res.json({
       status: after.status,
       limit,
@@ -653,6 +761,7 @@ router.post("/session/:id/feedback", async (req, res) => {
 
     if (countForUser >= SWIPE_LIMIT) {
       await maybeFinalizeSession(s.id);
+      console.info("[group] feedback(limit-reached)", { sessionId: s.id, userId: me.id });
       return res.json({ ok: true, reachedLimit: true });
     }
 
@@ -664,6 +773,14 @@ router.post("/session/:id/feedback", async (req, res) => {
         action, // "LIKE" | "PASS" | "SUPERSTAR"
         position: countForUser + 1,
       },
+    });
+
+    console.info("[group] feedback", {
+      sessionId: s.id,
+      userId: me.id,
+      restaurantId,
+      action,
+      position: countForUser + 1,
     });
 
     await maybeFinalizeSession(s.id);
@@ -699,6 +816,7 @@ router.post("/swipe", async (req, res) => {
     });
     if (countForUser >= SWIPE_LIMIT) {
       await maybeFinalizeSession(s.id);
+      console.info("[group] swipe-alias(limit-reached)", { sessionId: s.id, userId: me.id });
       return res.json({ ok: true, reachedLimit: true });
     }
 
@@ -710,6 +828,14 @@ router.post("/swipe", async (req, res) => {
         action,
         position: countForUser + 1,
       },
+    });
+
+    console.info("[group] swipe-alias", {
+      sessionId: s.id,
+      userId: me.id,
+      restaurantId,
+      action,
+      position: countForUser + 1,
     });
 
     await maybeFinalizeSession(s.id);
