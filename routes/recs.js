@@ -546,6 +546,7 @@ router.get("/winner", async (req, res) => {
   }
 });
 
+// routes/recs.js (replace the whole /discover-now handler)
 router.post("/discover-now", async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -566,12 +567,10 @@ router.post("/discover-now", async (req, res) => {
       cuisines = Array.isArray(u?.preferredCuisines) ? u.preferredCuisines : [];
     }
 
-    // If still empty, nothing to bias -> exit early
     if (!cuisines.length) {
       return res.json({ cuisinesUsed: [], found: 0, created: 0, attempts: 0 });
     }
 
-    // Build cuisine-only text queries
     const queries = Array.from(
       new Set(
         cuisines
@@ -582,11 +581,12 @@ router.post("/discover-now", async (req, res) => {
       )
     );
 
-    // Helpers for small offsets in km
-    const kmToDegLat = (km) => km / 111;                // ~111 km per 1° lat
-    const kmToDegLng = (km, atLat) => km / (111 * Math.cos((atLat * Math.PI) / 180));
+    // helpers for small offsets in km
+    const kmToDegLat = (km) => km / 111;
+    const kmToDegLng = (km, atLat) =>
+      km / (111 * Math.cos((atLat * Math.PI) / 180));
 
-    // Candidate centers to try (base, +2km east, -2km west, +5km north)
+    // Try origin, +2km east, -2km west, +5km north
     const centers = [
       { lat, lng, note: "origin" },
       { lat, lng: lng + kmToDegLng(2, lat), note: "+2km east" },
@@ -594,19 +594,34 @@ router.post("/discover-now", async (req, res) => {
       { lat: lat + kmToDegLat(5), lng, note: "+5km north" },
     ];
 
-    const byId = new Map();
-    let attempts = 0;
-    let zeroGrowthRuns = 0;
-
     console.log("[discover-now] cuisines:", cuisines);
     console.log("[discover-now] queries:", queries);
 
+    // Trackers
+    const placeById = new Map();   // id -> place object from Google
+    const seenIds = new Set();     // anything we saw from Google (avoid redundant DB checks)
+    const newIds = new Set();      // only ids that are NOT in DB
+    let attempts = 0;
+    let zeroGrowthRuns = 0;
+
+    // small helper: DB existence check in batches
+    async function filterNotInDb(ids) {
+      if (!ids.length) return ids;
+      const rows = await prisma.restaurant.findMany({
+        where: { id: { in: ids } },
+        select: { id: true },
+      });
+      const existing = new Set(rows.map((r) => r.id));
+      return ids.filter((id) => !existing.has(id));
+    }
+
     for (const c of centers) {
-      if (byId.size >= maxNew) break;
-      const before = byId.size;
+      if (newIds.size >= maxNew) break;
+      let newThisCenter = 0;
 
       for (const q of queries) {
-        // Text Search around the center with small-ish radius
+        if (newIds.size >= maxNew) break;
+
         const chunk = await places.googlePlacesSearchText(q, {
           lat: c.lat,
           lng: c.lng,
@@ -615,29 +630,47 @@ router.post("/discover-now", async (req, res) => {
         });
         attempts++;
 
+        // collect fresh ids we haven't seen at all
+        const fresh = [];
         for (const p of chunk || []) {
-          if (p?.id && !byId.has(p.id)) byId.set(p.id, p);
-          if (byId.size >= maxNew) break;
+          if (p?.id) {
+            placeById.set(p.id, p);
+            if (!seenIds.has(p.id)) {
+              seenIds.add(p.id);
+              fresh.push(p.id);
+            }
+          }
         }
-        if (byId.size >= maxNew) break;
+
+        if (fresh.length) {
+          // keep only the ones NOT in DB
+          const missing = await filterNotInDb(fresh);
+          for (const id of missing) {
+            if (newIds.size >= maxNew) break;
+            newIds.add(id);
+            newThisCenter++;
+          }
+        }
       }
 
-      const delta = byId.size - before;
-      console.log(`[discover-now] center ${c.note}: +${delta} (total=${byId.size})`);
+      console.log(
+        `[discover-now] center ${c.note}: +${newThisCenter} new (totalNew=${newIds.size})`
+      );
 
-      if (delta === 0) {
+      if (newThisCenter === 0) {
         zeroGrowthRuns++;
         if (zeroGrowthRuns >= 3) {
-          console.log("[discover-now] no growth after 3 tries, stopping.");
+          console.log("[discover-now] no NEW growth after 3 tries, stopping.");
           break;
         }
       } else {
-        zeroGrowthRuns = 0; // reset if we found something
+        zeroGrowthRuns = 0;
       }
     }
 
-    const discovered = Array.from(byId.values());
-    if (!discovered.length) {
+    const newObjects = Array.from(newIds).map((id) => placeById.get(id)).filter(Boolean);
+
+    if (!newObjects.length) {
       return res.json({
         cuisinesUsed: cuisines,
         found: 0,
@@ -646,17 +679,17 @@ router.post("/discover-now", async (req, res) => {
       });
     }
 
-    // Persist
-    const created = await places.upsertPlacesBatch(discovered);
+    // Persist just the NEW ones
+    const created = await places.upsertPlacesBatch(newObjects);
 
     console.log(
-      `[discover-now] done. found=${discovered.length}, created=${created}, attempts=${attempts}`
+      `[discover-now] done. newFound=${newObjects.length}, created=${created}, attempts=${attempts}`
     );
 
     return res.json({
       cuisinesUsed: cuisines,
-      found: discovered.length,
-      created,
+      found: newObjects.length, // number of new candidates we’re ingesting
+      created,                  // how many actually inserted/updated
       attempts,
     });
   } catch (err) {
@@ -664,5 +697,6 @@ router.post("/discover-now", async (req, res) => {
     res.status(500).json({ error: "discover-now failed" });
   }
 });
+
 
 module.exports = router;
