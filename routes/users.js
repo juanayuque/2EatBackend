@@ -229,11 +229,11 @@ router.post("/preferences", async (req, res) => {
 router.post("/lookup", verifyFirebaseToken, async (req, res) => {
   try {
     const ids = Array.from(
-      new Set((Array.isArray(req.body?.ids) ? req.body.ids : []).map(String))
+      new Set((Array.isArray(req.body?.ids) ? req.body.ids : []).map(String).filter(Boolean))
     );
     if (!ids.length) return res.json({ users: {} });
 
-    const users = await prisma.user.findMany({
+    const rows = await prisma.user.findMany({
       where: {
         OR: [
           { id: { in: ids } },
@@ -241,33 +241,30 @@ router.post("/lookup", verifyFirebaseToken, async (req, res) => {
           { email: { in: ids } },
         ],
       },
-      // Only select fields that exist in your schema
+      // Only select fields known to exist in your schema
       select: {
         id: true,
         firebaseUid: true,
         email: true,
         displayName: true,
-        firstName: true,
-        lastName: true,
-        username: true,   // optional if present in your model
+        // if you DO have username in your schema, you can include it:
+        // username: true,
       },
     });
 
-    const pickName = (u) =>
+    const nameFor = (u) =>
       (u.displayName && u.displayName.trim()) ||
-      ([u.firstName, u.lastName].filter(Boolean).join(" ").trim() || null) ||
-      (u.username && u.username.trim()) ||
       (u.email ? u.email.split("@")[0] : null) ||
-      "Unknown User";
+      u.firebaseUid ||
+      u.id;
 
-    // Map each requested id back to a name by matching id/firebaseUid/email
     const out = {};
-    for (const reqId of ids) {
-      const match =
-        users.find((u) => u.id === reqId) ||
-        users.find((u) => u.firebaseUid === reqId) ||
-        users.find((u) => u.email === reqId);
-      if (match) out[reqId] = pickName(match);
+    for (const wanted of ids) {
+      const u =
+        rows.find((x) => x.id === wanted) ||
+        rows.find((x) => x.firebaseUid === wanted) ||
+        rows.find((x) => x.email === wanted);
+      if (u) out[wanted] = nameFor(u);
     }
 
     res.json({ users: out });
