@@ -6,7 +6,7 @@ const { createPlacesService } = require("../src/services/placesService");
 
 const places = createPlacesService({
   prisma,
-  googleApiKey: process.env.GOOGLE_PLACES_API_KEY || process.env.PLACES_API_KEY,
+  googleApiKey: process.env.GOOGLE_API_KEY || process.env.PLACES_API_KEY,
 });
 
 const router = express.Router();
