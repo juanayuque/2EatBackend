@@ -25,6 +25,7 @@ router.post("/discover-now", async (req, res) => {
     let { lat, lng, maxNew = 20, preferredCuisines } = req.body || {};
     lat = Number(lat);
     lng = Number(lng);
+    maxNew = Math.max(0, Math.min(50, Number(maxNew) || 20)); // simple guard
 
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
       return res.status(400).json({ error: "lat/lng required" });
@@ -63,10 +64,10 @@ router.post("/discover-now", async (req, res) => {
     console.log("[discover-now] queries:", queries);
 
     // Trackers
-    const placeById = new Map(); // googleId -> place object
-    const seenIds = new Set(); // everything seen this run (avoid repeat DB checks)
-    const newIds = new Set(); // ids confirmed NOT in DB
-    const perCenter = []; // diagnostics
+    const placeById = new Map(); // googleId -> place object (from search)
+    const seenIds = new Set();   // everything seen this run (avoid repeat DB checks)
+    const newIds = new Set();    // ids confirmed NOT in DB
+    const perCenter = [];        // diagnostics
     let attempts = 0;
     let zeroGrowthStreak = 0;
 
@@ -99,12 +100,11 @@ router.post("/discover-now", async (req, res) => {
         });
         attempts++;
 
-        // Fallback: if text search returns nothing, try Nearby Search for generic restaurants
-        // This avoids returning nothing for niche/rare terms in some areas.
+        // Fallback: nearby generic restaurants if nothing came back
         if (!chunk || chunk.length === 0) {
           chunk = await places.googlePlacesSearchNearby(c.lat, c.lng, {
             radiusMeters: 3000,
-            maxPages: 1, // conserves API budget; increase if needed
+            maxPages: 1,
             rankPreference: "POPULARITY",
             includedTypes: ["restaurant"],
           });
@@ -150,41 +150,51 @@ router.post("/discover-now", async (req, res) => {
     }
 
     // Prepare up to maxNew new places to ingest
+    const toIngestIds = Array.from(newIds).slice(0, maxNew);
+
+    // Enrich each with Details if needed (missing photos/address/etc)
     const toIngest = [];
-for (const id of toIngestIds) {
-  const base = placeById.get(id);
-  const needsDetails =
-    !base?.photos?.length ||
-    !base?.formattedAddress ||
-    !base?.primaryType ||
-    !base?.editorialSummary;
+    for (const id of toIngestIds) {
+      const base = placeById.get(id);
+      if (!base) continue;
 
-  if (needsDetails) {
-    try {
-      const full = await places.fetchPlaceDetailsV1(id);
-      toIngest.push({ ...base, ...full });
-    } catch (e) {
-      console.warn("[discover-now] details failed for", id, e?.message || e);
-      toIngest.push(base);
+      const needsDetails =
+        !base?.photos?.length ||
+        !base?.formattedAddress ||
+        !base?.primaryType ||
+        !base?.editorialSummary;
+
+      if (needsDetails) {
+        try {
+          // fetch full details (includes photos[].name with our field mask)
+          const full = await places.fetchPlaceDetailsV1(id);
+          toIngest.push({ ...base, ...full });
+        } catch (e) {
+          console.warn("[discover-now] details failed for", id, e?.message || e);
+          toIngest.push(base); // still ingest minimal record
+        }
+      } else {
+        toIngest.push(base);
+      }
     }
-  } else {
-    toIngest.push(base);
-  }
-}
 
-let created = 0;
-if (toIngest.length) {
-  const result = await places.upsertPlacesBatch(toIngest);
-  created = typeof result === "number" ? result : (result?.created ?? 0);
-}
+    // Upsert into DB (photos included via Photo.connectOrCreate in service)
+    let created = 0;
+    if (toIngest.length) {
+      const result = await places.upsertPlacesBatch(toIngest);
+      created = typeof result === "number" ? result : (result?.created ?? 0);
+      if (result?.createdIds?.length) {
+        console.log("[discover-now] createdIds (first 5):", result.createdIds.slice(0, 5));
+      }
+    }
 
     const payload = {
       mode: "bias-new-v2",
       cuisinesUsed: preferredCuisines,
       queries,
       centersTried: perCenter,
-      found: toIngest.length, // truly NEW candidates attempted to ingest
-      created, // actually inserted/updated by upsert
+      found: toIngest.length, // candidates attempted to ingest
+      created,                // actually inserted/updated
       attempts,
     };
 
