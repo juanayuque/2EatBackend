@@ -150,17 +150,33 @@ router.post("/discover-now", async (req, res) => {
     }
 
     // Prepare up to maxNew new places to ingest
-    const toIngestIds = Array.from(newIds).slice(0, maxNew);
-    const toIngest = toIngestIds.map((id) => placeById.get(id)).filter(Boolean);
+    const toIngest = [];
+for (const id of toIngestIds) {
+  const base = placeById.get(id);
+  const needsDetails =
+    !base?.photos?.length ||
+    !base?.formattedAddress ||
+    !base?.primaryType ||
+    !base?.editorialSummary;
 
-        let created = 0;
-    if (toIngest.length) {
-      const result = await places.upsertPlacesBatch(toIngest);
-      created = typeof result === "number" ? result : (result?.created ?? 0);
-      if (result?.createdIds?.length) {
-        console.log("[discover-now] createdIds (first 5):", result.createdIds.slice(0, 5));
-      }
+  if (needsDetails) {
+    try {
+      const full = await places.fetchPlaceDetailsV1(id);
+      toIngest.push({ ...base, ...full });
+    } catch (e) {
+      console.warn("[discover-now] details failed for", id, e?.message || e);
+      toIngest.push(base);
     }
+  } else {
+    toIngest.push(base);
+  }
+}
+
+let created = 0;
+if (toIngest.length) {
+  const result = await places.upsertPlacesBatch(toIngest);
+  created = typeof result === "number" ? result : (result?.created ?? 0);
+}
 
     const payload = {
       mode: "bias-new-v2",
