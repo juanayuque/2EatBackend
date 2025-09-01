@@ -233,7 +233,6 @@ router.post("/lookup", verifyFirebaseToken, async (req, res) => {
     );
     if (!ids.length) return res.json({ users: {} });
 
-    // Fetch by either internal user id OR firebaseUid OR email (covers multiple callers)
     const users = await prisma.user.findMany({
       where: {
         OR: [
@@ -242,25 +241,26 @@ router.post("/lookup", verifyFirebaseToken, async (req, res) => {
           { email: { in: ids } },
         ],
       },
+      // Only select fields that exist in your schema
       select: {
         id: true,
         firebaseUid: true,
         email: true,
         displayName: true,
-        fullName: true,
         firstName: true,
         lastName: true,
+        username: true,   // optional if present in your model
       },
     });
 
     const pickName = (u) =>
       (u.displayName && u.displayName.trim()) ||
-      (u.fullName && u.fullName.trim()) ||
-      [u.firstName, u.lastName].filter(Boolean).join(" ").trim() ||
+      ([u.firstName, u.lastName].filter(Boolean).join(" ").trim() || null) ||
+      (u.username && u.username.trim()) ||
       (u.email ? u.email.split("@")[0] : null) ||
       "Unknown User";
 
-    // Map each *requested* id back to a name, matching id OR firebaseUid OR email
+    // Map each requested id back to a name by matching id/firebaseUid/email
     const out = {};
     for (const reqId of ids) {
       const match =
