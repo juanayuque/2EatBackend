@@ -164,120 +164,79 @@ function createPlacesService({ prisma, googleApiKey }) {
   }
 
   async function upsertPlacesBatch(placesArr) {
-  // 1) Normalise and filter unusable records
-  const normalized = [];
-  for (const raw of Array.from(placesArr || [])) {
-    const p = parseGooglePlace(raw);
-    if (!p?.googlePlaceId || !p?.latitude || !p?.longitude) continue;
-    normalized.push(p);
-  }
-  if (!normalized.length) return { created: 0, createdIds: [], updated: 0 };
+    let created = 0;
+    const chunks = [];
+    const copy = Array.from(placesArr || []);
+    while (copy.length) chunks.push(copy.splice(0, 50));
 
-  // 2) Find which IDs already exist
-  const ids = normalized.map((p) => String(p.googlePlaceId));
-  const existingRows = await prisma.restaurant.findMany({
-    where: { googlePlaceId: { in: ids } },
-    select: { googlePlaceId: true },
-  });
-  const existing = new Set(existingRows.map((r) => String(r.googlePlaceId)));
-
-  // 3) Build create & update payloads
-  const createData = [];
-  const updates = [];
-  const createdIds = [];
-
-  for (const p of normalized) {
-    const id = String(p.googlePlaceId);
-
-    const createShape = {
-      googlePlaceId: id,
-      name: p.name || "Unknown",
-      latitude: Number(p.latitude),
-      longitude: Number(p.longitude),
-      formattedAddress: p.formattedAddress ?? null,
-      internationalPhoneNumber: p.internationalPhoneNumber ?? null,
-      websiteUri: p.websiteUri ?? null,
-      primaryTypeDisplayName: p.primaryTypeDisplayName ?? null,
-      primaryType: p.primaryType ?? null,
-      types: Array.isArray(p.types) ? p.types : [],
-      rating: p.rating != null ? Number(p.rating) : null,
-      userRatingCount: p.userRatingCount || 0,
-      priceLevel: p.priceLevel != null ? Number(p.priceLevel) : null,
-      servesVegetarianFood: p.servesVegetarianFood == null ? null : p.servesVegetarianFood === true,
-      editorialSummary: p.editorialSummary ?? null,
-      plusCode: p.plusCode ?? null,
-      takeout: p.takeout == null ? null : p.takeout === true,
-      dineIn: p.dineIn == null ? null : p.dineIn === true,
-      curbsidePickup: p.curbsidePickup == null ? null : p.curbsidePickup === true,
-      delivery: p.delivery == null ? null : p.delivery === true,
-      outdoorSeating: p.outdoorSeating == null ? null : p.outdoorSeating === true,
-      allowsDogs: p.allowsDogs == null ? null : !!p.allowsDogs,
-      parkingOptions: p.parkingOptions ?? null,
-    };
-
-    const updateShape = {
-      name: p.name || undefined,
-      latitude: p.latitude != null ? Number(p.latitude) : undefined,
-      longitude: p.longitude != null ? Number(p.longitude) : undefined,
-      formattedAddress: p.formattedAddress ?? undefined,
-      internationalPhoneNumber: p.internationalPhoneNumber ?? undefined,
-      websiteUri: p.websiteUri ?? undefined,
-      primaryTypeDisplayName: p.primaryTypeDisplayName ?? undefined,
-      primaryType: p.primaryType ?? undefined,
-      types: Array.isArray(p.types) ? p.types : undefined,
-      rating: p.rating != null ? Number(p.rating) : undefined,
-      userRatingCount: p.userRatingCount ?? undefined,
-      priceLevel: p.priceLevel != null ? Number(p.priceLevel) : undefined,
-      servesVegetarianFood:
-        p.servesVegetarianFood == null ? undefined : p.servesVegetarianFood === true,
-      editorialSummary: p.editorialSummary ?? undefined,
-      plusCode: p.plusCode ?? undefined,
-      takeout: p.takeout == null ? undefined : p.takeout === true,
-      dineIn: p.dineIn == null ? undefined : p.dineIn === true,
-      curbsidePickup: p.curbsidePickup == null ? undefined : p.curbsidePickup === true,
-      delivery: p.delivery == null ? undefined : p.delivery === true,
-      outdoorSeating: p.outdoorSeating == null ? undefined : p.outdoorSeating === true,
-      allowsDogs: p.allowsDogs == null ? undefined : !!p.allowsDogs,
-      parkingOptions: p.parkingOptions ?? undefined,
-    };
-
-    if (existing.has(id)) {
-      updates.push({ id, data: updateShape });
-    } else {
-      createData.push(createShape);
-      createdIds.push(id);
-    }
-  }
-
-  // 4) Create new rows (count is exact) + update existing
-  let created = 0;
-
-  if (createData.length) {
-    const r = await prisma.restaurant.createMany({
-      data: createData,
-      skipDuplicates: true, // safety against races
-    });
-    created += r.count || 0;
-  }
-
-  if (updates.length) {
-    const batchSize = 50;
-    for (let i = 0; i < updates.length; i += batchSize) {
-      const slice = updates.slice(i, i + batchSize);
+    for (const chunk of chunks) {
       await Promise.all(
-        slice.map((u) =>
-          prisma.restaurant.update({
-            where: { googlePlaceId: u.id },
-            data: u.data,
-          })
-        )
+        chunk.map(async (raw) => {
+          const p = parseGooglePlace(raw);
+          if (!p.googlePlaceId || !p.latitude || !p.longitude) return;
+
+          const result = await prisma.restaurant.upsert({
+            where: { googlePlaceId: String(p.googlePlaceId) },
+            create: {
+              googlePlaceId: String(p.googlePlaceId),
+              name: p.name || "Unknown",
+              latitude: Number(p.latitude),
+              longitude: Number(p.longitude),
+              formattedAddress: p.formattedAddress,
+              internationalPhoneNumber: p.internationalPhoneNumber,
+              websiteUri: p.websiteUri,
+              primaryTypeDisplayName: p.primaryTypeDisplayName,
+              primaryType: p.primaryType,
+              types: p.types || [],
+              rating: p.rating != null ? Number(p.rating) : null,
+              userRatingCount: p.userRatingCount || 0,
+              priceLevel: p.priceLevel != null ? Number(p.priceLevel) : null,
+              servesVegetarianFood: p.servesVegetarianFood == null ? null : p.servesVegetarianFood === true,
+              editorialSummary: p.editorialSummary || null,
+              plusCode: p.plusCode,
+              takeout: p.takeout == null ? null : p.takeout === true,
+              dineIn: p.dineIn == null ? null : p.dineIn === true,
+              curbsidePickup: p.curbsidePickup == null ? null : p.curbsidePickup === true,
+              delivery: p.delivery == null ? null : p.delivery === true,
+              outdoorSeating: p.outdoorSeating == null ? null : p.outdoorSeating === true,
+              // Keep null when unknown; avoid defaulting to false on insert
+              allowsDogs: p.allowsDogs == null ? null : !!p.allowsDogs,
+              parkingOptions: p.parkingOptions || null,
+            },
+            update: {
+              name: p.name || undefined,
+              latitude: p.latitude != null ? Number(p.latitude) : undefined,
+              longitude: p.longitude != null ? Number(p.longitude) : undefined,
+              formattedAddress: p.formattedAddress ?? undefined,
+              internationalPhoneNumber: p.internationalPhoneNumber ?? undefined,
+              websiteUri: p.websiteUri ?? undefined,
+              primaryTypeDisplayName: p.primaryTypeDisplayName ?? undefined,
+              primaryType: p.primaryType ?? undefined,
+              types: Array.isArray(p.types) ? p.types : undefined,
+              rating: p.rating != null ? Number(p.rating) : undefined,
+              userRatingCount: p.userRatingCount ?? undefined,
+              priceLevel: p.priceLevel != null ? Number(p.priceLevel) : undefined,
+              servesVegetarianFood:
+                p.servesVegetarianFood == null ? undefined : p.servesVegetarianFood === true,
+              editorialSummary: p.editorialSummary ?? undefined,
+              plusCode: p.plusCode ?? undefined,
+              takeout: p.takeout == null ? undefined : p.takeout === true,
+              dineIn: p.dineIn == null ? undefined : p.dineIn === true,
+              curbsidePickup: p.curbsidePickup == null ? undefined : p.curbsidePickup === true,
+              delivery: p.delivery == null ? undefined : p.delivery === true,
+              outdoorSeating: p.outdoorSeating == null ? undefined : p.outdoorSeating === true,
+              // Only update when provided; preserves existing value when undefined
+              allowsDogs: p.allowsDogs == null ? undefined : !!p.allowsDogs,
+              parkingOptions: p.parkingOptions ?? undefined,
+            },
+          });
+
+          if (result.createdAt.getTime() === result.updatedAt.getTime()) created += 1;
+        })
       );
     }
+    return created;
   }
-
-  return { created, createdIds, updated: updates.length };
-}
-
 
   // Conservative field mask with widely supported fields; avoids INVALID_ARGUMENTs
   const GOOGLE_FIELD_MASK = [
