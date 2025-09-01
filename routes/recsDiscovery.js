@@ -2,8 +2,8 @@
 const express = require("express");
 const prisma = require("../src/prisma");
 const verifyFirebaseToken = require("../middleware/auth");
-// Make sure you have a places service available here.
 const { createPlacesService } = require("../src/services/placesService");
+
 const places = createPlacesService({
   prisma,
   googleApiKey: process.env.GOOGLE_PLACES_API_KEY || process.env.PLACES_API_KEY,
@@ -16,14 +16,16 @@ router.use(verifyFirebaseToken);
 const kmToDegLat = (km) => km / 111;
 const kmToDegLng = (km, atLat) => km / (111 * Math.cos((atLat * Math.PI) / 180));
 
-// Normalize cuisine labels a bit
+// Normalize cuisine labels
 const clean = (s) => String(s || "").trim();
 
 router.post("/discover-now", async (req, res) => {
   try {
     const uid = req.user.uid;
     let { lat, lng, maxNew = 20, preferredCuisines } = req.body || {};
-    lat = Number(lat); lng = Number(lng);
+    lat = Number(lat);
+    lng = Number(lng);
+
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
       return res.status(400).json({ error: "lat/lng required" });
     }
@@ -43,8 +45,8 @@ router.post("/discover-now", async (req, res) => {
       return res.json({ mode: "bias-new-v2", cuisinesUsed: [], found: 0, created: 0, attempts: 0 });
     }
 
-    // Queries: "<cuisine> restaurant"
-    const queries = Array.from(new Set(preferredCuisines.map((c) => `${c} restaurant`)));
+    // Queries: use cuisine terms as-is; rely on location bias for relevance
+    const queries = Array.from(new Set(preferredCuisines));
 
     // Centers to try (origin + offsets)
     const centers = [
@@ -61,23 +63,23 @@ router.post("/discover-now", async (req, res) => {
     console.log("[discover-now] queries:", queries);
 
     // Trackers
-    const placeById = new Map();     // googleId -> place object
-    const seenIds = new Set();       // everything we've seen from Google (avoid duplicate DB checks)
-    const newIds = new Set();        // ids confirmed NOT in DB
-    const perCenter = [];            // for diagnostics
+    const placeById = new Map(); // googleId -> place object
+    const seenIds = new Set(); // everything seen this run (avoid repeat DB checks)
+    const newIds = new Set(); // ids confirmed NOT in DB
+    const perCenter = []; // diagnostics
     let attempts = 0;
     let zeroGrowthStreak = 0;
 
-    // fast DB existence check
+    // Fast DB existence check
     async function notInDb(ids) {
-  if (!ids.length) return ids;
-  const rows = await prisma.restaurant.findMany({
-    where: { googlePlaceId: { in: ids.map(String) } },
-    select: { googlePlaceId: true },
-  });
-  const existing = new Set(rows.map(r => String(r.googlePlaceId)));
-  return ids.filter(id => !existing.has(String(id)));
-}
+      if (!ids.length) return ids;
+      const rows = await prisma.restaurant.findMany({
+        where: { googlePlaceId: { in: ids.map(String) } },
+        select: { googlePlaceId: true },
+      });
+      const existing = new Set(rows.map((r) => String(r.googlePlaceId)));
+      return ids.filter((id) => !existing.has(String(id)));
+    }
 
     for (const c of centers) {
       if (newIds.size >= maxNew) break;
@@ -88,8 +90,8 @@ router.post("/discover-now", async (req, res) => {
       for (const q of queries) {
         if (newIds.size >= maxNew) break;
 
-        // Text Search by cuisine query
-        const chunk = await places.googlePlacesSearchText(q, {
+        // Primary: Text Search on cuisine term with location bias
+        let chunk = await places.googlePlacesSearchText(q, {
           lat: c.lat,
           lng: c.lng,
           radiusMeters: 3000,
@@ -97,7 +99,19 @@ router.post("/discover-now", async (req, res) => {
         });
         attempts++;
 
-        // Fresh ids we haven't even seen this run
+        // Fallback: if text search returns nothing, try Nearby Search for generic restaurants
+        // This avoids returning nothing for niche/rare terms in some areas.
+        if (!chunk || chunk.length === 0) {
+          chunk = await places.googlePlacesSearchNearby(c.lat, c.lng, {
+            radiusMeters: 3000,
+            maxPages: 1, // conserves API budget; increase if needed
+            rankPreference: "POPULARITY",
+            includedTypes: ["restaurant"],
+          });
+          attempts++;
+        }
+
+        // Fresh ids not yet seen in this run
         const freshIds = [];
         for (const p of chunk || []) {
           const id = p?.id;
@@ -123,6 +137,7 @@ router.post("/discover-now", async (req, res) => {
       perCenter.push({ note: c.note, fresh: centerFresh, newAdded: centerNew, totalNewSoFar: newIds.size });
       console.log(`[discover-now] ${c.note}: fresh=${centerFresh}, +new=${centerNew}, totalNew=${newIds.size}`);
 
+      // Stop early if multiple centers yield no growth
       if (centerNew === 0) {
         zeroGrowthStreak++;
         if (zeroGrowthStreak >= 3) {
@@ -149,8 +164,8 @@ router.post("/discover-now", async (req, res) => {
       cuisinesUsed: preferredCuisines,
       queries,
       centersTried: perCenter,
-      found: toIngest.length, // truly NEW candidates we attempted to ingest
-      created,                // actually inserted/updated by upsert
+      found: toIngest.length, // truly NEW candidates attempted to ingest
+      created, // actually inserted/updated by upsert
       attempts,
     };
 
@@ -161,7 +176,5 @@ router.post("/discover-now", async (req, res) => {
     res.status(500).json({ error: "discover-now failed" });
   }
 });
-
-
 
 module.exports = router;

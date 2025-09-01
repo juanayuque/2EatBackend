@@ -1,8 +1,12 @@
+// src/services/placesService.js
+// Centralised Google Places helpers + DB upserts
+
 const { haversineKm, asFloat } = require("../utils/geo");
 
+// Use global fetch when available (Node 18+). Fall back to node-fetch with proper argument spreading.
 const fetchFn =
   (typeof fetch === "function" && fetch) ||
-  ((...args) => import("node-fetch").then((mod) => mod.default(args)));
+  (async (...args) => (await import("node-fetch")).default(...args));
 
 function bboxFromCenter(lat, lng, radiusKm) {
   const dLat = radiusKm / 111;
@@ -10,26 +14,37 @@ function bboxFromCenter(lat, lng, radiusKm) {
   return { minLat: lat - dLat, maxLat: lat + dLat, minLng: lng - dLng, maxLng: lng + dLng };
 }
 
+// Normalises Google Places objects into the shape used by the DB layer
 function parseGooglePlace(p) {
-  const id = p.id || p.googlePlaceId || p.placeId || p.place_id || (p.name && p.name.split("/").pop());
+  const id =
+    p.id ||
+    p.googlePlaceId ||
+    p.placeId ||
+    p.place_id ||
+    (p.name && p.name.split("/").pop());
+
+  // Places v1 returns coordinates under `location.{latitude,longitude}`; older shapes also supported
   const lat =
     p.location?.latitude ??
     p.location?.latLng?.latitude ??
     p.geometry?.location?.lat ??
     p.lat;
+
   const lng =
     p.location?.longitude ??
     p.location?.latLng?.longitude ??
     p.geometry?.location?.lng ??
     p.lng;
 
-  const displayName = p.displayName?.text || p.name || p.title || "";
+  // `p.name` is often a resource path like "places/<id>", so avoid using it as the human name
+  const displayName = p.displayName?.text || p.title || "";
+
   const editorialSummary = p.editorialSummary?.text || p.editorial_summary || null;
 
-  const dogsHeuristic =
-    /\bdog[- ]?friendly\b|\bpet[- ]?friendly\b|\bdogs welcome\b/i.test(
-      (editorialSummary || "") + " " + displayName
-    );
+  // Simple heuristic for pet-friendly signals in absence of explicit fields
+  const dogsHeuristic = /\bdog[- ]?friendly\b|\bpet[- ]?friendly\b|\bdogs welcome\b/i.test(
+    `${editorialSummary || ""} ${displayName}`
+  );
 
   return {
     id,
@@ -38,8 +53,7 @@ function parseGooglePlace(p) {
     latitude: lat,
     longitude: lng,
     formattedAddress: p.formattedAddress || p.vicinity || p.formatted_address || null,
-    primaryTypeDisplayName:
-      p.primaryTypeDisplayName?.text || p.primaryTypeDisplayName || null,
+    primaryTypeDisplayName: p.primaryTypeDisplayName?.text || p.primaryTypeDisplayName || null,
     primaryType: p.primaryType || (Array.isArray(p.types) ? p.types[0] : null),
     types: Array.isArray(p.types) ? p.types : [],
     rating: p.rating ?? null,
@@ -52,11 +66,11 @@ function parseGooglePlace(p) {
     curbsidePickup: p.curbsidePickup ?? p.curbside_pickup ?? null,
     delivery: p.delivery ?? null,
     outdoorSeating: p.outdoorSeating ?? p.outdoor_seating ?? null,
+    // Keep null when unknown so downstream filters don't treat "unknown" as "no"
     allowsDogs: p.allowsDogs ?? (dogsHeuristic ? true : null),
     parkingOptions: p.parkingOptions ?? null,
     websiteUri: p.websiteUri ?? p.website_uri ?? null,
-    internationalPhoneNumber:
-      p.internationalPhoneNumber ?? p.international_phone_number ?? null,
+    internationalPhoneNumber: p.internationalPhoneNumber ?? p.international_phone_number ?? null,
     plusCode: p.plusCode ?? p.plus_code ?? null,
   };
 }
@@ -81,10 +95,8 @@ function createPlacesService({ prisma, googleApiKey }) {
   }
 
   /**
-   * [FIXED] The original function overwrote Prisma 'where' conditions when multiple
-   * requirements were selected (e.g., vegetarian AND pet-friendly).
-   * This version constructs a single `AND` array, pushing all active requirement
-   * clauses into it, ensuring all filters are applied together.
+   * Strict filter variant (vegetarian / pet-friendly / parking).
+   * Constructs a single AND array so multiple requirements combine correctly.
    */
   async function ensureNearbyRestaurantsStrict(lat, lng, minCount = 100, radiusKm = 15, req = {}) {
     const box = bboxFromCenter(lat, lng, radiusKm);
@@ -114,7 +126,7 @@ function createPlacesService({ prisma, googleApiKey }) {
     const where = {
       latitude: { gte: box.minLat, lte: box.maxLat },
       longitude: { gte: box.minLng, lte: box.maxLng },
-      AND: [], // Initialize a single AND array
+      AND: [],
     };
 
     if (req?.vegetarian) {
@@ -135,10 +147,7 @@ function createPlacesService({ prisma, googleApiKey }) {
       });
     }
 
-    // If no requirements were added, remove the empty AND clause to avoid errors.
-    if (where.AND.length === 0) {
-      delete where.AND;
-    }
+    if (where.AND.length === 0) delete where.AND;
 
     const rows = await prisma.restaurant.findMany({
       where,
@@ -165,6 +174,7 @@ function createPlacesService({ prisma, googleApiKey }) {
         chunk.map(async (raw) => {
           const p = parseGooglePlace(raw);
           if (!p.googlePlaceId || !p.latitude || !p.longitude) return;
+
           const result = await prisma.restaurant.upsert({
             where: { googlePlaceId: String(p.googlePlaceId) },
             create: {
@@ -181,15 +191,16 @@ function createPlacesService({ prisma, googleApiKey }) {
               rating: p.rating != null ? Number(p.rating) : null,
               userRatingCount: p.userRatingCount || 0,
               priceLevel: p.priceLevel != null ? Number(p.priceLevel) : null,
-              servesVegetarianFood: p.servesVegetarianFood === true,
+              servesVegetarianFood: p.servesVegetarianFood == null ? null : p.servesVegetarianFood === true,
               editorialSummary: p.editorialSummary || null,
               plusCode: p.plusCode,
-              takeout: p.takeout === true,
-              dineIn: p.dineIn === true,
-              curbsidePickup: p.curbsidePickup === true,
-              delivery: p.delivery === true,
-              outdoorSeating: p.outdoorSeating === true,
-              allowsDogs: p.allowsDogs === true ? true : false,
+              takeout: p.takeout == null ? null : p.takeout === true,
+              dineIn: p.dineIn == null ? null : p.dineIn === true,
+              curbsidePickup: p.curbsidePickup == null ? null : p.curbsidePickup === true,
+              delivery: p.delivery == null ? null : p.delivery === true,
+              outdoorSeating: p.outdoorSeating == null ? null : p.outdoorSeating === true,
+              // Keep null when unknown; avoid defaulting to false on insert
+              allowsDogs: p.allowsDogs == null ? null : !!p.allowsDogs,
               parkingOptions: p.parkingOptions || null,
             },
             update: {
@@ -211,18 +222,15 @@ function createPlacesService({ prisma, googleApiKey }) {
               plusCode: p.plusCode ?? undefined,
               takeout: p.takeout == null ? undefined : p.takeout === true,
               dineIn: p.dineIn == null ? undefined : p.dineIn === true,
-              curbsidePickup:
-                p.curbsidePickup == null ? undefined : p.curbsidePickup === true,
+              curbsidePickup: p.curbsidePickup == null ? undefined : p.curbsidePickup === true,
               delivery: p.delivery == null ? undefined : p.delivery === true,
-              outdoorSeating:
-                p.outdoorSeating == null ? undefined : p.outdoorSeating === true,
-              allowsDogs:
-                p.allowsDogs === true
-                  ? true
-                  : undefined,
+              outdoorSeating: p.outdoorSeating == null ? undefined : p.outdoorSeating === true,
+              // Only update when provided; preserves existing value when undefined
+              allowsDogs: p.allowsDogs == null ? undefined : !!p.allowsDogs,
               parkingOptions: p.parkingOptions ?? undefined,
             },
           });
+
           if (result.createdAt.getTime() === result.updatedAt.getTime()) created += 1;
         })
       );
@@ -230,8 +238,25 @@ function createPlacesService({ prisma, googleApiKey }) {
     return created;
   }
 
-  // Common fields to request from Google Places API
-  const GOOGLE_FIELD_MASK = "places.id,places.displayName,places.location,places.formattedAddress,places.primaryType,places.primaryTypeDisplayName,places.types,places.rating,places.userRatingCount,places.priceLevel,places.editorialSummary,places.servesVegetarianFood,places.allowsDogs,places.parkingOptions,places.outdoorSeating,places.dineIn,places.delivery,places.takeout,places.curbsidePickup,places.websiteUri,places.internationalPhoneNumber";
+  // Conservative field mask with widely supported fields; avoids INVALID_ARGUMENTs
+  const GOOGLE_FIELD_MASK = [
+    "places.id",
+    "places.displayName",
+    "places.formattedAddress",
+    "places.location",
+    "places.primaryType",
+    "places.primaryTypeDisplayName",
+    "places.types",
+    "places.rating",
+    "places.userRatingCount",
+    "places.priceLevel",
+    "places.editorialSummary",
+    "places.websiteUri",
+    "places.googleMapsUri",
+    "places.nationalPhoneNumber",
+    "places.internationalPhoneNumber",
+    "places.regularOpeningHours.openNow",
+  ].join(",");
 
   async function googlePlacesSearchNearby(
     lat,
@@ -241,9 +266,10 @@ function createPlacesService({ prisma, googleApiKey }) {
     if (!googleApiKey) return [];
     const out = [];
     let pageToken = null;
+
     for (let page = 0; page < maxPages; page++) {
       const body = {
-        includedTypes: includedTypes,
+        includedTypes,
         maxResultCount: 20,
         rankPreference,
         locationRestriction: {
@@ -253,9 +279,11 @@ function createPlacesService({ prisma, googleApiKey }) {
           },
         },
       };
+
       const url = pageToken
         ? `https://places.googleapis.com/v1/places:searchNearby?pageToken=${encodeURIComponent(pageToken)}`
         : `https://places.googleapis.com/v1/places:searchNearby`;
+
       const r = await fetchFn(url, {
         method: "POST",
         headers: {
@@ -265,13 +293,18 @@ function createPlacesService({ prisma, googleApiKey }) {
         },
         body: JSON.stringify(body),
       });
+
       if (!r.ok) break;
+
       const j = await r.json();
       const places = Array.isArray(j.places) ? j.places : [];
       out.push(...places.map(parseGooglePlace));
+
       if (!j.nextPageToken) break;
       pageToken = j.nextPageToken;
-      await new Promise((res) => setTimeout(res, 200));
+
+      // Token propagation needs a brief delay
+      await new Promise((res) => setTimeout(res, 1500));
     }
     return out;
   }
@@ -283,9 +316,10 @@ function createPlacesService({ prisma, googleApiKey }) {
     if (!googleApiKey) return [];
     const out = [];
     let pageToken = null;
+
     for (let page = 0; page < maxPages; page++) {
       const body = {
-        textQuery: query,
+        textQuery: String(query || "").trim(),
         maxResultCount: 20,
         locationBias: {
           circle: {
@@ -294,9 +328,11 @@ function createPlacesService({ prisma, googleApiKey }) {
           },
         },
       };
+
       const url = pageToken
         ? `https://places.googleapis.com/v1/places:searchText?pageToken=${encodeURIComponent(pageToken)}`
         : `https://places.googleapis.com/v1/places:searchText`;
+
       const r = await fetchFn(url, {
         method: "POST",
         headers: {
@@ -306,13 +342,18 @@ function createPlacesService({ prisma, googleApiKey }) {
         },
         body: JSON.stringify(body),
       });
+
       if (!r.ok) break;
+
       const j = await r.json();
       const places = Array.isArray(j.places) ? j.places : [];
       out.push(...places.map(parseGooglePlace));
+
       if (!j.nextPageToken) break;
       pageToken = j.nextPageToken;
-      await new Promise((res) => setTimeout(res, 200));
+
+      // Token propagation needs a brief delay
+      await new Promise((res) => setTimeout(res, 1500));
     }
     return out;
   }
