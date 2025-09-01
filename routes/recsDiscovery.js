@@ -155,8 +155,11 @@ router.post("/discover-now", async (req, res) => {
 
     let created = 0;
     if (toIngest.length) {
-      // Persist only the NEW ones
-      created = await places.upsertPlacesBatch(toIngest);
+      const result = await places.upsertPlacesBatch(toIngest);
+      created = typeof result === "number" ? result : (result?.created ?? 0);
+      if (result?.createdIds?.length) {
+        console.log("[discover-now] createdIds (first 5):", result.createdIds.slice(0, 5));
+      }
     }
 
     const payload = {
