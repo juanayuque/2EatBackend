@@ -36,6 +36,7 @@ app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 const allowSet = new Set([
   "https://2eatapp.com",
   "https://app.2eatapp.com",
+  "https://2eat.pages.dev",     // Pages preview
   "https://www.2eatapp.com",
    /\.pages\.dev$/,
   "http://localhost:8081",  // Expo Metro (web preview)
