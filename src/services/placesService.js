@@ -24,7 +24,8 @@ function parseGooglePlace(p) {
     (p.name && p.name.split("/").pop());
 
   // Places v1 returns coordinates under `location.{latitude,longitude}`; older shapes also supported
-  const lat =
+    const lat =
+    p.latitude ??
     p.location?.latitude ??
     p.location?.latLng?.latitude ??
     p.geometry?.location?.lat ??
@@ -167,7 +168,10 @@ function createPlacesService({ prisma, googleApiKey }) {
   // 1) Normalise and filter unusable records
   const normalized = [];
   for (const raw of Array.from(placesArr || [])) {
-    const p = parseGooglePlace(raw);
+    const alreadyNormalized =
+      raw && typeof raw === "object" &&
+      raw.googlePlaceId && raw.latitude != null && raw.longitude != null;
+    const p = alreadyNormalized ? raw : parseGooglePlace(raw);
     if (!p?.googlePlaceId || !p?.latitude || !p?.longitude) continue;
     normalized.push(p);
   }
