@@ -226,4 +226,55 @@ router.post("/preferences", async (req, res) => {
   }
 });
 
+router.post("/lookup", verifyFirebaseToken, async (req, res) => {
+  try {
+    const ids = Array.from(
+      new Set((Array.isArray(req.body?.ids) ? req.body.ids : []).map(String))
+    );
+    if (!ids.length) return res.json({ users: {} });
+
+    // Fetch by either internal user id OR firebaseUid OR email (covers multiple callers)
+    const users = await prisma.user.findMany({
+      where: {
+        OR: [
+          { id: { in: ids } },
+          { firebaseUid: { in: ids } },
+          { email: { in: ids } },
+        ],
+      },
+      select: {
+        id: true,
+        firebaseUid: true,
+        email: true,
+        displayName: true,
+        fullName: true,
+        firstName: true,
+        lastName: true,
+      },
+    });
+
+    const pickName = (u) =>
+      (u.displayName && u.displayName.trim()) ||
+      (u.fullName && u.fullName.trim()) ||
+      [u.firstName, u.lastName].filter(Boolean).join(" ").trim() ||
+      (u.email ? u.email.split("@")[0] : null) ||
+      "Unknown User";
+
+    // Map each *requested* id back to a name, matching id OR firebaseUid OR email
+    const out = {};
+    for (const reqId of ids) {
+      const match =
+        users.find((u) => u.id === reqId) ||
+        users.find((u) => u.firebaseUid === reqId) ||
+        users.find((u) => u.email === reqId);
+      if (match) out[reqId] = pickName(match);
+    }
+
+    res.json({ users: out });
+  } catch (err) {
+    console.error("[users/lookup] error:", err);
+    res.status(500).json({ error: "lookup failed" });
+  }
+});
+
 module.exports = router;
