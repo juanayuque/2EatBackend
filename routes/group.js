@@ -3,6 +3,7 @@
 const express = require("express");
 const prisma = require("../src/prisma");
 const verifyFirebaseToken = require("../middleware/auth");
+const { asNum } = require("../src/utils/nums");
 
 const { getOrBuildSessionPool, clearPool, orderPoolDeterministic, } = require("../src/group/pool");
 const { haversineKm, asFloat } = require("../src/utils/geo");
@@ -133,8 +134,6 @@ router.get("/sessions", async (req, res) => {
 });
 
 
-// routes/group.js — replace your POST /session/:id/start handler
-
 router.post("/session/:id/start", async (req, res) => {
   try {
     const me = await authedUser(req.user.uid);
@@ -143,17 +142,12 @@ router.post("/session/:id/start", async (req, res) => {
     const sessionId = String(req.params.id || "");
     const { key: rawKey, lat, lng } = req.body || {};
 
-    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-      return res.status(400).json({ error: "lat/lng required" });
-    }
-
     const s = await prisma.groupSwipeSession.findUnique({
       where: { id: sessionId },
       select: { id: true, aUserId: true, bUserId: true, startedById: true, context: true },
     });
     if (!s) return res.status(404).json({ error: "Session not found" });
 
-    // Figure out whether caller is A or B (fallback: startedBy is A if aUserId not set)
     let inferredKey = null;
     if (s.aUserId && s.aUserId === me.id) inferredKey = "locA";
     else if (s.bUserId && s.bUserId === me.id) inferredKey = "locB";
@@ -162,26 +156,41 @@ router.post("/session/:id/start", async (req, res) => {
     const key = ["locA", "locB"].includes(String(rawKey)) ? rawKey : inferredKey;
     if (!key) return res.status(403).json({ error: "Not a participant" });
 
-    // Update session context
-    const ctx = (s.context && typeof s.context === "object" && s.context) || {};
-    ctx[key] = { lat, lng, by: me.id, at: Date.now() };
-    await prisma.groupSwipeSession.update({ where: { id: s.id }, data: { context: ctx } });
+    const bodyLat = Number.isFinite(lat) ? Number(lat) : null;
+    const bodyLng = Number.isFinite(lng) ? Number(lng) : null;
+    const lastLat = asNum(me.lastLat);
+    const lastLng = asNum(me.lastLng);
 
-    // Also persist on user so we always have a fallback
-    await prisma.user.update({
-      where: { id: me.id },
-      data: { lastLat: lat, lastLng: lng, lastGeoAt: new Date(), lastGeoSource: "group-start" },
-    });
+    const useLat = bodyLat != null ? bodyLat : lastLat;
+    const useLng = bodyLng != null ? bodyLng : lastLng;
 
-    // Clear cached pool so the next /state rebuilds using this fresh location
-    clearPool(sessionId);
+    if (useLat != null && useLng != null) {
+      const prevCtx = (s.context && typeof s.context === "object" && s.context) || {};
+      const prev = prevCtx[key];
+      const changed = !prev || asNum(prev.lat) !== useLat || asNum(prev.lng) !== useLng;
 
-    return res.json({ ok: true, key });
+      if (changed) {
+        const nextCtx = { ...prevCtx, [key]: { lat: useLat, lng: useLng, by: me.id, at: Date.now() } };
+        await prisma.groupSwipeSession.update({ where: { id: s.id }, data: { context: nextCtx } });
+
+        if (bodyLat != null && bodyLng != null) {
+          await prisma.user.update({
+            where: { id: me.id },
+            data: { lastLat: useLat, lastLng: useLng, lastGeoAt: new Date(), lastGeoSource: "group-start" },
+          });
+        }
+        clearPool(sessionId);
+      }
+      return res.json({ ok: true, key, used: "coords", source: bodyLat != null ? "body" : "user-last" });
+    }
+
+    return res.json({ ok: true, key, used: "none" });
   } catch (err) {
     console.error("[group/start] error:", err);
     res.status(400).json({ error: err.message || "start failed" });
   }
 });
+
 
 
 // GET /session/:id/state
@@ -227,29 +236,29 @@ router.get("/session/:id/state", async (req, res) => {
 
     // build/reuse the shared UNION pool
     const pool = await getOrBuildSessionPool({
-      sessionId,
-      prisma,
-      aUser: {
-        id: userA?.id,
-        name: userA?.displayName || userA?.username || null,
-        prefs: aPrefs,
-        tag: "A",
-        lastLat: userA?.lastLat,
-        lastLng: userA?.lastLng,
-      },
-      bUser: {
-        id: userB?.id,
-        name: userB?.displayName || userB?.username || null,
-        prefs: bPrefs,
-        tag: "B",
-        lastLat: userB?.lastLat,
-        lastLng: userB?.lastLng,
-      },
-      locA,
-      locB,
-      want: MAX_SWIPES * 2, // build a bit more than we show
-      log: console.log,
-    });
+  sessionId,
+  prisma,
+  aUser: {
+    id: userA?.id,
+    name: userA?.displayName || userA?.username || null,
+    prefs: aPrefs,
+    tag: "A",
+    lastLat: asNum(userA?.lastLat),
+    lastLng: asNum(userA?.lastLng),
+  },
+  bUser: {
+    id: userB?.id,
+    name: userB?.displayName || userB?.username || null,
+    prefs: bPrefs,
+    tag: "B",
+    lastLat: asNum(userB?.lastLat),
+    lastLng: asNum(userB?.lastLng),
+  },
+  locA,
+  locB,
+  want: MAX_SWIPES * 2,
+  log: console.log,
+});
 
     // Create the per-user view (same set, different order), cap to MAX_SWIPES
     const ordered = orderPoolDeterministic(pool.items, sessionId, youTag).slice(0, MAX_SWIPES);
