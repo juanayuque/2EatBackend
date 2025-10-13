@@ -169,26 +169,30 @@ if (_NODE_ENV === "production" && !_FORCE_DEV_HTTP) {
     const key = fs.readFileSync(_SSL_KEY_PATH);
     const cert = fs.readFileSync(_SSL_CERT_PATH);
 
-    https.createServer({ key, cert }, app).listen(443, () => {
-      console.log("✅ Backend running on https://2eatapp.com (port 443)");
+    // Bind HTTPS explicitly to IPv4
+    https.createServer({ key, cert }, app).listen(443, "0.0.0.0", () => {
+      console.log("✅ Backend running on https://2eatapp.com (port 443, IPv4)");
     });
 
-    // Optional: redirect plaintext to HTTPS if no external proxy handles it.
-    http.createServer((req, res) => {
-      res.writeHead(301, { Location: "https://2eatapp.com" + req.url });
-      res.end();
-    }).listen(80, () => {
-      console.log("↪️  Redirecting http://:80 to https://:443");
-    });
+    // Redirect HTTP → HTTPS (also bind to IPv4)
+    http
+      .createServer((req, res) => {
+        res.writeHead(301, { Location: "https://2eatapp.com" + req.url });
+        res.end();
+      })
+      .listen(80, "0.0.0.0", () => {
+        console.log("↪️  Redirecting http://:80 to https://:443 (IPv4)");
+      });
   } catch (err) {
     console.error("❌ Failed to start HTTPS server:", err);
     process.exit(1); // fail loud so PM2 shows the real issue
   }
 } else {
-  app.listen(_HTTP_PORT, () => {
+  app.listen(_HTTP_PORT, "0.0.0.0", () => {
     console.log(`🔧 Dev server on http://localhost:${_HTTP_PORT}`);
   });
 }
+
 
 /* ────────────────────────────── Graceful shutdown ─────────────────────────────── */
 
